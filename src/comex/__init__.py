@@ -12,7 +12,9 @@ def get_language_map():
 
     grammar_repos = [
         ("https://github.com/tree-sitter/tree-sitter-java", "09d650def6cdf7f479f4b78f595e9ef5b58ce31e"),
-        ("https://github.com/tree-sitter/tree-sitter-c-sharp", "3ef3f7f99e16e528e6689eae44dff35150993307")
+        ("https://github.com/tree-sitter/tree-sitter-c-sharp", "3ef3f7f99e16e528e6689eae44dff35150993307"),
+        ("https://github.com/tree-sitter/tree-sitter-c", "34f4c7e751f4d661be3e23682fe2631d6615141d"),
+        ("https://github.com/tree-sitter/tree-sitter-cpp", "a71474021410973b29bfe99440d57bcd750246b1")
     ]
     vendor_languages = []
 
@@ -66,6 +68,8 @@ def get_language_map():
     # PYTHON_LANGUAGE = Language("build/my-languages.so", "python")
     JAVA_LANGUAGE = Language(shared_languages, "java")
     C_SHARP_LANGUAGE = Language(shared_languages, "c_sharp")
+    C_LANGUAGE = Language(shared_languages, "c")
+    CPP_LANGUAGE = Language(shared_languages, "cpp")
     # RUBY_LANGUAGE = Language("build/my-languages.so", "ruby")
     # GO_LANGUAGE = Language("build/my-languages.so", "go")
     # PHP_LANGUAGE = Language("build/my-languages.so", "php")
@@ -78,6 +82,8 @@ def get_language_map():
         # "python": PYTHON_LANGUAGE,
         "java": JAVA_LANGUAGE,
         "cs": C_SHARP_LANGUAGE,
+        "c": C_LANGUAGE,
+        "cpp": CPP_LANGUAGE,
         # "ruby": RUBY_LANGUAGE,
         # "go": GO_LANGUAGE,
         # "php": PHP_LANGUAGE,
