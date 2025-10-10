@@ -9,3 +9,4 @@ dist/
 tests/**/*.dot
 tests/**/*.png
 /tests/data/RANDOM/gcj.json
+CLAUDE.md

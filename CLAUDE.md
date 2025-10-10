@@ -30,12 +30,17 @@ pip install -r requirements-dev.txt
 This performs an editable install, making `comex` available throughout your environment while reflecting code changes without reinstallation.
 
 ### Dependencies
-- Python >= 3.8
-- GraphViz (`dot` command) must be installed separately for graph visualization
+- Python >= 3.8 (3.12+ requires setuptools>=69.0, automatically installed)
+- **GraphViz** (`dot` command) must be installed separately on your system for PNG/DOT graph visualization
+  - Only needed if using `--output "dot"` or `--output "all"`
+  - JSON output works without GraphViz
+  - Install: `apt install graphviz` (Ubuntu) or `brew install graphviz` (macOS)
 - Key packages: networkx==2.6.3, tree-sitter==0.20.1, typer==0.4.1, pydot==1.4.1
 
 ### First-time Setup
 On first run, comex automatically clones and builds tree-sitter grammars for Java and C# into a temporary directory (`/tmp/comex/`). This is handled by [src/comex/__init__.py](src/comex/__init__.py) in the `get_language_map()` function.
+
+**Note**: If you see "Intial Setup: First time running COMEX" messages, this is normal - the grammars are being downloaded and compiled. This only happens once per system.
 
 ## Testing
 
@@ -55,12 +60,25 @@ pytest -k 'test_cfg[cs-test7]' --no-cov -vv
 ```
 
 ### Test Organization
-- Test files are dynamically discovered in `tests/data/` subdirectories
-- Each test consists of a source file (`.java` or `.cs`) and a gold standard JSON output
-- Tests use `deepdiff` to compare generated output against gold files
+Tests are dynamically discovered via `pytest_generate_tests()` in [tests/test_codeviews.py](tests/test_codeviews.py):
+- Scans `tests/data/{AST,CFG,SDFG,COMBINED}` for `.java` and `.cs` files
+- Each test file `testN.{java|cs}` should have a corresponding `testN/testN-gold.json` reference output
+- If gold file doesn't exist, it's auto-generated from first run (then test will fail, requiring re-run)
+- Tests use `deepdiff` to compare generated JSON against gold files with `ignore_order=True`
+- COMBINED tests also require a `testN-config.json` specifying which codeviews to combine
 - Test categories: AST, CFG, SDFG, COMBINED
 
+### Adding New Tests
+To add a new test case:
+1. Create source file: `tests/data/{AST|CFG|SDFG|COMBINED}/testN.{java|cs}`
+2. For COMBINED tests, also create `testN-config.json` with codeview configuration
+3. Run test once to generate gold file: `pytest -k 'test_cfg[java-testN]' --no-cov`
+4. Inspect generated `testN/testN-gold.json` to verify correctness
+5. Run test again - it should now pass
+
 ## CLI Usage
+
+The CLI can be invoked as `comex` (after pip install) or `python -m comex` (for development).
 
 ### Basic Command Structure
 ```bash
@@ -118,7 +136,10 @@ graph = driver.get_graph()
 ### High-Level Flow
 1. **Parsing Layer** ([tree_parser/](src/comex/tree_parser/)): Tree-sitter-based parsing with language-specific extensions
 2. **Codeview Generation** ([codeviews/](src/comex/codeviews/)): Each codeview has a driver and implementation class
-3. **Combination** ([combined_graph/combined_driver.py](src/comex/codeviews/combined_graph/combined_driver.py)): Merges multiple codeviews into a single NetworkX MultiDiGraph
+3. **Combination** ([combined_graph/combined_driver.py](src/comex/codeviews/combined_graph/combined_driver.py)):
+   - Merges multiple codeviews into a single NetworkX MultiDiGraph
+   - Each edge type (AST, CFG, DFG, etc.) becomes a separate edge in the multigraph
+   - Nodes are merged by ID, with attributes combined from all codeviews
 4. **Output** ([utils/postprocessor.py](src/comex/utils/postprocessor.py)): Exports to JSON or DOT (with PNG via GraphViz)
 
 ### Key Components
@@ -155,7 +176,8 @@ Structure:
 
 #### CLI Entry Point
 - **[cli.py](src/comex/cli.py)**: Typer-based CLI that parses arguments and invokes `CombinedDriver`
-- **[__main__.py](src/comex/__main__.py)**: Enables `python -m comex` invocation
+  - Registered as `comex` console script in [setup.cfg](setup.cfg)
+- **[__main__.py](src/comex/__main__.py)**: Enables `python -m comex` invocation for development
 
 ### Extension Pattern for New Languages
 1. Add tree-sitter grammar URL and commit to `src/comex/__init__.py:grammar_repos`

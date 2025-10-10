@@ -1,7 +1,8 @@
 import subprocess
 
-from comex import get_language_map
 from tree_sitter import Parser
+
+from comex import get_language_map
 
 
 def get_commit_hash(directory):
