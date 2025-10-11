@@ -28,6 +28,21 @@ statement_types = {
         "operator_cast",
         "delete_expression",
         "lambda_expression",
+        # HIGH PRIORITY FEATURES ADDED:
+        "enum_specifier",           # Enum types
+        "union_specifier",          # Union types
+        "type_definition",          # Typedef declarations
+        "friend_declaration",       # Friend declarations
+        "catch_clause",             # Exception catch blocks
+        # MEDIUM PRIORITY FEATURES ADDED:
+        "new_expression",           # Memory management - new
+        "static_assert_declaration", # Static assertions
+        "using_declaration",        # Namespace features
+        "namespace_alias_definition", # Namespace aliases
+        "preproc_include",          # Preprocessor directives
+        "preproc_def",              # Preprocessor defines
+        "preproc_ifdef",            # Preprocessor conditionals
+        "preproc_if",
     ],
     "non_control_statement": [
         "declaration",
@@ -36,6 +51,16 @@ statement_types = {
         "using_declaration",
         "alias_declaration",
         "access_specifier",
+        "enum_specifier",
+        "union_specifier",
+        "type_definition",
+        "friend_declaration",
+        "static_assert_declaration",
+        "namespace_alias_definition",
+        "preproc_include",
+        "preproc_def",
+        "preproc_ifdef",
+        "preproc_if",
     ],
     "control_statement": [
         "if_statement",
@@ -77,6 +102,9 @@ statement_types = {
         "field_declaration",
         "namespace_definition",
         "template_declaration",
+        "enum_specifier",
+        "union_specifier",
+        "type_definition",
     ]
 }
 
@@ -153,6 +181,165 @@ def find_function_definition(node):
             return node.parent
         node = node.parent
     return None
+
+
+def is_virtual_function(node):
+    """Check if a function_definition or field_declaration is virtual"""
+    if node.type not in ["function_definition", "field_declaration"]:
+        return False
+
+    for child in node.children:
+        if child.type == "virtual":
+            return True
+    return False
+
+
+def is_pure_virtual_function(node):
+    """Check if a function is pure virtual (= 0)"""
+    if not is_virtual_function(node):
+        return False
+
+    # Check for = 0 pattern
+    has_equals = False
+    for child in node.children:
+        if child.type == "=" or child.text == b"=":
+            has_equals = True
+        if has_equals and child.type == "number_literal" and child.text == b"0":
+            return True
+    return False
+
+
+def has_field_initializer_list(node):
+    """Check if a function has a constructor initializer list"""
+    if node.type != "function_definition":
+        return False
+
+    for child in node.children:
+        if child.type == "field_initializer_list":
+            return True
+    return False
+
+
+def is_deleted_or_defaulted(node):
+    """Check if a function is = default or = delete"""
+    if node.type not in ["function_definition", "field_declaration"]:
+        return None
+
+    for child in node.children:
+        if child.type == "default_method_clause":
+            return "default"
+        if child.type == "delete_method_clause":
+            return "delete"
+    return None
+
+
+def is_operator_overload(node):
+    """Check if a function is an operator overload"""
+    if node.type != "function_definition":
+        return False
+
+    declarator = node.child_by_field_name("declarator")
+    if declarator:
+        for child in declarator.children:
+            if child.type == "operator_name":
+                return True
+    return False
+
+
+# MEDIUM PRIORITY FEATURE HELPERS
+
+def is_constexpr_function(node):
+    """Check if a function is constexpr"""
+    if node.type not in ["function_definition", "field_declaration"]:
+        return False
+
+    for child in node.children:
+        if child.type == "constexpr":
+            return True
+    return False
+
+
+def is_inline_function(node):
+    """Check if a function has inline specifier"""
+    if node.type not in ["function_definition", "field_declaration"]:
+        return False
+
+    for child in node.children:
+        if child.type == "inline":
+            return True
+    return False
+
+
+def has_noexcept_specifier(node):
+    """Check if a function has noexcept specifier"""
+    if node.type not in ["function_definition", "field_declaration"]:
+        return False
+
+    for child in node.children:
+        if child.type == "noexcept":
+            return True
+    return False
+
+
+def get_attributes(node):
+    """Extract C++ attributes like [[nodiscard]], [[deprecated]]"""
+    attributes = []
+    for child in node.children:
+        if child.type == "attribute_specifier":
+            # Extract attribute names
+            for attr_child in child.children:
+                if attr_child.type == "attribute":
+                    for identifier in attr_child.children:
+                        if identifier.type == "identifier":
+                            attributes.append(identifier.text.decode("utf-8"))
+    return attributes
+
+
+def has_auto_type(node):
+    """Check if a declaration uses auto type inference"""
+    if node.type not in ["declaration", "parameter_declaration"]:
+        return False
+
+    for child in node.children:
+        if child.type == "auto":
+            return True
+        # Check recursively in declarators
+        if child.type in ["init_declarator", "parameter_declarator"]:
+            for subchild in child.children:
+                if subchild.type == "auto":
+                    return True
+    return False
+
+
+def is_rvalue_reference(node):
+    """Check if a declaration is an rvalue reference (&&)"""
+    if node.type not in ["declaration", "parameter_declaration", "field_declaration"]:
+        return False
+
+    for child in node.children:
+        if child.type == "rvalue_reference_declarator":
+            return True
+        # Check in nested declarators
+        if hasattr(child, 'children'):
+            for subchild in child.children:
+                if subchild.type == "rvalue_reference_declarator":
+                    return True
+    return False
+
+
+def is_template_specialization(node):
+    """Check if a template declaration is a specialization"""
+    if node.type != "template_declaration":
+        return False
+
+    # Check for empty template parameter list (template<>)
+    for child in node.children:
+        if child.type == "template_parameter_list":
+            # Empty or has only whitespace/comments
+            named_children = [c for c in child.children if c.is_named]
+            if len(named_children) == 0:
+                return True
+    return False
 
 
 def get_signature(node):
@@ -320,10 +507,24 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
             elif root_node.type == "function_definition":
                 label = ""
                 declarator = root_node.child_by_field_name("declarator")
+
+                # Check for special function properties (high priority)
+                is_virtual = is_virtual_function(root_node)
+                is_pure_virtual = is_pure_virtual_function(root_node)
+                is_operator = is_operator_overload(root_node)
+                deleted_or_defaulted = is_deleted_or_defaulted(root_node)
+                has_initializers = has_field_initializer_list(root_node)
+
+                # Check for medium priority function features
+                is_constexpr = is_constexpr_function(root_node)
+                is_inline = is_inline_function(root_node)
+                has_noexcept = has_noexcept_specifier(root_node)
+                attributes = get_attributes(root_node)
+
                 if declarator:
                     # Get function name and parameters
                     for child in root_node.children:
-                        if child.type != "compound_statement" and child.type != "function_body":
+                        if child.type not in ["compound_statement", "function_body", "field_initializer_list"]:
                             label = label + " " + child.text.decode('utf-8')
 
                 # Extract function name
@@ -367,6 +568,29 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                             else:
                                 return_type = "void"
                             records["return_type"][((class_name, function_name), signature)] = return_type
+
+                            # Track C++ specific function features (high priority)
+                            if is_virtual or is_pure_virtual:
+                                records["virtual_functions"][function_index] = {
+                                    "is_virtual": is_virtual,
+                                    "is_pure_virtual": is_pure_virtual
+                                }
+                            if is_operator:
+                                records["operator_overloads"][function_index] = function_name
+                            if deleted_or_defaulted:
+                                records["special_functions"][function_index] = deleted_or_defaulted
+                            if has_initializers:
+                                records["functions_with_initializers"][function_index] = True
+
+                            # Track medium priority function features
+                            if is_constexpr:
+                                records["constexpr_functions"][function_index] = True
+                            if is_inline:
+                                records["inline_functions"][function_index] = True
+                            if has_noexcept:
+                                records["noexcept_functions"][function_index] = True
+                            if attributes:
+                                records["attributed_functions"][function_index] = attributes
                     else:
                         # Global function
                         if function_name == "main":
@@ -511,6 +735,101 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 else:
                     label = root_node.text.decode("UTF-8")
                 type_label = "return"
+
+            # HIGH PRIORITY FEATURES:
+            elif root_node.type == "enum_specifier":
+                # enum Color { RED, GREEN } or enum class Status { OK, ERROR }
+                enum_name_node = get_child_of_type(root_node, ["type_identifier"])
+                is_scoped = "class" in [child.type for child in root_node.children]
+                if enum_name_node:
+                    enum_name = enum_name_node.text.decode("UTF-8")
+                    if is_scoped:
+                        label = f"enum class {enum_name}"
+                    else:
+                        label = f"enum {enum_name}"
+                else:
+                    label = "enum (anonymous)"
+                type_label = "enum"
+
+                enum_index = index[(root_node.start_point, root_node.end_point, root_node.type)]
+                if enum_name_node:
+                    records["enum_list"][enum_name] = enum_index
+
+            elif root_node.type == "union_specifier":
+                # union Data { int i; float f; }
+                union_name_node = get_child_of_type(root_node, ["type_identifier"])
+                if union_name_node:
+                    union_name = union_name_node.text.decode("UTF-8")
+                    label = f"union {union_name}"
+                else:
+                    label = "union (anonymous)"
+                type_label = "union"
+
+                union_index = index[(root_node.start_point, root_node.end_point, root_node.type)]
+                if union_name_node:
+                    records["union_list"][union_name] = union_index
+
+            elif root_node.type == "type_definition":
+                # typedef int Integer; or typedef void (*FuncPtr)(int);
+                type_identifier_node = get_child_of_type(root_node, ["type_identifier"])
+                if type_identifier_node:
+                    typedef_name = type_identifier_node.text.decode("UTF-8")
+                    label = f"typedef {typedef_name}"
+                else:
+                    label = "typedef"
+                type_label = "typedef"
+
+                typedef_index = index[(root_node.start_point, root_node.end_point, root_node.type)]
+                if type_identifier_node:
+                    records["typedef_list"][typedef_name] = typedef_index
+
+            elif root_node.type == "friend_declaration":
+                # friend class B; or friend void func();
+                label = "friend " + root_node.text.decode("UTF-8").replace("friend", "").strip()
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "friend"
+
+            # MEDIUM PRIORITY NODE TYPES
+            elif root_node.type == "static_assert_declaration":
+                # static_assert(sizeof(int) == 4, "int must be 4 bytes");
+                label = root_node.text.decode("UTF-8")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "static_assert"
+
+            elif root_node.type == "namespace_alias_definition":
+                # namespace short_name = very::long::namespace::name;
+                label = root_node.text.decode("UTF-8")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "namespace_alias"
+
+            elif root_node.type == "preproc_include":
+                # #include <iostream> or #include "header.h"
+                label = root_node.text.decode("UTF-8")
+                type_label = "include"
+
+            elif root_node.type == "preproc_def":
+                # #define MAX_SIZE 100
+                label = root_node.text.decode("UTF-8")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "define"
+
+            elif root_node.type in ["preproc_ifdef", "preproc_if"]:
+                # #ifdef DEBUG or #if defined(FEATURE)
+                label = root_node.text.decode("UTF-8").split('\n')[0]  # Just first line
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "preprocessor"
+
+            elif root_node.type == "new_expression":
+                # new int(5) or new MyClass()
+                label = root_node.text.decode("UTF-8")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "new"
 
             if root_node.type != "function_definition":
                 graph_node_list.append(
