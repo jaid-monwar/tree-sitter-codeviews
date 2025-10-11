@@ -89,29 +89,31 @@ class CParser(CustomParser):
         """
         Given a declarator node, return the variable type of the identifier.
         C type specifiers include: primitive_type, type_identifier, sized_type_specifier, etc.
+
+        This function traverses up the tree to find the declaration or parameter_declaration node,
+        then searches for the type specifier among its children. This handles complex nested
+        declarators like int **pp, int ***ppp, int (*ptr_arr)[10], etc.
         """
         datatypes = ['primitive_type', 'type_identifier', 'sized_type_specifier',
                      'struct_specifier', 'union_specifier', 'enum_specifier']
 
-        if node.type == "parameter_declaration":
-            # For parameters, look for type specifier
-            for child in node.children:
-                if child.type in datatypes:
-                    return child.text.decode('utf-8')
-            return None
+        # Start from the current node and walk up the tree
+        current = node
 
-        # Search in parent's children for type specifier
-        if node.parent is not None:
-            for child in node.parent.children:
-                if child.type in datatypes:
-                    return child.text.decode('utf-8')
-
-            # Try searching in grandparent for nested declarators
-            if node.parent.parent is not None:
-                for child in node.parent.parent.children:
+        while current is not None:
+            # Check if we've reached a declaration or parameter_declaration node
+            if current.type in ["declaration", "parameter_declaration"]:
+                # Found the declaration context, now search for type specifier
+                for child in current.children:
                     if child.type in datatypes:
                         return child.text.decode('utf-8')
+                # If no type found at this level, return None
+                return None
 
+            # Move up to parent
+            current = current.parent
+
+        # If we've reached the root without finding a declaration, return None
         return None
 
     def scope_check(self, parent_scope, child_scope):
