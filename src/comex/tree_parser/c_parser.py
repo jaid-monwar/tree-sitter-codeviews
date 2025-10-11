@@ -10,6 +10,7 @@ class CParser(CustomParser):
         Check if the current node is a variable declaration in C.
         C declarations can be:
         - init_declarator (e.g., int x = 5;)
+        - Direct child of declaration (e.g., int x;)
         - parameter_declaration (function parameters)
         - pointer_declarator (pointer variables)
         """
@@ -42,6 +43,24 @@ class CParser(CustomParser):
             elif current_node.parent.type == "parameter_declaration":
                 # Function parameters are declarations
                 return True
+
+        # Handle uninitialized declarations: int x; (identifier is direct child of declaration)
+        if (
+            current_node.parent is not None
+            and current_node.parent.type == "declaration"
+            and current_node.type == "identifier"
+        ):
+            # Check if this identifier comes after a type specifier
+            # Structure: declaration -> [primitive_type/type_identifier, identifier, ;]
+            for i, child in enumerate(current_node.parent.children):
+                if child == current_node and i > 0:
+                    # Check if previous sibling is a type specifier
+                    prev_sibling = current_node.parent.children[i-1]
+                    if prev_sibling.type in ['primitive_type', 'type_identifier', 'sized_type_specifier',
+                                             'struct_specifier', 'union_specifier', 'enum_specifier',
+                                             'storage_class_specifier', 'type_qualifier']:
+                        return True
+            return False
 
         # Handle direct declarators in declarations
         if current_node.parent is not None and current_node.parent.type == "declarator":
