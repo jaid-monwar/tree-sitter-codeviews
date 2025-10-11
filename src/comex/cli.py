@@ -17,7 +17,7 @@ app = typer.Typer()
 
 @app.callback(invoke_without_command=True)
 def main(
-        lang: str = typer.Option(..., help="java, cs"),
+        lang: str = typer.Option(..., help="java, cs, c"),
         code: Optional[str] = typer.Option(None, help="""
     public class Max2 {
         public static void main(String[] args) {
