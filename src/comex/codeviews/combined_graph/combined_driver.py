@@ -49,7 +49,8 @@ class CombinedDriver:
                 )
             if graph_format == "all" or graph_format == "dot":
                 postprocessor.write_to_dot(
-                    self.graph, output_file.split(".")[0] + ".dot", output_png=True
+                    self.graph, output_file.split(".")[0] + ".dot",
+                    output_png=True, src_language=self.src_language
                 )
 
     def get_graph(self):

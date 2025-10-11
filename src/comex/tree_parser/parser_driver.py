@@ -1,6 +1,7 @@
 from ..tree_parser.java_parser import JavaParser
 from ..tree_parser.cs_parser import CSParser
 from ..tree_parser.c_parser import CParser
+from ..tree_parser.cpp_parser import CppParser
 from ..utils import preprocessor
 
 class ParserDriver:
@@ -15,6 +16,7 @@ class ParserDriver:
             "java": JavaParser,
             "cs": CSParser,
             "c": CParser,
+            "cpp": CppParser,
             # 'python': PythonParser
             # Add more languages here
         }

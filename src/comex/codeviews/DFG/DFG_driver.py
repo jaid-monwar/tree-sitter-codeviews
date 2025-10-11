@@ -33,4 +33,5 @@ class DFGDriver:
                 # os.path.join(grandparent_folder,"output_graphs/AST_output.dot"),
                 output_file.split(".")[0] + ".dot",
                 output_png=True,
+                src_language=self.src_language,
             )
