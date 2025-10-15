@@ -2,6 +2,6 @@
 using namespace std;
 
 int main() {
-    string x = "hello world";
+    string x = "hell\to\tworld\n";
     cout << "Output x:" << x;
 }
