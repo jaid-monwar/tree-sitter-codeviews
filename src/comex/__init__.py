@@ -14,7 +14,7 @@ def get_language_map():
         ("https://github.com/tree-sitter/tree-sitter-java", "09d650def6cdf7f479f4b78f595e9ef5b58ce31e"),
         ("https://github.com/tree-sitter/tree-sitter-c-sharp", "3ef3f7f99e16e528e6689eae44dff35150993307"),
         ("https://github.com/tree-sitter/tree-sitter-c", "34f4c7e751f4d661be3e23682fe2631d6615141d"),
-        ("https://github.com/tree-sitter/tree-sitter-cpp", "a71474021410973b29bfe99440d57bcd750246b1")
+        ("https://github.com/tree-sitter/tree-sitter-cpp", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02")  # Latest stable with pure virtual destructor support
     ]
     vendor_languages = []
 
@@ -39,6 +39,20 @@ def get_language_map():
                               stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         subprocess.check_call(["git", "checkout", commit], cwd=vendor_language, stdout=subprocess.DEVNULL,
                               stderr=subprocess.STDOUT)
+
+        # Patch tree-sitter-cpp scanner.c to remove static_assert that causes compilation issues
+        if grammar == "tree-sitter-cpp":
+            scanner_path = os.path.join(vendor_language, "src", "scanner.c")
+            if os.path.exists(scanner_path):
+                with open(scanner_path, 'r') as f:
+                    content = f.read()
+                # Remove problematic static_assert lines
+                content = content.replace(
+                    'static_assert(MAX_DELIMITER_LENGTH * sizeof(wchar_t) < TREE_SITTER_SERIALIZATION_BUFFER_SIZE,\n                  "Serialized delimiter is too long!");',
+                    '// static_assert removed for compatibility'
+                )
+                with open(scanner_path, 'w') as f:
+                    f.write(content)
 
     # build_id = ""
     # for vendor_language in vendor_languages:
