@@ -27,12 +27,36 @@ def to_dot(graph):
     return nx.nx_pydot.to_pydot(graph)
 
 
-def write_to_dot(og_graph, filename, output_png=False):
+def write_to_dot(og_graph, filename, output_png=False, src_language=None):
     graph = copy.deepcopy(og_graph)
     if not os.getenv("GITHUB_ACTIONS"):
+        # DOT reserved keywords that need to be quoted
+        dot_reserved_keywords = {
+            'node', 'edge', 'graph', 'digraph', 'subgraph', 'strict',
+            'Node', 'Edge', 'Graph', 'Digraph', 'Subgraph', 'Strict'
+        }
+
         for node in graph.nodes:
             if 'label' in graph.nodes[node]:
-                graph.nodes[node]['label'] = re.escape(graph.nodes[node]['label'])
+                label = graph.nodes[node]['label']
+
+                # C++ specific handling for namespace qualifiers and other special chars
+                if src_language == 'cpp':
+                    label = str(label)
+                    # Replace colons (from C++ namespace qualifiers like std::cout)
+                    label = label.replace('::', '_SCOPE_')
+                    # Replace other potentially problematic characters
+                    label = label.replace('\n', ' ')
+                    label = label.replace('\r', ' ')
+                else:
+                    # Original behavior for Java, C#, C, and other languages
+                    label = re.escape(label)
+
+                # Quote the label if it's a DOT reserved keyword
+                if label in dot_reserved_keywords:
+                    label = f'"{label}"'
+
+                graph.nodes[node]['label'] = label
         nx.nx_pydot.write_dot(graph, filename)
         if output_png:
             check_call(

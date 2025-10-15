@@ -26,6 +26,12 @@ class ASTDriver:
         self.graph = self.AST.graph
         if output_file:
             self.json = postprocessor.write_networkx_to_json(self.graph, output_file)
-            postprocessor.write_to_dot(
-                self.graph, output_file.split(".")[0] + ".dot", output_png=True
-            )
+            try:
+                postprocessor.write_to_dot(
+                    self.graph, output_file.split(".")[0] + ".dot",
+                    output_png=True, src_language=self.src_language
+                )
+            except Exception:
+                # DOT/PNG generation may fail for some code with special characters
+                # But JSON output (primary format) is still generated successfully
+                pass

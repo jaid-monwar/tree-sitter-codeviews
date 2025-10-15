@@ -1,14 +1,18 @@
 import traceback
+
 import networkx as nx
-from .CFG import CFGGraph
-from ...utils import java_nodes
 from loguru import logger
+
+from ...utils import java_nodes
+from .CFG import CFGGraph
+
 
 class CFGGraph_java(CFGGraph):
     def __init__(self, src_language, src_code, properties, root_node, parser):
         super().__init__(src_language, src_code, properties, root_node, parser)
 
         self.node_list = None
+        # Import statement types from java_nodes
         self.statement_types = java_nodes.statement_types
         self.CFG_node_list = []
         self.CFG_edge_list = []
@@ -30,6 +34,8 @@ class CFGGraph_java(CFGGraph):
         self.types = ["scoped_type_identifier", "type_identifier", "generic_type"]
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
+
+        # Access parser data (created by parser_driver)
         self.symbol_table = self.parser.symbol_table
         self.declaration = self.parser.declaration
         self.declaration_map = self.parser.declaration_map

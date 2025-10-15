@@ -1,5 +1,6 @@
 from ..tree_parser.custom_parser import CustomParser
 
+
 class JavaParser(CustomParser):
     def __init__(self, src_language, src_code):
         super().__init__(src_language, src_code)
@@ -97,27 +98,39 @@ class JavaParser(CustomParser):
             "explicit_constructor_invocation",
         ]
 
+        # Scope Management
         if root_node.is_named and root_node.type in block_types:
             """On entering a new block, increment the scope id and push it to the scope_stack"""
             # current_scope = symbol_table['scope_stack'][-1]
             symbol_table["scope_id"] = symbol_table["scope_id"] + 1
             symbol_table["scope_stack"].append(symbol_table["scope_id"])
 
+        # Leaf Node Processing (Tokens)
         if (
             root_node.is_named
             and (len(root_node.children) == 0 or root_node.type == "string")
             and root_node.type != "comment"
         ): # All identifiers
+            # Get unique ID for this token
             index = self.index[(root_node.start_point, root_node.end_point, root_node.type)]
+
+            # Extract label (actual code in the source)
             label[index] = root_node.text.decode("UTF-8")
+
+            # start line number
             start_line[index] = root_node.start_point[0]
+            
+            # add to token list
             all_tokens.append(index)
             """Store a copy of the current scope stack in the scope map for each token. This token belongs to all the scopes in the current scope stack."""
             
+            # Record which scopes this token belongs to
             symbol_table["scope_map"][index] = symbol_table["scope_stack"].copy()
 
             
             current_node = root_node
+            
+            # Method Identification
             if (current_node.parent is not None and current_node.parent.type in remove_list):
                 method_map.append(index)
                 if current_node.next_named_sibling.type == "argument_list":
@@ -137,6 +150,7 @@ class JavaParser(CustomParser):
                     method_map.append(index)
                 label[index] = current_node.text.decode("UTF-8")
                 
+            # Variable Declaration
             if self.check_declaration(current_node):
                 variable_name = label[index]
                 declaration[index] = variable_name
@@ -145,6 +159,7 @@ class JavaParser(CustomParser):
                 if variable_type is not None:
                     symbol_table["data_type"][index] = variable_type
             else:
+                # Variable Usage
                 current_scope = symbol_table['scope_map'][index]
 
                 if current_node.type == "field_access":   
@@ -177,6 +192,7 @@ class JavaParser(CustomParser):
                         declaration_map[index] = closest_index
                         break
 
+        # Recursion and Scope Exit
         else:
             for child in root_node.children:
                 self.create_all_tokens(

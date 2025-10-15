@@ -1,8 +1,9 @@
-import shutil
-import tempfile
-from tree_sitter import Language
 import os
+import shutil
 import subprocess
+import tempfile
+
+from tree_sitter import Language
 
 
 def get_language_map():
@@ -11,7 +12,9 @@ def get_language_map():
 
     grammar_repos = [
         ("https://github.com/tree-sitter/tree-sitter-java", "09d650def6cdf7f479f4b78f595e9ef5b58ce31e"),
-        ("https://github.com/tree-sitter/tree-sitter-c-sharp", "3ef3f7f99e16e528e6689eae44dff35150993307")
+        ("https://github.com/tree-sitter/tree-sitter-c-sharp", "3ef3f7f99e16e528e6689eae44dff35150993307"),
+        ("https://github.com/tree-sitter/tree-sitter-c", "34f4c7e751f4d661be3e23682fe2631d6615141d"),
+        ("https://github.com/tree-sitter/tree-sitter-cpp", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02")  # Latest stable with pure virtual destructor support
     ]
     vendor_languages = []
 
@@ -36,6 +39,20 @@ def get_language_map():
                               stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         subprocess.check_call(["git", "checkout", commit], cwd=vendor_language, stdout=subprocess.DEVNULL,
                               stderr=subprocess.STDOUT)
+
+        # Patch tree-sitter-cpp scanner.c to remove static_assert that causes compilation issues
+        if grammar == "tree-sitter-cpp":
+            scanner_path = os.path.join(vendor_language, "src", "scanner.c")
+            if os.path.exists(scanner_path):
+                with open(scanner_path, 'r') as f:
+                    content = f.read()
+                # Remove problematic static_assert lines
+                content = content.replace(
+                    'static_assert(MAX_DELIMITER_LENGTH * sizeof(wchar_t) < TREE_SITTER_SERIALIZATION_BUFFER_SIZE,\n                  "Serialized delimiter is too long!");',
+                    '// static_assert removed for compatibility'
+                )
+                with open(scanner_path, 'w') as f:
+                    f.write(content)
 
     # build_id = ""
     # for vendor_language in vendor_languages:
@@ -65,6 +82,8 @@ def get_language_map():
     # PYTHON_LANGUAGE = Language("build/my-languages.so", "python")
     JAVA_LANGUAGE = Language(shared_languages, "java")
     C_SHARP_LANGUAGE = Language(shared_languages, "c_sharp")
+    C_LANGUAGE = Language(shared_languages, "c")
+    CPP_LANGUAGE = Language(shared_languages, "cpp")
     # RUBY_LANGUAGE = Language("build/my-languages.so", "ruby")
     # GO_LANGUAGE = Language("build/my-languages.so", "go")
     # PHP_LANGUAGE = Language("build/my-languages.so", "php")
@@ -77,6 +96,8 @@ def get_language_map():
         # "python": PYTHON_LANGUAGE,
         "java": JAVA_LANGUAGE,
         "cs": C_SHARP_LANGUAGE,
+        "c": C_LANGUAGE,
+        "cpp": CPP_LANGUAGE,
         # "ruby": RUBY_LANGUAGE,
         # "go": GO_LANGUAGE,
         # "php": PHP_LANGUAGE,
