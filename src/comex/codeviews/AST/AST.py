@@ -19,6 +19,11 @@ class ASTGraph:
     def get_AST_nodes(self, root_node, AST, AST_index):
 
         if root_node.is_named:
+            # Skip string_content nodes for C and C++ to match Java/C# behavior
+            # In tree-sitter, C/C++ string_literal has a string_content child, but Java/C# don't
+            if root_node.type == "string_content":
+                return None
+
             current_node_id = AST_index[
                 (root_node.start_point, root_node.end_point, root_node.type)
             ]
