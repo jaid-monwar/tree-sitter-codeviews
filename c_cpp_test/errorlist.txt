@@ -1,3 +1,3 @@
-1. Crashes if there is any variable/struct/class named "node"
-2. Can't handle pure virtual functions. Creates an "ERROR" node instead of the assignment operator
-3. The order of string_content and "hello world" is inverted. "hello world" should be the child of string_content. Also, treating cin and cout as binary expressions seems awkward
+1. Can't detect the ... parameter
+2. Can't detect escapes characters such as \t and \n in the string. These are parts of the string, not children.
+   hell\to\tworld\n is converted to helltotworld, which is not correct from any point of view.

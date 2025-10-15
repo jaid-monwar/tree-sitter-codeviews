@@ -40,16 +40,18 @@ def write_to_dot(og_graph, filename, output_png=False, src_language=None):
             if 'label' in graph.nodes[node]:
                 label = graph.nodes[node]['label']
 
-                # C++ specific handling for namespace qualifiers and other special chars
-                if src_language == 'cpp':
+                # C and C++ specific handling for namespace qualifiers and other special chars
+                if src_language in ['c', 'cpp']:
                     label = str(label)
                     # Replace colons (from C++ namespace qualifiers like std::cout)
                     label = label.replace('::', '_SCOPE_')
+                    # Escape backslashes first (before other replacements) to preserve escape sequences
+                    label = label.replace('\\', '\\\\')
                     # Replace other potentially problematic characters
                     label = label.replace('\n', ' ')
                     label = label.replace('\r', ' ')
                 else:
-                    # Original behavior for Java, C#, C, and other languages
+                    # Original behavior for Java, C#, and other languages
                     label = re.escape(label)
 
                 # Quote the label if it's a DOT reserved keyword

@@ -170,9 +170,11 @@ class CParser(CustomParser):
             symbol_table["scope_stack"].append(symbol_table["scope_id"])
 
         # Leaf Node Processing (Tokens)
+        # Note: variadic_parameter has unnamed children but should be treated as a leaf node
+        # so that "..." appears in the AST with its actual syntax rather than just the node type
         if (
             root_node.is_named
-            and (len(root_node.children) == 0 or root_node.type == "string_literal")
+            and (len(root_node.children) == 0 or root_node.type in ["string_literal", "variadic_parameter"])
             and root_node.type != "comment"
         ):
             # Get unique ID for this token

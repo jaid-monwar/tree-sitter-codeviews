@@ -4,7 +4,7 @@ using namespace std;
 // Template function to return maximum of two values
 template <typename T> T myMax(T x, T y)
 {
-    return (x > y) ? x : y;
+    return x>y ? x : y;
 }
 
 int main()

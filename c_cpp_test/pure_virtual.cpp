@@ -1,6 +1,15 @@
 #include <iostream>
 using namespace std;
 
+class tester
+{
+    public:
+    int x = 0;
+    int func(int a, int b) {
+        return a+b;
+    }
+};
+
 class Base
 {
   public:
@@ -34,6 +43,7 @@ class Derived : public Base
 
 int main()
 {
+    int x = 0;
     Base *basePtr;
     Derived derivedObj;
     basePtr = &derivedObj;
