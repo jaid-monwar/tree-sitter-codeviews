@@ -30,6 +30,12 @@ def to_dot(graph):
 def write_to_dot(og_graph, filename, output_png=False, src_language=None):
     graph = copy.deepcopy(og_graph)
     if not os.getenv("GITHUB_ACTIONS"):
+        # DOT reserved keywords that need to be quoted
+        dot_reserved_keywords = {
+            'node', 'edge', 'graph', 'digraph', 'subgraph', 'strict',
+            'Node', 'Edge', 'Graph', 'Digraph', 'Subgraph', 'Strict'
+        }
+
         for node in graph.nodes:
             if 'label' in graph.nodes[node]:
                 label = graph.nodes[node]['label']
@@ -45,6 +51,10 @@ def write_to_dot(og_graph, filename, output_png=False, src_language=None):
                 else:
                     # Original behavior for Java, C#, C, and other languages
                     label = re.escape(label)
+
+                # Quote the label if it's a DOT reserved keyword
+                if label in dot_reserved_keywords:
+                    label = f'"{label}"'
 
                 graph.nodes[node]['label'] = label
         nx.nx_pydot.write_dot(graph, filename)
