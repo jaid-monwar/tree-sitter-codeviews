@@ -87,26 +87,54 @@ class CParser(CustomParser):
 
     def get_type(self, node):
         """
-        Given a declarator node, return the variable type of the identifier.
+        Given a declarator node, return the variable type of the identifier INCLUDING pointer indicators.
         C type specifiers include: primitive_type, type_identifier, sized_type_specifier, etc.
 
         This function traverses up the tree to find the declaration or parameter_declaration node,
         then searches for the type specifier among its children. This handles complex nested
         declarators like int **pp, int ***ppp, int (*ptr_arr)[10], etc.
+
+        Returns the full type including pointers, e.g., "char*", "int**", "uint32_t*"
         """
         datatypes = ['primitive_type', 'type_identifier', 'sized_type_specifier',
                      'struct_specifier', 'union_specifier', 'enum_specifier']
 
         # Start from the current node and walk up the tree
         current = node
+        pointer_count = 0
+        is_array = False
 
+        # Count pointer levels and check for arrays while traversing up
         while current is not None:
+            # Count pointer declarators
+            if current.type == "pointer_declarator":
+                # Count the number of '*' symbols
+                for child in current.children:
+                    if child.type == "*":
+                        pointer_count += 1
+
+            # Check for array declarators
+            if current.type == "array_declarator":
+                is_array = True
+
             # Check if we've reached a declaration or parameter_declaration node
             if current.type in ["declaration", "parameter_declaration"]:
                 # Found the declaration context, now search for type specifier
+                base_type = None
                 for child in current.children:
                     if child.type in datatypes:
-                        return child.text.decode('utf-8')
+                        base_type = child.text.decode('utf-8')
+                        break
+
+                if base_type:
+                    # Add pointer indicators
+                    if pointer_count > 0:
+                        base_type += "*" * pointer_count
+                    elif is_array:
+                        # Arrays decay to pointers in most contexts
+                        base_type += "*"
+                    return base_type
+
                 # If no type found at this level, return None
                 return None
 
