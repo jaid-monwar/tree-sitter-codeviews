@@ -1,0 +1,4 @@
+# Generate AST
+comex --lang "c" --code-file sample/test_c.c --graphs "ast"
+
+comex --lang "cpp" --code-file hello.cpp --graphs "ast" --output "json"
