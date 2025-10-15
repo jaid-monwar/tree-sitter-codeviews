@@ -4,6 +4,13 @@ from ..tree_parser.custom_parser import CustomParser
 class CParser(CustomParser):
     def __init__(self, src_language, src_code):
         super().__init__(src_language, src_code)
+        # Track struct definitions: struct_name -> {field_name: field_type}
+        self.struct_definitions = {}
+        # Track typedef aliases: typedef_name -> actual_type
+        self.typedef_map = {}
+        # Parse struct definitions and typedefs after initialization
+        self._parse_struct_definitions()
+        self._parse_typedefs()
 
     def check_declaration(self, current_node):
         """
@@ -133,7 +140,9 @@ class CParser(CustomParser):
                     elif is_array:
                         # Arrays decay to pointers in most contexts
                         base_type += "*"
-                    return base_type
+
+                    # Expand typedef if applicable
+                    return self.expand_typedef(base_type)
 
                 # If no type found at this level, return None
                 return None
@@ -321,3 +330,231 @@ class CParser(CustomParser):
             declaration_map,
             symbol_table,
         )
+
+    def _parse_struct_definitions(self):
+        """
+        Parse all struct definitions in the code and build a mapping of
+        struct_name -> {field_name: field_type}
+
+        This allows us to resolve struct field types when we encounter
+        field_expression nodes like p.x or ptr->field.
+        """
+        def traverse_for_structs(node):
+            if node.type == "struct_specifier":
+                # Get struct name if it exists
+                struct_name = None
+                field_list = None
+
+                for child in node.children:
+                    if child.type == "type_identifier":
+                        struct_name = child.text.decode('utf-8')
+                    elif child.type == "field_declaration_list":
+                        field_list = child
+
+                # Only process if we have both name and fields
+                if struct_name and field_list:
+                    fields = {}
+                    for field_decl in field_list.children:
+                        if field_decl.type == "field_declaration":
+                            # Extract field type and name
+                            field_type = None
+                            field_names = []
+
+                            for fc in field_decl.children:
+                                # Get base type
+                                if fc.type in ['primitive_type', 'type_identifier', 'sized_type_specifier', 'struct_specifier']:
+                                    if fc.type == 'struct_specifier':
+                                        # Nested struct - get its name
+                                        for sc in fc.children:
+                                            if sc.type == "type_identifier":
+                                                field_type = "struct " + sc.text.decode('utf-8')
+                                                break
+                                    else:
+                                        field_type = fc.text.decode('utf-8')
+
+                                # Get field declarators
+                                elif fc.type == "field_identifier":
+                                    field_names.append(fc.text.decode('utf-8'))
+                                elif fc.type == "pointer_declarator":
+                                    # Handle pointer fields
+                                    pointer_count = fc.text.decode('utf-8').count('*')
+                                    # Find the identifier
+                                    for pchild in fc.named_children:
+                                        if pchild.type == "field_identifier":
+                                            field_names.append(pchild.text.decode('utf-8'))
+                                            break
+                                    # Add pointer indicators to type
+                                    if field_type:
+                                        field_type += "*" * pointer_count
+                                elif fc.type == "array_declarator":
+                                    # Handle array fields
+                                    for achild in fc.children:
+                                        if achild.type == "field_identifier":
+                                            field_names.append(achild.text.decode('utf-8'))
+                                            break
+                                    # Arrays decay to pointers
+                                    if field_type:
+                                        field_type += "*"
+
+                            # Store each field with its type
+                            for fname in field_names:
+                                fields[fname] = field_type if field_type else "unknown"
+
+                    self.struct_definitions[struct_name] = fields
+
+            # Recurse to children
+            for child in node.children:
+                traverse_for_structs(child)
+
+        traverse_for_structs(self.root_node)
+
+    def get_struct_field_type(self, struct_name, field_name):
+        """
+        Get the type of a field in a struct.
+
+        Args:
+            struct_name: Name of the struct (without 'struct' keyword)
+            field_name: Name of the field
+
+        Returns:
+            Type string or "unknown" if not found
+        """
+        # Remove 'struct' prefix if present
+        if struct_name.startswith('struct '):
+            struct_name = struct_name[7:]
+
+        if struct_name in self.struct_definitions:
+            return self.struct_definitions[struct_name].get(field_name, "unknown")
+        return "unknown"
+
+    def _parse_typedefs(self):
+        """
+        Parse all typedef declarations and build a mapping of
+        typedef_name -> actual_type
+
+        This allows us to expand typedef aliases when resolving types.
+        """
+        def traverse_for_typedefs(node):
+            if node.type == "type_definition":
+                # Extract typedef name and actual type
+                # Strategy: Process children in order
+                # - Skip "typedef" keyword
+                # - First non-keyword is the base type
+                # - Last type_identifier or primitive_type (not in declarator) is the typedef name
+
+                children = [c for c in node.children if c.type != ';' and c.type != 'typedef']
+
+                if len(children) < 2:
+                    return
+
+                # Find the typedef name (usually last identifier)
+                typedef_name = None
+                actual_type = None
+                pointer_count = 0
+
+                # Check for pointer_declarator (e.g., typedef char* String or char** StringArray)
+                if any(c.type == 'pointer_declarator' for c in children):
+                    # First child is base type
+                    if children[0].type in ['primitive_type', 'sized_type_specifier', 'type_identifier']:
+                        actual_type = children[0].text.decode('utf-8')
+
+                    # Pointer declarator contains the typedef name and pointer count
+                    # Navigate through nested pointer_declarators for multiple *
+                    for child in children:
+                        if child.type == 'pointer_declarator':
+                            pointer_count = child.text.decode('utf-8').count('*')
+
+                            # Find the innermost identifier (could be nested)
+                            def find_typedef_name(node):
+                                if node.type in ['type_identifier', 'identifier']:
+                                    return node.text.decode('utf-8')
+                                for c in node.named_children:
+                                    result = find_typedef_name(c)
+                                    if result:
+                                        return result
+                                return None
+
+                            typedef_name = find_typedef_name(child)
+
+                # Check for function_declarator (function pointers)
+                elif any(c.type == 'function_declarator' for c in children):
+                    # First child is return type
+                    if children[0].type in ['primitive_type', 'type_identifier']:
+                        actual_type = "function_pointer"
+
+                    for child in children:
+                        if child.type == 'function_declarator':
+                            # Find name in pointer_declarator inside function_declarator
+                            for fc in child.children:
+                                if fc.type == 'pointer_declarator':
+                                    for pdc in fc.named_children:
+                                        if pdc.type in ['identifier', 'type_identifier']:
+                                            typedef_name = pdc.text.decode('utf-8')
+                                            break
+
+                # Check for struct typedef
+                elif any(c.type == 'struct_specifier' for c in children):
+                    for i, child in enumerate(children):
+                        if child.type == 'struct_specifier':
+                            # Get struct name if it has one
+                            for sc in child.children:
+                                if sc.type == "type_identifier":
+                                    actual_type = "struct " + sc.text.decode('utf-8')
+                                    break
+                            if not actual_type:
+                                # Anonymous struct
+                                actual_type = child.text.decode('utf-8')
+
+                        # The typedef name comes after the struct
+                        elif child.type in ['type_identifier', 'primitive_type'] and i > 0:
+                            typedef_name = child.text.decode('utf-8')
+
+                # Simple typedef (e.g., typedef int MyInt OR typedef MyInt Integer)
+                else:
+                    # First is actual type, second is typedef name
+                    if len(children) >= 2:
+                        # First child is the base type
+                        if children[0].type in ['primitive_type', 'sized_type_specifier', 'type_identifier']:
+                            actual_type = children[0].text.decode('utf-8')
+
+                        # Last child is the typedef name
+                        if children[-1].type in ['type_identifier', 'primitive_type']:
+                            typedef_name = children[-1].text.decode('utf-8')
+
+                # Add pointers to actual type
+                if actual_type and pointer_count > 0:
+                    actual_type += "*" * pointer_count
+
+                # Store the typedef mapping
+                if typedef_name and actual_type:
+                    self.typedef_map[typedef_name] = actual_type
+
+            # Recurse to children
+            for child in node.children:
+                traverse_for_typedefs(child)
+
+        traverse_for_typedefs(self.root_node)
+
+    def expand_typedef(self, type_name):
+        """
+        Recursively expand a typedef to its actual type.
+
+        Args:
+            type_name: Type name (possibly a typedef)
+
+        Returns:
+            Expanded type string, or original if not a typedef
+        """
+        # Handle pointer types
+        if type_name.endswith('*'):
+            base = type_name.rstrip('*')
+            stars = '*' * type_name.count('*')
+            expanded = self.expand_typedef(base.strip())
+            return expanded + stars
+
+        # Check if this is a typedef
+        if type_name in self.typedef_map:
+            # Recursively expand (in case typedef points to another typedef)
+            return self.expand_typedef(self.typedef_map[type_name])
+
+        return type_name

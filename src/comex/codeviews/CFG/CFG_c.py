@@ -256,7 +256,9 @@ class CFGGraph_c(CFGGraph):
         # IDENTIFIERS - Look up in symbol table
         # ============================================================
         if node_type == "identifier":
-            # Check if this identifier has a declaration
+            var_name = arg_node.text.decode('utf-8')
+
+            # Method 1: Try declaration_map (if populated)
             arg_index_key = (arg_node.start_point, arg_node.end_point, arg_node.type)
             if arg_index_key in self.index:
                 arg_index = self.index[arg_index_key]
@@ -267,6 +269,18 @@ class CFGGraph_c(CFGGraph):
                     # Get type from symbol table
                     if decl_index in self.symbol_table["data_type"]:
                         return self.symbol_table["data_type"][decl_index]
+
+            # Method 2: Look up by name in declaration dict (fallback for C)
+            # Find the declaration index for this variable name
+            for decl_idx, decl_name in self.declaration.items():
+                if decl_name == var_name:
+                    # Check if this declaration has a type
+                    if decl_idx in self.symbol_table["data_type"]:
+                        var_type = self.symbol_table["data_type"][decl_idx]
+                        # Expand typedef if applicable
+                        if hasattr(self.parser, 'expand_typedef'):
+                            return self.parser.expand_typedef(var_type)
+                        return var_type
 
             return "unknown"
 
@@ -389,11 +403,25 @@ class CFGGraph_c(CFGGraph):
         elif node_type == "field_expression":
             # struct.field or ptr->field
             field = arg_node.child_by_field_name("field")
-            if field and field.type == "identifier":
-                # Try to look up field type
-                # For now, we don't have struct field type information
-                # This would require parsing struct definitions
-                return "unknown"
+            argument = arg_node.child_by_field_name("argument")
+
+            if field and field.type in ["field_identifier", "identifier"]:
+                field_name = field.text.decode('utf-8')
+
+                # Try to get the type of the struct/pointer being accessed
+                if argument:
+                    struct_type = self.get_argument_type(argument)
+
+                    # Remove pointer indicators if this is ptr->field (for pointer access)
+                    # struct_type might be "struct Point*" or "struct Point"
+                    base_type = struct_type.rstrip('*').strip()
+
+                    # Look up field type in struct definitions
+                    if hasattr(self.parser, 'struct_definitions'):
+                        field_type = self.parser.get_struct_field_type(base_type, field_name)
+                        if field_type != "unknown":
+                            return field_type
+
             return "unknown"
 
         # ============================================================
@@ -536,6 +564,37 @@ class CFGGraph_c(CFGGraph):
             index=self.index,
             records=self.records
         )
+
+        # Filter out nodes that shouldn't be in CFG
+        # 1. Preprocessor directives (compile-time only, not runtime control flow)
+        # 2. Compound statements (redundant - individual statements already represented)
+        cfg_excluded_types = [
+            "preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
+            "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else",
+            "compound_statement"
+        ]
+
+        # Filter node_list dictionary
+        node_list = {key: node for key, node in node_list.items()
+                     if node.type not in cfg_excluded_types}
+
+        # Filter CFG_node_list
+        filtered_cfg_nodes = []
+        excluded_indices = set()
+        for node_tuple in self.CFG_node_list:
+            node_id = node_tuple[0]
+            # Find the node type from index
+            node_found = False
+            for key, node in node_list.items():
+                if self.get_index(node) == node_id:
+                    filtered_cfg_nodes.append(node_tuple)
+                    node_found = True
+                    break
+            if not node_found:
+                # This node was filtered out
+                excluded_indices.add(node_id)
+
+        self.CFG_node_list = filtered_cfg_nodes
 
         # ============================================================
         # STEP 2: Create Initial Sequential Edges
