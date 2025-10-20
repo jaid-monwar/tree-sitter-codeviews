@@ -14,6 +14,7 @@ int main() {
     printf("var: %d\n", var);          
     printf("*ptr1: %d\n", *ptr1);
     printf("**ptr2: %d", **ptr2);
+    printf("hel\tlo\tworld\n");
 
     return 0;
 }
