@@ -666,7 +666,18 @@ class CFGGraph_c(CFGGraph):
         self.CFG_node_list = updated_node_list
 
         # ============================================================
-        # STEP 5: Build Function Call Map
+        # STEP 5: Detect Main Function
+        # ============================================================
+        # Check if a main function exists and record it
+        for key, node in node_list.items():
+            if node.type == "function_definition":
+                func_name = c_nodes.get_function_name(node)
+                if func_name == "main":
+                    self.records["main_function"] = self.get_index(node)
+                    break
+
+        # ============================================================
+        # STEP 6: Build Function Call Map
         # ============================================================
         self.function_list(self.root_node, node_list)
 
@@ -695,13 +706,13 @@ class CFGGraph_c(CFGGraph):
                             self.records["return_statement_map"][func_index].append(last_index)
 
         # ============================================================
-        # STEP 6: Add Dummy Nodes
+        # STEP 7: Add Dummy Nodes
         # ============================================================
         # Add start node (ID=1)
         self.CFG_node_list.append((1, 0, "start_node", "start"))
 
         # ============================================================
-        # STEP 7: Add Control Flow Edges
+        # STEP 8: Add Control Flow Edges
         # ============================================================
         for key, node in node_list.items():
             current_index = self.get_index(node)
@@ -710,11 +721,15 @@ class CFGGraph_c(CFGGraph):
             if node.type == "function_definition":
                 func_name = c_nodes.get_function_name(node)
 
-                # Connect start node to main function
-                if func_name == "main":
-                    self.add_edge(1, current_index, "next")
+                # Connect start node based on whether main function exists
+                # This follows the same logic as Java CFG implementation
+                if "main_function" in self.records:
+                    # Main function exists: only connect start_node to main
+                    # Other functions become disjoint graphs
+                    if func_name == "main":
+                        self.add_edge(1, current_index, "next")
                 else:
-                    # Connect start to all top-level functions
+                    # No main function: connect start_node to all functions
                     self.add_edge(1, current_index, "next")
 
                 # Connect function to first statement in body
@@ -1040,7 +1055,7 @@ class CFGGraph_c(CFGGraph):
                     self.add_edge(current_index, self.get_index(stmt), "next_line")
 
         # ============================================================
-        # STEP 8: Add Function Call Edges
+        # STEP 9: Add Function Call Edges
         # ============================================================
         self.add_function_call_edges(node_list)
 
