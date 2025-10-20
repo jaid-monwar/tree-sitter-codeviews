@@ -102,7 +102,10 @@ def main(
             file_handle = open(code_file, "r")
             src_code = file_handle.read()
             file_handle.close()
-            CombinedDriver(src_language=lang, src_code=src_code, output_file="output.json",
+            # Use the source file's name (without extension) as the output file base name
+            output_base_name = code_file.stem
+            output_file_name = f"{output_base_name}.json"
+            CombinedDriver(src_language=lang, src_code=src_code, output_file=output_file_name,
                            graph_format=output, codeviews=codeviews)
         else:
             if not code:

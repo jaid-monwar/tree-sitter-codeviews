@@ -125,6 +125,29 @@ class CFGGraph_c(CFGGraph):
         # If not, recursively find the next node
         return self.get_next_index(next_node, node_list)
 
+    def is_last_in_control_block(self, node):
+        """
+        Check if a node is the last statement in a control flow block (if/else/loop).
+        These nodes should NOT have edges added in the sequential flow step,
+        as they will be handled by the control flow step.
+        """
+        if node.parent is None:
+            return False
+
+        parent = node.parent
+
+        # Check if parent is a compound_statement
+        if parent.type == "compound_statement":
+            # Check if this node is the last named child
+            children = list(parent.named_children)
+            if children and children[-1] == node:
+                # Now check if the compound_statement's parent is a control structure
+                grandparent = parent.parent
+                if grandparent and grandparent.type in ["if_statement", "while_statement", "for_statement", "do_statement", "else_clause"]:
+                    return True
+
+        return False
+
     def get_block_last_line(self, current_node, body_field="body"):
         """
         Find the last executable statement in a block.
@@ -612,6 +635,11 @@ class CFGGraph_c(CFGGraph):
                 if node.type == "compound_statement" and len(list(node.named_children)) == 0:
                     continue
 
+                # Skip if this is the last statement in a control flow block
+                # Those edges will be handled in the control flow step
+                if self.is_last_in_control_block(node):
+                    continue
+
                 # Find next statement
                 next_index, next_node = self.get_next_index(node, node_list)
 
@@ -717,20 +745,47 @@ class CFGGraph_c(CFGGraph):
                         if (consequence.start_point, consequence.end_point, consequence.type) in node_list:
                             self.add_edge(current_index, self.get_index(consequence), "pos_next")
 
-                    # Edge from last statement in then block to next after if
+                    # Edge from last statement in then block to next after entire if-else chain
+                    # We need to find the outermost if statement in the chain
                     last_node, _ = self.get_block_last_line(node, "consequence")
                     if last_node and (last_node.start_point, last_node.end_point, last_node.type) in node_list:
                         if last_node.type not in ["return_statement", "break_statement", "continue_statement", "goto_statement"]:
-                            next_index, _ = self.get_next_index(node, node_list)
+                            # Find the outermost if statement by traversing up while parent is if_statement with this node as alternative
+                            outermost_if = node
+                            parent = node.parent
+                            while parent and parent.type == "if_statement":
+                                parent_alt = parent.child_by_field_name("alternative")
+                                if parent_alt == outermost_if:
+                                    outermost_if = parent
+                                    parent = parent.parent
+                                else:
+                                    break
+
+                            next_index, _ = self.get_next_index(outermost_if, node_list)
                             if next_index != 2:
                                 self.add_edge(self.get_index(last_node), next_index, "next_line")
 
                 # Get alternative (else block)
                 alternative = node.child_by_field_name("alternative")
                 if alternative:
-                    # Edge to first statement in else block
-                    if alternative.type == "compound_statement":
-                        children_list = list(alternative.named_children)
+                    # alternative is an else_clause node, need to get the actual content
+                    # Get the first named child of else_clause (skip the "else" keyword)
+                    alt_content = None
+                    for child in alternative.named_children:
+                        alt_content = child
+                        break
+
+                    if alt_content is None:
+                        # Empty else clause
+                        next_index, _ = self.get_next_index(node, node_list)
+                        if next_index != 2:
+                            self.add_edge(current_index, next_index, "neg_next")
+                    elif alt_content.type == "if_statement":
+                        # else if - connect to the else-if node
+                        self.add_edge(current_index, self.get_index(alt_content), "neg_next")
+                    elif alt_content.type == "compound_statement":
+                        # else { ... } - connect to first statement in block
+                        children_list = list(alt_content.named_children)
                         if children_list:
                             first_stmt = children_list[0]
                             if (first_stmt.start_point, first_stmt.end_point, first_stmt.type) in node_list:
@@ -740,21 +795,66 @@ class CFGGraph_c(CFGGraph):
                             next_index, _ = self.get_next_index(node, node_list)
                             if next_index != 2:
                                 self.add_edge(current_index, next_index, "neg_next")
-                    elif alternative.type == "if_statement":
-                        # else if
-                        self.add_edge(current_index, self.get_index(alternative), "neg_next")
-                    else:
-                        # Single statement
-                        if (alternative.start_point, alternative.end_point, alternative.type) in node_list:
-                            self.add_edge(current_index, self.get_index(alternative), "neg_next")
 
-                    # Edge from last statement in else block to next after if
-                    last_node, _ = self.get_block_last_line(node, "alternative")
-                    if last_node and (last_node.start_point, last_node.end_point, last_node.type) in node_list:
-                        if last_node.type not in ["return_statement", "break_statement", "continue_statement", "goto_statement"]:
-                            next_index, _ = self.get_next_index(node, node_list)
-                            if next_index != 2:
-                                self.add_edge(self.get_index(last_node), next_index, "next_line")
+                        # Edge from last statement in else block to next after entire if-else chain
+                        last_node = None
+                        if children_list:
+                            last_stmt = children_list[-1]
+                            if (last_stmt.start_point, last_stmt.end_point, last_stmt.type) in node_list:
+                                last_node = last_stmt
+
+                        if last_node and (last_node.start_point, last_node.end_point, last_node.type) in node_list:
+                            if last_node.type not in ["return_statement", "break_statement", "continue_statement", "goto_statement"]:
+                                # Find the outermost if statement
+                                outermost_if = node
+                                parent = node.parent
+                                while parent and parent.type == "if_statement":
+                                    parent_alt = parent.child_by_field_name("alternative")
+                                    if parent_alt:
+                                        # Check if outermost_if is inside parent's alternative
+                                        parent_alt_content = None
+                                        for child in parent_alt.named_children:
+                                            parent_alt_content = child
+                                            break
+                                        if parent_alt_content == outermost_if:
+                                            outermost_if = parent
+                                            parent = parent.parent
+                                        else:
+                                            break
+                                    else:
+                                        break
+
+                                next_index, _ = self.get_next_index(outermost_if, node_list)
+                                if next_index != 2:
+                                    self.add_edge(self.get_index(last_node), next_index, "next_line")
+                    else:
+                        # Single statement (no braces)
+                        if (alt_content.start_point, alt_content.end_point, alt_content.type) in node_list:
+                            self.add_edge(current_index, self.get_index(alt_content), "neg_next")
+
+                            # Edge from that statement to next after if
+                            if alt_content.type not in ["return_statement", "break_statement", "continue_statement", "goto_statement"]:
+                                # Find the outermost if statement
+                                outermost_if = node
+                                parent = node.parent
+                                while parent and parent.type == "if_statement":
+                                    parent_alt = parent.child_by_field_name("alternative")
+                                    if parent_alt:
+                                        parent_alt_content = None
+                                        for child in parent_alt.named_children:
+                                            parent_alt_content = child
+                                            break
+                                        if parent_alt_content == outermost_if:
+                                            outermost_if = parent
+                                            parent = parent.parent
+                                        else:
+                                            break
+                                    else:
+                                        break
+
+                                next_index, _ = self.get_next_index(outermost_if, node_list)
+                                if next_index != 2:
+                                    self.add_edge(self.get_index(alt_content), next_index, "next_line")
                 else:
                     # No else - direct edge to next statement
                     next_index, _ = self.get_next_index(node, node_list)
