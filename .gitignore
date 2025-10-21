@@ -11,3 +11,5 @@ tests/**/*.png
 /tests/data/RANDOM/gcj.json
 CLAUDE.md
 .coverage
+*.png
+*.dot
