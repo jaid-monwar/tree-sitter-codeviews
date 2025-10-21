@@ -591,6 +591,7 @@ class CFGGraph_c(CFGGraph):
         # Filter out nodes that shouldn't be in CFG
         # 1. Preprocessor directives (compile-time only, not runtime control flow)
         # 2. Compound statements (redundant - individual statements already represented)
+        # 3. Function declarations (forward declarations/prototypes - compile-time only)
         cfg_excluded_types = [
             "preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
             "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else",
@@ -599,7 +600,7 @@ class CFGGraph_c(CFGGraph):
 
         # Filter node_list dictionary
         node_list = {key: node for key, node in node_list.items()
-                     if node.type not in cfg_excluded_types}
+                     if node.type not in cfg_excluded_types and not c_nodes.is_function_declaration(node)}
 
         # Filter CFG_node_list
         filtered_cfg_nodes = []

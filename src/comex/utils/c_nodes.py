@@ -122,6 +122,25 @@ def get_function_name(node):
                             return pchild.text.decode('utf-8')
     return None
 
+def is_function_declaration(node):
+    """
+    Check if a declaration node is a function declaration (forward declaration/prototype).
+
+    Function declarations have the form: int foo(int x);
+    They contain a function_declarator child but no compound_statement (function body).
+
+    Returns True if the node is a function declaration, False otherwise.
+    """
+    if node.type != "declaration":
+        return False
+
+    # Check if it contains a function_declarator
+    for child in node.children:
+        if child.type == "function_declarator":
+            return True
+
+    return False
+
 def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, records={}):
     """
     Returns statement level nodes recursively from the C AST.
