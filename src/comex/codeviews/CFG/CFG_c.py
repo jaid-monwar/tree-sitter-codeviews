@@ -24,6 +24,7 @@ class CFGGraph_c(CFGGraph):
             "switch_child_map": {},
             "label_statement_map": {},
             "return_statement_map": {},
+            "function_pointer_map": {},  # Maps function pointer variables to their target functions
         }
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
@@ -247,10 +248,35 @@ class CFGGraph_c(CFGGraph):
         else:
             self.CFG_edge_list.append((src, dest, edge_type))
 
+    def track_function_pointers(self, root_node):
+        """
+        Track function pointer assignments in the program.
+        Records mappings like: fptr -> add when we see fptr = &add
+        """
+        if root_node.type == "assignment_expression":
+            left = root_node.child_by_field_name("left")
+            right = root_node.child_by_field_name("right")
+
+            if left and right:
+                # Check if right side is &function_name
+                if right.type == "pointer_expression":
+                    arg = right.child_by_field_name("argument")
+                    if arg and arg.type == "identifier":
+                        # This is something like: fptr = &add
+                        ptr_var = left.text.decode('utf-8')
+                        target_func = arg.text.decode('utf-8')
+                        self.records["function_pointer_map"][ptr_var] = target_func
+
+        # Recursively process children
+        for child in root_node.children:
+            self.track_function_pointers(child)
+
     def function_list(self, root_node, node_list):
         """
         Build a map of all function calls in the program.
         Maps function signatures to their call sites.
+
+        Handles both direct calls (add(10, 5)) and function pointer calls (fptr(10, 5)).
         """
         if root_node.type == "call_expression":
             # Get function name
@@ -258,6 +284,12 @@ class CFGGraph_c(CFGGraph):
             if function_node:
                 if function_node.type == "identifier":
                     func_name = function_node.text.decode('utf-8')
+
+                    # Check if this is a function pointer call
+                    # If func_name is in function_pointer_map, resolve to actual function
+                    if func_name in self.records["function_pointer_map"]:
+                        actual_func_name = self.records["function_pointer_map"][func_name]
+                        func_name = actual_func_name
 
                     # Find the parent statement node
                     parent_stmt = root_node
@@ -731,6 +763,10 @@ class CFGGraph_c(CFGGraph):
         # ============================================================
         # STEP 6: Build Function Call Map
         # ============================================================
+        # First, track function pointer assignments (e.g., fptr = &add)
+        self.track_function_pointers(self.root_node)
+
+        # Then, build function call map (including function pointer calls)
         self.function_list(self.root_node, node_list)
 
         # Track return statements
