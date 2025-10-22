@@ -918,8 +918,14 @@ class CFGGraph_cpp(CFGGraph):
                 # Edge to first statement in case body
                 children = list(node.named_children)
                 if children:
-                    # First child is the value, rest are statements
-                    for i in range(1, len(children)):
+                    # Check if this is a default case (no value) or regular case (has value)
+                    value_field = node.child_by_field_name("value")
+
+                    # For default case, statements start at index 0
+                    # For regular case, statements start at index 1 (index 0 is the value)
+                    start_index = 0 if value_field is None else 1
+
+                    for i in range(start_index, len(children)):
                         if children[i].type in self.statement_types["node_list_type"]:
                             if (children[i].start_point, children[i].end_point, children[i].type) in node_list:
                                 self.add_edge(current_index, self.get_index(children[i]), "case_next")
