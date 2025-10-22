@@ -19,7 +19,7 @@ statement_types = {
         "class_specifier",
         "struct_specifier",
         "namespace_definition",
-        "using_declaration",
+        # "using_declaration",      # Excluded: compile-time only
         "alias_declaration",
         "template_declaration",
         "field_declaration",
@@ -37,18 +37,19 @@ statement_types = {
         # MEDIUM PRIORITY FEATURES ADDED:
         "new_expression",           # Memory management - new
         "static_assert_declaration", # Static assertions
-        "using_declaration",        # Namespace features
+        # "using_declaration",      # Excluded: compile-time only (duplicate, already commented above)
         "namespace_alias_definition", # Namespace aliases
-        "preproc_include",          # Preprocessor directives
-        "preproc_def",              # Preprocessor defines
-        "preproc_ifdef",            # Preprocessor conditionals
-        "preproc_if",
+        # Preprocessor directives excluded - they are compile-time only, not runtime:
+        # "preproc_include",        # Excluded: preprocessor directive
+        # "preproc_def",            # Excluded: preprocessor directive
+        # "preproc_ifdef",          # Excluded: preprocessor directive
+        # "preproc_if",             # Excluded: preprocessor directive
     ],
     "non_control_statement": [
         "declaration",
         "expression_statement",
         "field_declaration",
-        "using_declaration",
+        # "using_declaration",        # Excluded: compile-time only
         "alias_declaration",
         "access_specifier",
         "enum_specifier",
@@ -57,10 +58,11 @@ statement_types = {
         "friend_declaration",
         "static_assert_declaration",
         "namespace_alias_definition",
-        "preproc_include",
-        "preproc_def",
-        "preproc_ifdef",
-        "preproc_if",
+        # Preprocessor directives excluded - they are compile-time only, not runtime:
+        # "preproc_include",          # Excluded: preprocessor directive
+        # "preproc_def",              # Excluded: preprocessor directive
+        # "preproc_ifdef",            # Excluded: preprocessor directive
+        # "preproc_if",               # Excluded: preprocessor directive
     ],
     "control_statement": [
         "if_statement",

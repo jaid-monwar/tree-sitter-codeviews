@@ -2,6 +2,7 @@
 from .CFG_csharp import CFGGraph_csharp
 from .CFG_java import CFGGraph_java
 from .CFG_c import CFGGraph_c
+from .CFG_cpp import CFGGraph_cpp
 from ...tree_parser.parser_driver import ParserDriver
 from ...utils import postprocessor
 
@@ -25,6 +26,7 @@ class CFGDriver:
             "java": CFGGraph_java,
             "cs": CFGGraph_csharp,
             "c": CFGGraph_c,
+            "cpp": CFGGraph_cpp,
             # "python": CFGGraph_python
         }
 
