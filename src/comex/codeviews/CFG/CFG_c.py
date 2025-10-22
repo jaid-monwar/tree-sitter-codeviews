@@ -1096,9 +1096,19 @@ class CFGGraph_c(CFGGraph):
             elif node.type == "case_statement":
                 # Edge to first statement in case body
                 children = list(node.named_children)
-                if len(children) > 1:  # case value + statements
+
+                # Check if this is a default case
+                # default: printf(...); has NO case value, so children[0] is the first statement
+                # case 1: printf(...); has case value at children[0], first statement at children[1]
+                is_default = node.children and node.children[0].type == "default"
+
+                # For default case, start from children[0] (first statement)
+                # For regular case, start from children[1] (skip case value)
+                start_index = 0 if is_default else 1
+
+                if len(children) > start_index:
                     # Find first executable statement after case label
-                    for child in children[1:]:
+                    for child in children[start_index:]:
                         if (child.start_point, child.end_point, child.type) in node_list:
                             self.add_edge(current_index, self.get_index(child), "case_next")
                             break
