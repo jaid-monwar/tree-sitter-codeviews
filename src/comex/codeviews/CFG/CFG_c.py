@@ -130,13 +130,17 @@ class CFGGraph_c(CFGGraph):
         Check if a node is the last statement in a control flow block (if/else/loop).
         These nodes should NOT have edges added in the sequential flow step,
         as they will be handled by the control flow step.
+
+        Handles two cases:
+        1. Last statement in a compound_statement that belongs to a control structure
+        2. Single statement (no braces) that is the consequence/body of a control structure
         """
         if node.parent is None:
             return False
 
         parent = node.parent
 
-        # Check if parent is a compound_statement
+        # Case 1: Parent is a compound_statement (block with braces)
         if parent.type == "compound_statement":
             # Check if this node is the last named child
             children = list(parent.named_children)
@@ -145,6 +149,29 @@ class CFGGraph_c(CFGGraph):
                 grandparent = parent.parent
                 if grandparent and grandparent.type in ["if_statement", "while_statement", "for_statement", "do_statement", "else_clause"]:
                     return True
+
+        # Case 2: Parent is a control structure directly (single statement, no braces)
+        # This happens with syntax like: if (cond) statement;
+        if parent.type in ["if_statement", "while_statement", "for_statement", "do_statement"]:
+            # Check if this node is the consequence/body of the control structure
+            consequence = parent.child_by_field_name("consequence")
+            body = parent.child_by_field_name("body")
+
+            # For if_statement, check if this is the consequence
+            if consequence and consequence == node:
+                return True
+
+            # For loops (while/for/do), check if this is the body
+            if body and body == node:
+                return True
+
+        # Case 3: Parent is an else_clause (single statement after else)
+        if parent.type == "else_clause":
+            # Check if this node is a direct child of else_clause (single statement)
+            # In else_clause, the statement is a named child
+            children = list(parent.named_children)
+            if children and node in children:
+                return True
 
         return False
 
@@ -538,13 +565,37 @@ class CFGGraph_c(CFGGraph):
         """
         Add edges for function calls and returns.
         Connects call sites to function definitions and returns back to callers.
-        """
-        for (func_name, signature), call_sites in self.records["function_calls"].items():
-            # Check if function is defined in this file
-            func_key = (func_name, signature)
-            if func_key in self.records["function_list"]:
-                func_index = self.records["function_list"][func_key]
 
+        Supports variadic functions by matching function name and checking if the
+        definition signature is a prefix of the call signature (for variadic functions).
+        """
+        for (func_name, call_signature), call_sites in self.records["function_calls"].items():
+            # Try exact signature match first
+            func_key = (func_name, call_signature)
+            func_index = None
+
+            if func_key in self.records["function_list"]:
+                # Exact match found
+                func_index = self.records["function_list"][func_key]
+            else:
+                # No exact match - check for variadic function match
+                # Look for functions with same name and signature ending with '...'
+                for (def_name, def_signature), idx in self.records["function_list"].items():
+                    if def_name == func_name and len(def_signature) > 0 and def_signature[-1] == '...':
+                        # Variadic function - check if call signature matches required parameters
+                        # def_signature = ('int', '...') means at least 1 int parameter required
+                        # call_signature = ('int', 'int', 'int') should match
+                        required_params = def_signature[:-1]  # Remove '...'
+
+                        # Check if call has at least the required number of parameters
+                        if len(call_signature) >= len(required_params):
+                            # Check if the required parameter types match
+                            # Note: We do a simple length check here since type inference
+                            # may not always be accurate for variadic calls
+                            func_index = idx
+                            break
+
+            if func_index is not None:
                 for call_id, parent_id in call_sites:
                     # Edge from caller to function
                     self.add_edge(parent_id, func_index, f"function_call|{call_id}")

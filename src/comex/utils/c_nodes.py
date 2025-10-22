@@ -91,7 +91,14 @@ def return_switch_child(node):
     return None
 
 def get_function_signature(node):
-    """Extract function signature from function definition or declaration"""
+    """
+    Extract function signature from function definition or declaration.
+
+    For variadic functions (e.g., int foo(int x, ...)), the signature includes
+    '...' as the last element to indicate variable arguments.
+
+    Returns: tuple of parameter types, e.g., ('int', 'char*') or ('int', '...')
+    """
     signature = []
     # Find parameter_list in function_declarator
     for child in node.children:
@@ -105,6 +112,9 @@ def get_function_signature(node):
                             if pchild.type in function_return_types:
                                 signature.append(pchild.text.decode('utf-8'))
                                 break
+                    elif param.type == "variadic_parameter":
+                        # Variadic function - add '...' marker
+                        signature.append('...')
     return tuple(signature)
 
 def get_function_name(node):
