@@ -598,8 +598,10 @@ class CFGGraph_c(CFGGraph):
         Add edges for function calls and returns.
         Connects call sites to function definitions and returns back to callers.
 
-        Supports variadic functions by matching function name and checking if the
-        definition signature is a prefix of the call signature (for variadic functions).
+        Supports:
+        - Exact signature matching
+        - Variadic functions
+        - Fuzzy matching by name when signature can't be inferred
         """
         for (func_name, call_signature), call_sites in self.records["function_calls"].items():
             # Try exact signature match first
@@ -610,20 +612,23 @@ class CFGGraph_c(CFGGraph):
                 # Exact match found
                 func_index = self.records["function_list"][func_key]
             else:
-                # No exact match - check for variadic function match
-                # Look for functions with same name and signature ending with '...'
+                # No exact match - try fallback strategies
+
+                # Strategy 1: Check for variadic function match
                 for (def_name, def_signature), idx in self.records["function_list"].items():
                     if def_name == func_name and len(def_signature) > 0 and def_signature[-1] == '...':
                         # Variadic function - check if call signature matches required parameters
-                        # def_signature = ('int', '...') means at least 1 int parameter required
-                        # call_signature = ('int', 'int', 'int') should match
                         required_params = def_signature[:-1]  # Remove '...'
-
-                        # Check if call has at least the required number of parameters
                         if len(call_signature) >= len(required_params):
-                            # Check if the required parameter types match
-                            # Note: We do a simple length check here since type inference
-                            # may not always be accurate for variadic calls
+                            func_index = idx
+                            break
+
+                # Strategy 2: Fuzzy match by name only (for cases with 'unknown' types)
+                # This handles cases where type inference fails (e.g., fibonacci(i) where i's type is unknown)
+                if func_index is None and 'unknown' in call_signature:
+                    # Look for function with same name and same number of parameters
+                    for (def_name, def_signature), idx in self.records["function_list"].items():
+                        if def_name == func_name and len(def_signature) == len(call_signature):
                             func_index = idx
                             break
 
@@ -633,9 +638,24 @@ class CFGGraph_c(CFGGraph):
                     self.add_edge(parent_id, func_index, f"function_call|{call_id}")
 
                     # Add return edges from all return points in the function
+                    # IMPORTANT: Only add return edge if parent_id is NOT itself a return statement
+                    # This prevents incorrect edges like "return -> return"
+                    parent_node = None
+                    for key, node in node_list.items():
+                        if self.get_index(node) == parent_id:
+                            parent_node = node
+                            break
+
+                    # Check if parent is a return statement
+                    is_parent_return = parent_node and parent_node.type == "return_statement"
+
                     if func_index in self.records["return_statement_map"]:
                         for return_id in self.records["return_statement_map"][func_index]:
-                            self.add_edge(return_id, parent_id, "function_return")
+                            # Only add return edge if parent is not a return statement
+                            # For recursive calls in return statements, the return edge
+                            # will be handled when the recursive call returns
+                            if not is_parent_return:
+                                self.add_edge(return_id, parent_id, "function_return")
 
     def find_enclosing_loop(self, node):
         """Find the nearest enclosing loop for break/continue statements"""
