@@ -178,6 +178,29 @@ def has_inner_definition(node):
     return False
 
 
+def is_function_declaration(node):
+    """
+    Check if a declaration node is a function declaration (forward declaration).
+    Function declarations have a function_declarator child but NO compound_statement (body).
+    Returns True for function declarations (should be excluded from CFG).
+    Returns False for variable declarations (should be included in CFG).
+    """
+    if node.type != "declaration":
+        return False
+
+    has_function_declarator = False
+    has_body = False
+
+    for child in node.children:
+        if child.type == "function_declarator":
+            has_function_declarator = True
+        if child.type == "compound_statement":
+            has_body = True
+
+    # It's a function declaration if it has function_declarator but no body
+    return has_function_declarator and not has_body
+
+
 def find_function_definition(node):
     """Searches for a function definition while going up the tree and returns it"""
     while node.parent is not None:
@@ -464,7 +487,11 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
 
     elif root_node.type in statement_types["node_list_type"]:
-        if (
+        # Skip function declarations (forward declarations without bodies)
+        # These are compile-time constructs and should not appear in CFG
+        if is_function_declaration(root_node):
+            pass  # Skip this node
+        elif (
             root_node.type in statement_types["inner_node_type"]
             and root_node.parent is not None
             and root_node.parent.type in statement_types["outer_node_type"]
