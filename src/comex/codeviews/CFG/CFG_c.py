@@ -24,6 +24,7 @@ class CFGGraph_c(CFGGraph):
             "switch_child_map": {},
             "label_statement_map": {},
             "return_statement_map": {},
+            "function_pointer_map": {},  # Maps function pointer variables to their target functions
         }
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
@@ -130,13 +131,17 @@ class CFGGraph_c(CFGGraph):
         Check if a node is the last statement in a control flow block (if/else/loop).
         These nodes should NOT have edges added in the sequential flow step,
         as they will be handled by the control flow step.
+
+        Handles two cases:
+        1. Last statement in a compound_statement that belongs to a control structure
+        2. Single statement (no braces) that is the consequence/body of a control structure
         """
         if node.parent is None:
             return False
 
         parent = node.parent
 
-        # Check if parent is a compound_statement
+        # Case 1: Parent is a compound_statement (block with braces)
         if parent.type == "compound_statement":
             # Check if this node is the last named child
             children = list(parent.named_children)
@@ -145,6 +150,29 @@ class CFGGraph_c(CFGGraph):
                 grandparent = parent.parent
                 if grandparent and grandparent.type in ["if_statement", "while_statement", "for_statement", "do_statement", "else_clause"]:
                     return True
+
+        # Case 2: Parent is a control structure directly (single statement, no braces)
+        # This happens with syntax like: if (cond) statement;
+        if parent.type in ["if_statement", "while_statement", "for_statement", "do_statement"]:
+            # Check if this node is the consequence/body of the control structure
+            consequence = parent.child_by_field_name("consequence")
+            body = parent.child_by_field_name("body")
+
+            # For if_statement, check if this is the consequence
+            if consequence and consequence == node:
+                return True
+
+            # For loops (while/for/do), check if this is the body
+            if body and body == node:
+                return True
+
+        # Case 3: Parent is an else_clause (single statement after else)
+        if parent.type == "else_clause":
+            # Check if this node is a direct child of else_clause (single statement)
+            # In else_clause, the statement is a named child
+            children = list(parent.named_children)
+            if children and node in children:
+                return True
 
         return False
 
@@ -220,10 +248,35 @@ class CFGGraph_c(CFGGraph):
         else:
             self.CFG_edge_list.append((src, dest, edge_type))
 
+    def track_function_pointers(self, root_node):
+        """
+        Track function pointer assignments in the program.
+        Records mappings like: fptr -> add when we see fptr = &add
+        """
+        if root_node.type == "assignment_expression":
+            left = root_node.child_by_field_name("left")
+            right = root_node.child_by_field_name("right")
+
+            if left and right:
+                # Check if right side is &function_name
+                if right.type == "pointer_expression":
+                    arg = right.child_by_field_name("argument")
+                    if arg and arg.type == "identifier":
+                        # This is something like: fptr = &add
+                        ptr_var = left.text.decode('utf-8')
+                        target_func = arg.text.decode('utf-8')
+                        self.records["function_pointer_map"][ptr_var] = target_func
+
+        # Recursively process children
+        for child in root_node.children:
+            self.track_function_pointers(child)
+
     def function_list(self, root_node, node_list):
         """
         Build a map of all function calls in the program.
         Maps function signatures to their call sites.
+
+        Handles both direct calls (add(10, 5)) and function pointer calls (fptr(10, 5)).
         """
         if root_node.type == "call_expression":
             # Get function name
@@ -231,6 +284,12 @@ class CFGGraph_c(CFGGraph):
             if function_node:
                 if function_node.type == "identifier":
                     func_name = function_node.text.decode('utf-8')
+
+                    # Check if this is a function pointer call
+                    # If func_name is in function_pointer_map, resolve to actual function
+                    if func_name in self.records["function_pointer_map"]:
+                        actual_func_name = self.records["function_pointer_map"][func_name]
+                        func_name = actual_func_name
 
                     # Find the parent statement node
                     parent_stmt = root_node
@@ -538,21 +597,65 @@ class CFGGraph_c(CFGGraph):
         """
         Add edges for function calls and returns.
         Connects call sites to function definitions and returns back to callers.
-        """
-        for (func_name, signature), call_sites in self.records["function_calls"].items():
-            # Check if function is defined in this file
-            func_key = (func_name, signature)
-            if func_key in self.records["function_list"]:
-                func_index = self.records["function_list"][func_key]
 
+        Supports:
+        - Exact signature matching
+        - Variadic functions
+        - Fuzzy matching by name when signature can't be inferred
+        """
+        for (func_name, call_signature), call_sites in self.records["function_calls"].items():
+            # Try exact signature match first
+            func_key = (func_name, call_signature)
+            func_index = None
+
+            if func_key in self.records["function_list"]:
+                # Exact match found
+                func_index = self.records["function_list"][func_key]
+            else:
+                # No exact match - try fallback strategies
+
+                # Strategy 1: Check for variadic function match
+                for (def_name, def_signature), idx in self.records["function_list"].items():
+                    if def_name == func_name and len(def_signature) > 0 and def_signature[-1] == '...':
+                        # Variadic function - check if call signature matches required parameters
+                        required_params = def_signature[:-1]  # Remove '...'
+                        if len(call_signature) >= len(required_params):
+                            func_index = idx
+                            break
+
+                # Strategy 2: Fuzzy match by name only (for cases with 'unknown' types)
+                # This handles cases where type inference fails (e.g., fibonacci(i) where i's type is unknown)
+                if func_index is None and 'unknown' in call_signature:
+                    # Look for function with same name and same number of parameters
+                    for (def_name, def_signature), idx in self.records["function_list"].items():
+                        if def_name == func_name and len(def_signature) == len(call_signature):
+                            func_index = idx
+                            break
+
+            if func_index is not None:
                 for call_id, parent_id in call_sites:
                     # Edge from caller to function
                     self.add_edge(parent_id, func_index, f"function_call|{call_id}")
 
                     # Add return edges from all return points in the function
+                    # IMPORTANT: Only add return edge if parent_id is NOT itself a return statement
+                    # This prevents incorrect edges like "return -> return"
+                    parent_node = None
+                    for key, node in node_list.items():
+                        if self.get_index(node) == parent_id:
+                            parent_node = node
+                            break
+
+                    # Check if parent is a return statement
+                    is_parent_return = parent_node and parent_node.type == "return_statement"
+
                     if func_index in self.records["return_statement_map"]:
                         for return_id in self.records["return_statement_map"][func_index]:
-                            self.add_edge(return_id, parent_id, "function_return")
+                            # Only add return edge if parent is not a return statement
+                            # For recursive calls in return statements, the return edge
+                            # will be handled when the recursive call returns
+                            if not is_parent_return:
+                                self.add_edge(return_id, parent_id, "function_return")
 
     def find_enclosing_loop(self, node):
         """Find the nearest enclosing loop for break/continue statements"""
@@ -591,6 +694,7 @@ class CFGGraph_c(CFGGraph):
         # Filter out nodes that shouldn't be in CFG
         # 1. Preprocessor directives (compile-time only, not runtime control flow)
         # 2. Compound statements (redundant - individual statements already represented)
+        # 3. Function declarations (forward declarations/prototypes - compile-time only)
         cfg_excluded_types = [
             "preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
             "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else",
@@ -599,7 +703,7 @@ class CFGGraph_c(CFGGraph):
 
         # Filter node_list dictionary
         node_list = {key: node for key, node in node_list.items()
-                     if node.type not in cfg_excluded_types}
+                     if node.type not in cfg_excluded_types and not c_nodes.is_function_declaration(node)}
 
         # Filter CFG_node_list
         filtered_cfg_nodes = []
@@ -666,8 +770,23 @@ class CFGGraph_c(CFGGraph):
         self.CFG_node_list = updated_node_list
 
         # ============================================================
-        # STEP 5: Build Function Call Map
+        # STEP 5: Detect Main Function
         # ============================================================
+        # Check if a main function exists and record it
+        for key, node in node_list.items():
+            if node.type == "function_definition":
+                func_name = c_nodes.get_function_name(node)
+                if func_name == "main":
+                    self.records["main_function"] = self.get_index(node)
+                    break
+
+        # ============================================================
+        # STEP 6: Build Function Call Map
+        # ============================================================
+        # First, track function pointer assignments (e.g., fptr = &add)
+        self.track_function_pointers(self.root_node)
+
+        # Then, build function call map (including function pointer calls)
         self.function_list(self.root_node, node_list)
 
         # Track return statements
@@ -695,13 +814,13 @@ class CFGGraph_c(CFGGraph):
                             self.records["return_statement_map"][func_index].append(last_index)
 
         # ============================================================
-        # STEP 6: Add Dummy Nodes
+        # STEP 7: Add Dummy Nodes
         # ============================================================
         # Add start node (ID=1)
         self.CFG_node_list.append((1, 0, "start_node", "start"))
 
         # ============================================================
-        # STEP 7: Add Control Flow Edges
+        # STEP 8: Add Control Flow Edges
         # ============================================================
         for key, node in node_list.items():
             current_index = self.get_index(node)
@@ -710,11 +829,15 @@ class CFGGraph_c(CFGGraph):
             if node.type == "function_definition":
                 func_name = c_nodes.get_function_name(node)
 
-                # Connect start node to main function
-                if func_name == "main":
-                    self.add_edge(1, current_index, "next")
+                # Connect start node based on whether main function exists
+                # This follows the same logic as Java CFG implementation
+                if "main_function" in self.records:
+                    # Main function exists: only connect start_node to main
+                    # Other functions become disjoint graphs
+                    if func_name == "main":
+                        self.add_edge(1, current_index, "next")
                 else:
-                    # Connect start to all top-level functions
+                    # No main function: connect start_node to all functions
                     self.add_edge(1, current_index, "next")
 
                 # Connect function to first statement in body
@@ -993,9 +1116,19 @@ class CFGGraph_c(CFGGraph):
             elif node.type == "case_statement":
                 # Edge to first statement in case body
                 children = list(node.named_children)
-                if len(children) > 1:  # case value + statements
+
+                # Check if this is a default case
+                # default: printf(...); has NO case value, so children[0] is the first statement
+                # case 1: printf(...); has case value at children[0], first statement at children[1]
+                is_default = node.children and node.children[0].type == "default"
+
+                # For default case, start from children[0] (first statement)
+                # For regular case, start from children[1] (skip case value)
+                start_index = 0 if is_default else 1
+
+                if len(children) > start_index:
                     # Find first executable statement after case label
-                    for child in children[1:]:
+                    for child in children[start_index:]:
                         if (child.start_point, child.end_point, child.type) in node_list:
                             self.add_edge(current_index, self.get_index(child), "case_next")
                             break
@@ -1040,7 +1173,7 @@ class CFGGraph_c(CFGGraph):
                     self.add_edge(current_index, self.get_index(stmt), "next_line")
 
         # ============================================================
-        # STEP 8: Add Function Call Edges
+        # STEP 9: Add Function Call Edges
         # ============================================================
         self.add_function_call_edges(node_list)
 

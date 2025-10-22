@@ -70,6 +70,47 @@ statement_types = {
 
 function_return_types = ['primitive_type', 'type_identifier', 'sized_type_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier', 'pointer_declarator']
 
+def extract_parameter_type(param_node):
+    """
+    Extract the full type of a parameter declaration, including qualifiers and pointers.
+
+    Examples:
+    - const uint32_t *in_arr -> 'uint32_t*'
+    - size_t n -> 'size_t'
+    - char **argv -> 'char**'
+    - const int * const ptr -> 'int*'
+
+    Returns: string representing the parameter type
+    """
+    if param_node.type != "parameter_declaration":
+        return "unknown"
+
+    base_type = None
+    pointer_count = 0
+
+    # Traverse children to find base type and count pointers
+    for child in param_node.children:
+        # Skip type qualifiers (const, volatile, restrict)
+        if child.type == "type_qualifier":
+            continue
+
+        # Get base type
+        if child.type in ['primitive_type', 'type_identifier', 'sized_type_specifier',
+                         'struct_specifier', 'union_specifier', 'enum_specifier']:
+            base_type = child.text.decode('utf-8')
+
+        # Count pointer levels
+        elif child.type == "pointer_declarator":
+            # Count '*' symbols in the pointer_declarator
+            pointer_text = child.text.decode('utf-8')
+            pointer_count = pointer_text.count('*')
+
+    # Construct the type string
+    if base_type:
+        return base_type + ('*' * pointer_count)
+
+    return "unknown"
+
 def get_child_of_type(node, type_list):
     out = list(filter(lambda x : x.type in type_list, node.children))
     if len(out) > 0:
@@ -91,7 +132,19 @@ def return_switch_child(node):
     return None
 
 def get_function_signature(node):
-    """Extract function signature from function definition or declaration"""
+    """
+    Extract function signature from function definition or declaration.
+
+    For variadic functions (e.g., int foo(int x, ...)), the signature includes
+    '...' as the last element to indicate variable arguments.
+
+    Handles complex types including pointers, const qualifiers, etc.
+    Examples:
+    - int foo(const uint32_t *arr, size_t n) -> ('uint32_t*', 'size_t')
+    - char* bar(char **argv, int argc) -> ('char**', 'int')
+
+    Returns: tuple of parameter types, e.g., ('int', 'char*') or ('int', '...')
+    """
     signature = []
     # Find parameter_list in function_declarator
     for child in node.children:
@@ -100,11 +153,12 @@ def get_function_signature(node):
             if param_list:
                 for param in param_list.children:
                     if param.type == "parameter_declaration":
-                        # Get the type of the parameter
-                        for pchild in param.children:
-                            if pchild.type in function_return_types:
-                                signature.append(pchild.text.decode('utf-8'))
-                                break
+                        # Extract the full parameter type including pointers
+                        param_type = extract_parameter_type(param)
+                        signature.append(param_type)
+                    elif param.type == "variadic_parameter":
+                        # Variadic function - add '...' marker
+                        signature.append('...')
     return tuple(signature)
 
 def get_function_name(node):
@@ -121,6 +175,25 @@ def get_function_name(node):
                         if pchild.type == "identifier":
                             return pchild.text.decode('utf-8')
     return None
+
+def is_function_declaration(node):
+    """
+    Check if a declaration node is a function declaration (forward declaration/prototype).
+
+    Function declarations have the form: int foo(int x);
+    They contain a function_declarator child but no compound_statement (function body).
+
+    Returns True if the node is a function declaration, False otherwise.
+    """
+    if node.type != "declaration":
+        return False
+
+    # Check if it contains a function_declarator
+    for child in node.children:
+        if child.type == "function_declarator":
+            return True
+
+    return False
 
 def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, records={}):
     """
