@@ -114,6 +114,24 @@ class CFGGraph_cpp(CFGGraph):
             node = node.parent
         return None
 
+    def is_jump_statement(self, node):
+        """
+        Check if a node is a jump statement that transfers control elsewhere.
+        Jump statements should NOT have fall-through edges to the next statement.
+        """
+        if node is None:
+            return False
+
+        jump_types = [
+            "break_statement",
+            "continue_statement",
+            "return_statement",
+            "goto_statement",
+            "throw_statement"
+        ]
+
+        return node.type in jump_types
+
     def get_next_index(self, current_node, node_list):
         """
         Find the next executable statement after current_node.
@@ -590,14 +608,25 @@ class CFGGraph_cpp(CFGGraph):
                     first_index, first_node = first_line
                     self.add_edge(current_index, first_index, "first_next_line")
 
-                # Track last line for return edges
-                last_line, last_type = self.get_block_last_line(node, "body")
-                if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                    last_index = self.get_index(last_line)
-                    if current_index not in self.records["return_statement_map"]:
-                        self.records["return_statement_map"][current_index] = []
-                    if last_index not in self.records["return_statement_map"][current_index]:
-                        self.records["return_statement_map"][current_index].append(last_index)
+                # For VOID functions, add implicit return from last statement
+                # For non-void functions, only explicit returns should be in return_statement_map
+                return_type_node = node.child_by_field_name("type")
+                is_void = False
+                if return_type_node:
+                    return_type_text = return_type_node.text.decode('utf-8')
+                    is_void = return_type_text == "void"
+
+                if is_void:
+                    # Add implicit return from last statement of void function
+                    last_line, last_type = self.get_block_last_line(node, "body")
+                    if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
+                        # Only add if last line is not already an explicit return/throw
+                        if not self.is_jump_statement(last_line):
+                            last_index = self.get_index(last_line)
+                            if current_index not in self.records["return_statement_map"]:
+                                self.records["return_statement_map"][current_index] = []
+                            if last_index not in self.records["return_statement_map"][current_index]:
+                                self.records["return_statement_map"][current_index].append(last_index)
 
             # ─────────────────────────────────────────────────────────
             # CLASS / STRUCT DEFINITION
@@ -639,11 +668,13 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(consequence), "pos_next")
 
                     # Connect last of consequence to next after if
+                    # BUT: Don't add edge if last statement is a jump statement (break, return, etc.)
                     last_line, _ = self.get_block_last_line(node, "consequence")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        next_index, next_node = self.get_next_index(node, node_list)
-                        if next_index != 2:
-                            self.add_edge(self.get_index(last_line), next_index, "next_line")
+                        if not self.is_jump_statement(last_line):
+                            next_index, next_node = self.get_next_index(node, node_list)
+                            if next_index != 2:
+                                self.add_edge(self.get_index(last_line), next_index, "next_line")
 
                 # Get alternative (else branch)
                 alternative = node.child_by_field_name("alternative")
@@ -673,6 +704,7 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(else_body), "neg_next")
 
                     # Connect last of alternative to next after if
+                    # BUT: Don't add edge if last statement is a jump statement (break, return, etc.)
                     # Need to find last statement in the else body
                     if alternative.type == "else_clause":
                         # For else_clause, we need to get the body and find its last statement
@@ -681,22 +713,25 @@ class CFGGraph_cpp(CFGGraph):
                             if children:
                                 last_stmt = children[-1]
                                 if (last_stmt.start_point, last_stmt.end_point, last_stmt.type) in node_list:
-                                    next_index, next_node = self.get_next_index(node, node_list)
-                                    if next_index != 2:
-                                        self.add_edge(self.get_index(last_stmt), next_index, "next_line")
+                                    if not self.is_jump_statement(last_stmt):
+                                        next_index, next_node = self.get_next_index(node, node_list)
+                                        if next_index != 2:
+                                            self.add_edge(self.get_index(last_stmt), next_index, "next_line")
                         else:
                             # Single statement after else
                             if (else_body.start_point, else_body.end_point, else_body.type) in node_list:
-                                next_index, next_node = self.get_next_index(node, node_list)
-                                if next_index != 2:
-                                    self.add_edge(self.get_index(else_body), next_index, "next_line")
+                                if not self.is_jump_statement(else_body):
+                                    next_index, next_node = self.get_next_index(node, node_list)
+                                    if next_index != 2:
+                                        self.add_edge(self.get_index(else_body), next_index, "next_line")
                     elif else_body.type == "compound_statement" or else_body.type != "if_statement":
                         # Direct compound_statement (not wrapped in else_clause)
                         last_line, _ = self.get_block_last_line(node, "alternative")
                         if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                            next_index, next_node = self.get_next_index(node, node_list)
-                            if next_index != 2:
-                                self.add_edge(self.get_index(last_line), next_index, "next_line")
+                            if not self.is_jump_statement(last_line):
+                                next_index, next_node = self.get_next_index(node, node_list)
+                                if next_index != 2:
+                                    self.add_edge(self.get_index(last_line), next_index, "next_line")
                 else:
                     # No else branch - if condition false, go to next statement
                     next_index, next_node = self.get_next_index(node, node_list)
@@ -721,9 +756,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to loop header
+                    # BUT: Don't add edge if last statement is a jump statement
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        self.add_edge(self.get_index(last_line), current_index, "loop_control")
+                        if not self.is_jump_statement(last_line):
+                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Edge to next statement after loop (condition false)
                 next_index, next_node = self.get_next_index(node, node_list)
@@ -751,9 +788,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to loop header
+                    # BUT: Don't add edge if last statement is a jump statement
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        self.add_edge(self.get_index(last_line), current_index, "loop_control")
+                        if not self.is_jump_statement(last_line):
+                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Edge to next statement after loop
                 next_index, next_node = self.get_next_index(node, node_list)
@@ -780,10 +819,12 @@ class CFGGraph_cpp(CFGGraph):
                         if (body.start_point, body.end_point, body.type) in node_list:
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
-                    # Back edge
+                    # Back edge from last statement to loop header
+                    # BUT: Don't add edge if last statement is a jump statement
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        self.add_edge(self.get_index(last_line), current_index, "loop_control")
+                        if not self.is_jump_statement(last_line):
+                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Exit edge
                 next_index, next_node = self.get_next_index(node, node_list)
@@ -811,9 +852,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to do node (condition check)
+                    # BUT: Don't add edge if last statement is a jump statement
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        self.add_edge(self.get_index(last_line), current_index, "loop_control")
+                        if not self.is_jump_statement(last_line):
+                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Edge to next statement after loop (condition false)
                 next_index, next_node = self.get_next_index(node, node_list)
@@ -882,11 +925,15 @@ class CFGGraph_cpp(CFGGraph):
             # LABELED STATEMENT
             # ─────────────────────────────────────────────────────────
             elif node.type == "labeled_statement":
-                # Edge to first line in labeled block
-                first_line = self.edge_first_line(node, node_list)
-                if first_line:
-                    first_index, first_node = first_line
-                    self.add_edge(current_index, first_index, "first_next_line")
+                # In tree-sitter C++, labeled_statement contains:
+                #   child[0]: statement_identifier (the label name)
+                #   child[1]: statement (the statement immediately after the label)
+                # Create edge from label to the statement it contains
+                children = list(node.named_children)
+                if len(children) >= 2:
+                    stmt = children[1]  # The statement after the label
+                    if (stmt.start_point, stmt.end_point, stmt.type) in node_list:
+                        self.add_edge(current_index, self.get_index(stmt), "next_line")
 
             # ─────────────────────────────────────────────────────────
             # SWITCH STATEMENT
@@ -958,11 +1005,13 @@ class CFGGraph_cpp(CFGGraph):
                         self.add_edge(current_index, catch_index, "catch_exception")
 
                 # Edge from try to next statement (if no exception)
+                # BUT: Don't add edge if last statement is a jump statement
                 last_line, _ = self.get_block_last_line(node, "body")
                 if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                    next_index, next_node = self.get_next_index(node, node_list)
-                    if next_index != 2:
-                        self.add_edge(self.get_index(last_line), next_index, "try_exit")
+                    if not self.is_jump_statement(last_line):
+                        next_index, next_node = self.get_next_index(node, node_list)
+                        if next_index != 2:
+                            self.add_edge(self.get_index(last_line), next_index, "try_exit")
 
             # ─────────────────────────────────────────────────────────
             # CATCH CLAUSE
@@ -979,14 +1028,16 @@ class CFGGraph_cpp(CFGGraph):
                                 self.add_edge(current_index, self.get_index(first_stmt), "catch_next")
 
                 # Edge from catch to next statement after try-catch
+                # BUT: Don't add edge if last statement is a jump statement
                 last_line, _ = self.get_block_last_line(node, "body")
                 if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                    # Find parent try statement
-                    parent_try = node.parent
-                    if parent_try and parent_try.type == "try_statement":
-                        next_index, next_node = self.get_next_index(parent_try, node_list)
-                        if next_index != 2:
-                            self.add_edge(self.get_index(last_line), next_index, "catch_exit")
+                    if not self.is_jump_statement(last_line):
+                        # Find parent try statement
+                        parent_try = node.parent
+                        if parent_try and parent_try.type == "try_statement":
+                            next_index, next_node = self.get_next_index(parent_try, node_list)
+                            if next_index != 2:
+                                self.add_edge(self.get_index(last_line), next_index, "catch_exit")
 
             # ─────────────────────────────────────────────────────────
             # THROW STATEMENT

@@ -11,6 +11,7 @@ statement_types = {
         "break_statement",
         "continue_statement",
         "return_statement",
+        "goto_statement",
         "switch_statement",
         "case_statement",
         "throw_statement",
@@ -73,6 +74,7 @@ statement_types = {
         "break_statement",
         "continue_statement",
         "return_statement",
+        "goto_statement",
         "switch_statement",
         "try_statement",
         "throw_statement",
@@ -722,6 +724,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 label_node = root_node.child_by_field_name("label")
                 if label_node:
                     label = label_node.text.decode("UTF-8") + ":"
+                    # Map label to the labeled_statement node itself
+                    # Goto statements will jump to this label node
+                    # The labeled_statement handler in CFG_cpp.py will then create
+                    # an edge from the label to the statement after it
                     records["label_statement_map"][label] = (
                         root_node.start_point,
                         root_node.end_point,
