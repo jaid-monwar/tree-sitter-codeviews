@@ -44,6 +44,8 @@ class CFGGraph_cpp(CFGGraph):
             "inline_functions": {},                # function_id → True
             "noexcept_functions": {},              # function_id → True
             "attributed_functions": {},            # function_id → [attributes]
+            "function_pointer_assignments": {},    # pointer_var → [function_names]
+            "indirect_calls": {},                  # (pointer_var, sig) → [(call_id, parent_id)]
         }
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
@@ -347,8 +349,10 @@ class CFGGraph_cpp(CFGGraph):
             function_node = root_node.child_by_field_name("function")
             if function_node:
                 func_name = None
+                is_indirect_call = False
+                pointer_var = None
 
-                # Case 1: Simple identifier (regular function call)
+                # Case 1: Simple identifier (could be regular call or function pointer)
                 if function_node.type == "identifier":
                     func_name = function_node.text.decode('utf-8')
 
@@ -362,19 +366,37 @@ class CFGGraph_cpp(CFGGraph):
                 elif function_node.type == "qualified_identifier":
                     func_name = function_node.text.decode('utf-8')
 
-                if func_name:
-                    # Find the parent statement node
-                    parent_stmt = root_node
-                    while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
-                        parent_stmt = parent_stmt.parent
+                # Case 4: Subscript expression (array of function pointers: operations[0](args))
+                elif function_node.type == "subscript_expression":
+                    is_indirect_call = True
+                    # Get the array name
+                    argument = function_node.child_by_field_name("argument")
+                    if argument and argument.type == "identifier":
+                        pointer_var = argument.text.decode('utf-8')
 
-                    if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
-                        parent_index = self.get_index(parent_stmt)
-                        call_index = self.get_index(function_node)
+                # Find the parent statement node
+                parent_stmt = root_node
+                while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                    parent_stmt = parent_stmt.parent
 
-                        # Get argument types for signature matching
-                        args_node = root_node.child_by_field_name("arguments")
-                        signature = self.get_call_signature(args_node)
+                if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                    parent_index = self.get_index(parent_stmt)
+                    call_index = self.get_index(function_node)
+
+                    # Get argument types for signature matching
+                    args_node = root_node.child_by_field_name("arguments")
+                    signature = self.get_call_signature(args_node)
+
+                    # Track indirect calls separately
+                    if is_indirect_call and pointer_var:
+                        key = (pointer_var, signature)
+                        if key not in self.records["indirect_calls"]:
+                            self.records["indirect_calls"][key] = []
+                        self.records["indirect_calls"][key].append((call_index, parent_index))
+                    elif func_name:
+                        # Check if this identifier is in function_list (direct call) or might be a pointer (indirect)
+                        # For now, treat all identifiers as potential direct calls
+                        # We'll handle the distinction in add_function_call_edges
 
                         # Determine if this is a method call or function call
                         if function_node.type == "field_expression":
@@ -456,6 +478,88 @@ class CFGGraph_cpp(CFGGraph):
         self.CFG_node_list.append((1, 0, "start_node", "start"))
         # Exit node (ID=2) is implicit
 
+    def track_function_pointer_assignments(self, root_node):
+        """
+        Track assignments to function pointers.
+        Handles:
+        - Simple assignments: mathFunc = add;
+        - Address-of assignments: greetFunc = &greet;
+        - Array initializers: int (*ops[2])(int, int) = {add, multiply};
+        """
+        if root_node.type == "assignment_expression":
+            # Get left side (the pointer variable)
+            left = root_node.child_by_field_name("left")
+            # Get right side (the function being assigned)
+            right = root_node.child_by_field_name("right")
+
+            if left and right:
+                pointer_var = None
+                function_name = None
+
+                # Get pointer variable name
+                if left.type == "identifier":
+                    pointer_var = left.text.decode('utf-8')
+
+                # Get function name from right side
+                if right.type == "identifier":
+                    # Simple assignment: mathFunc = add
+                    function_name = right.text.decode('utf-8')
+                elif right.type == "pointer_expression":
+                    # Address-of assignment: greetFunc = &greet
+                    arg = right.child_by_field_name("argument")
+                    if arg and arg.type == "identifier":
+                        function_name = arg.text.decode('utf-8')
+
+                # Track the assignment
+                if pointer_var and function_name:
+                    if pointer_var not in self.records["function_pointer_assignments"]:
+                        self.records["function_pointer_assignments"][pointer_var] = []
+                    if function_name not in self.records["function_pointer_assignments"][pointer_var]:
+                        self.records["function_pointer_assignments"][pointer_var].append(function_name)
+
+        # Handle array initializers: int (*ops[2])(int, int) = {add, multiply};
+        elif root_node.type == "init_declarator":
+            # Check if this is an array of function pointers
+            declarator = root_node.child_by_field_name("declarator")
+            value = root_node.child_by_field_name("value")
+
+            if declarator and value and value.type == "initializer_list":
+                # Get array name - navigate the tree structure
+                # function_declarator → parenthesized_declarator → pointer_declarator → array_declarator → identifier
+                array_name = None
+
+                # Helper function to recursively find array_declarator
+                def find_array_declarator(node):
+                    if node is None:
+                        return None
+                    if node.type == "array_declarator":
+                        # Get the identifier (array name)
+                        for child in node.named_children:
+                            if child.type == "identifier":
+                                return child.text.decode('utf-8')
+                    # Recursively search children
+                    for child in node.named_children:
+                        result = find_array_declarator(child)
+                        if result:
+                            return result
+                    return None
+
+                array_name = find_array_declarator(declarator)
+
+                # Get the functions in the initializer list
+                if array_name:
+                    for child in value.named_children:
+                        if child.type == "identifier":
+                            function_name = child.text.decode('utf-8')
+                            if array_name not in self.records["function_pointer_assignments"]:
+                                self.records["function_pointer_assignments"][array_name] = []
+                            if function_name not in self.records["function_pointer_assignments"][array_name]:
+                                self.records["function_pointer_assignments"][array_name].append(function_name)
+
+        # Recursively process children
+        for child in root_node.children:
+            self.track_function_pointer_assignments(child)
+
     def add_function_call_edges(self):
         """
         Add edges for function calls and returns.
@@ -529,6 +633,79 @@ class CFGGraph_cpp(CFGGraph):
                                             return_func = self.get_containing_function(return_node)
                                             if parent_func != return_func or parent_func is None:
                                                 self.add_edge(return_id, parent_id, "method_return")
+
+        # Process indirect calls through function pointers
+        # Handle calls through pointer variables and array subscripts
+        for (pointer_var, signature), call_list in self.records["indirect_calls"].items():
+            # Look up what function(s) this pointer/array might point to
+            if pointer_var in self.records["function_pointer_assignments"]:
+                function_names = self.records["function_pointer_assignments"][pointer_var]
+
+                # Create edges to all possible target functions
+                for func_name in function_names:
+                    # Find the function definition
+                    for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                        if fn_name == func_name:
+                            # Found a possible target
+                            for call_id, parent_id in call_list:
+                                # Add call edge
+                                self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
+
+                                # Add return edges
+                                if fn_id in self.records["return_statement_map"]:
+                                    for return_id in self.records["return_statement_map"][fn_id]:
+                                        if parent_id != fn_id:
+                                            parent_key = index_to_key.get(parent_id)
+                                            return_key = index_to_key.get(return_id)
+
+                                            if parent_key and return_key:
+                                                parent_node = self.node_list.get(parent_key)
+                                                return_node = self.node_list.get(return_key)
+
+                                                if parent_node and return_node:
+                                                    parent_func = self.get_containing_function(parent_node)
+                                                    return_func = self.get_containing_function(return_node)
+                                                    if parent_func != return_func or parent_func is None:
+                                                        self.add_edge(return_id, parent_id, "indirect_return")
+
+        # Also check function_calls for indirect calls (identifiers that don't match any function)
+        # These are calls like mathFunc(5, 3) where mathFunc is a function pointer variable
+        for (func_name, signature), call_list in list(self.records["function_calls"].items()):
+            # Check if this name matches any function definition
+            found_direct_match = False
+            for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                if fn_name == func_name:
+                    found_direct_match = True
+                    break
+
+            # If no direct match, check if it's a function pointer variable
+            if not found_direct_match and func_name in self.records["function_pointer_assignments"]:
+                function_names = self.records["function_pointer_assignments"][func_name]
+
+                # Create edges to all possible target functions
+                for target_func in function_names:
+                    for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                        if fn_name == target_func:
+                            for call_id, parent_id in call_list:
+                                # Add call edge
+                                self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
+
+                                # Add return edges
+                                if fn_id in self.records["return_statement_map"]:
+                                    for return_id in self.records["return_statement_map"][fn_id]:
+                                        if parent_id != fn_id:
+                                            parent_key = index_to_key.get(parent_id)
+                                            return_key = index_to_key.get(return_id)
+
+                                            if parent_key and return_key:
+                                                parent_node = self.node_list.get(parent_key)
+                                                return_node = self.node_list.get(return_key)
+
+                                                if parent_node and return_node:
+                                                    parent_func = self.get_containing_function(parent_node)
+                                                    return_func = self.get_containing_function(return_node)
+                                                    if parent_func != return_func or parent_func is None:
+                                                        self.add_edge(return_id, parent_id, "indirect_return")
 
     def add_lambda_edges(self):
         """
@@ -615,6 +792,11 @@ class CFGGraph_cpp(CFGGraph):
         # STEP 4: Build function/method call map
         # ═══════════════════════════════════════════════════════════
         self.function_list(self.root_node, node_list)
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 4.5: Track function pointer assignments
+        # ═══════════════════════════════════════════════════════════
+        self.track_function_pointer_assignments(self.root_node)
 
         # ═══════════════════════════════════════════════════════════
         # STEP 5: Add dummy nodes
