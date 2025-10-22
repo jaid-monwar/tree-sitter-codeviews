@@ -465,6 +465,9 @@ class CFGGraph_cpp(CFGGraph):
         - Constructor calls
         - Virtual function dispatch
         """
+        # Create reverse index mapping: index -> node_key
+        index_to_key = {v: k for k, v in self.index.items()}
+
         # Process regular function calls
         for (func_name, signature), call_list in self.records["function_calls"].items():
             # Find matching function definition
@@ -476,9 +479,27 @@ class CFGGraph_cpp(CFGGraph):
                         self.add_edge(parent_id, fn_id, f"function_call|{call_id}")
 
                         # Add return edges: function return points -> caller
+                        # Skip return edges to call sites within the same function
+                        # (e.g., recursive calls in mutually exclusive branches)
                         if fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
-                                self.add_edge(return_id, parent_id, "function_return")
+                                # Don't add return edge if caller is in the same function as the return
+                                # This prevents confusing edges between mutually exclusive branches
+                                if parent_id != fn_id:  # Skip if call site is the function itself (recursive)
+                                    # Get nodes from indices
+                                    parent_key = index_to_key.get(parent_id)
+                                    return_key = index_to_key.get(return_id)
+
+                                    if parent_key and return_key:
+                                        parent_node = self.node_list.get(parent_key)
+                                        return_node = self.node_list.get(return_key)
+
+                                        if parent_node and return_node:
+                                            parent_func = self.get_containing_function(parent_node)
+                                            return_func = self.get_containing_function(return_node)
+                                            # Only add edge if they're in different functions
+                                            if parent_func != return_func or parent_func is None:
+                                                self.add_edge(return_id, parent_id, "function_return")
 
         # Process method calls (similar pattern but consider class context)
         for (method_name, signature), call_list in self.records["method_calls"].items():
@@ -492,9 +513,22 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(parent_id, fn_id, f"method_call|{call_id}")
 
                         # Add return edges
+                        # Skip return edges to call sites within the same function
                         if fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
-                                self.add_edge(return_id, parent_id, "method_return")
+                                if parent_id != fn_id:
+                                    parent_key = index_to_key.get(parent_id)
+                                    return_key = index_to_key.get(return_id)
+
+                                    if parent_key and return_key:
+                                        parent_node = self.node_list.get(parent_key)
+                                        return_node = self.node_list.get(return_key)
+
+                                        if parent_node and return_node:
+                                            parent_func = self.get_containing_function(parent_node)
+                                            return_func = self.get_containing_function(return_node)
+                                            if parent_func != return_func or parent_func is None:
+                                                self.add_edge(return_id, parent_id, "method_return")
 
     def add_lambda_edges(self):
         """
