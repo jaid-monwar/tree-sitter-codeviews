@@ -40,6 +40,7 @@ class CFGGraph_cpp(CFGGraph):
             "switch_child_map": {},                # parent_id → switch_child_id
             "label_statement_map": {},             # label → node_key
             "return_statement_map": {},            # function_id → [return_node_ids]
+            "implicit_return_map": {},             # function_id → implicit_return_node_id (for void functions)
             "constexpr_functions": {},             # function_id → True
             "inline_functions": {},                # function_id → True
             "noexcept_functions": {},              # function_id → True
@@ -62,6 +63,11 @@ class CFGGraph_cpp(CFGGraph):
     def get_index(self, node):
         """Get the unique index for a given AST node"""
         return self.index[(node.start_point, node.end_point, node.type)]
+
+    def get_new_synthetic_index(self):
+        """Generate a new unique index for synthetic nodes (implicit returns, etc.)"""
+        self.index_counter += 1
+        return self.index_counter
 
     def get_basic_blocks(self, CFG_node_list, CFG_edge_list):
         """Partition CFG into basic blocks using weakly connected components"""
@@ -199,6 +205,25 @@ class CFGGraph_cpp(CFGGraph):
                 first_child = children_list[0]
                 if (first_child.start_point, first_child.end_point, first_child.type) in node_list:
                     return (self.get_index(first_child), first_child)
+
+        # If next node is a field_declaration, look inside for the actual statement
+        if next_node.type == "field_declaration":
+            # Field declarations wrap the actual declaration/expression
+            # Recursively search for the first node inside that's in node_list
+            def find_first_in_wrapper(wrapper_node):
+                # Check all children
+                for child in wrapper_node.named_children:
+                    if (child.start_point, child.end_point, child.type) in node_list:
+                        return (self.get_index(child), child)
+                    # Recursively check grandchildren
+                    result = find_first_in_wrapper(child)
+                    if result:
+                        return result
+                return None
+
+            result = find_first_in_wrapper(next_node)
+            if result:
+                return result
 
         # Check if next_node is in node_list
         if (next_node.start_point, next_node.end_point, next_node.type) in node_list:
@@ -410,6 +435,46 @@ class CFGGraph_cpp(CFGGraph):
                                 self.records["function_calls"][key] = []
                             self.records["function_calls"][key].append((call_index, parent_index))
 
+        # Handle constructor calls from object declarations
+        # Example: Dog myDog("Buddy", 3);
+        # Tree structure: declaration → init_declarator → argument_list
+        elif root_node.type == "declaration":
+            # Get the type (class name)
+            type_node = root_node.child_by_field_name("type")
+            if type_node and type_node.type == "type_identifier":
+                class_name = type_node.text.decode('utf-8')
+
+                # Look for init_declarator with argument_list (constructor call)
+                for child in root_node.children:
+                    if child.type == "init_declarator":
+                        # Check if it has an argument_list (constructor call with args)
+                        args_node = None
+                        for subchild in child.children:
+                            if subchild.type == "argument_list":
+                                args_node = subchild
+                                break
+
+                        if args_node:
+                            # This is a constructor call!
+                            # Find the parent statement node
+                            parent_stmt = root_node
+                            while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                                parent_stmt = parent_stmt.parent
+
+                            if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                                parent_index = self.get_index(parent_stmt)
+                                # Use the declaration statement as the call site
+                                call_index = parent_index
+
+                                # Get argument signature
+                                signature = self.get_call_signature(args_node)
+
+                                # Store constructor call
+                                key = (class_name, signature)
+                                if key not in self.records["constructor_calls"]:
+                                    self.records["constructor_calls"][key] = []
+                                self.records["constructor_calls"][key].append((call_index, parent_index))
+
         # Recursively process children
         for child in root_node.children:
             self.function_list(child, node_list)
@@ -587,23 +652,66 @@ class CFGGraph_cpp(CFGGraph):
                         # (e.g., recursive calls in mutually exclusive branches)
                         if fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
-                                # Don't add return edge if caller is in the same function as the return
-                                # This prevents confusing edges between mutually exclusive branches
-                                if parent_id != fn_id:  # Skip if call site is the function itself (recursive)
-                                    # Get nodes from indices
-                                    parent_key = index_to_key.get(parent_id)
+                                # Check if this is a synthetic implicit return node
+                                is_implicit_return = return_id in self.records["implicit_return_map"].values()
+
+                                # Get the call site node
+                                parent_key = index_to_key.get(parent_id)
+                                if not parent_key:
+                                    continue
+                                parent_node = self.node_list.get(parent_key)
+                                if not parent_node:
+                                    continue
+
+                                # Determine return target based on function return type
+                                # For NON-VOID functions: return to call site (value needed in expression)
+                                # For VOID functions/implicit returns: return to next statement
+                                return_target = None
+
+                                if is_implicit_return:
+                                    # Implicit return = void function or constructor
+                                    # Return to NEXT statement (no value to evaluate)
+                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                    return_target = next_index if next_index != 2 else None
+                                else:
+                                    # Explicit return = may return a value
+                                    # Check function's return type
+                                    fn_key = None
+                                    for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
+                                        if fn_id_check == fn_id:
+                                            fn_key = ((class_name_check, fn_name_check), fn_sig_check)
+                                            break
+
+                                    is_void_return = False
+                                    if fn_key and fn_key in self.records["return_type"]:
+                                        ret_type = self.records["return_type"][fn_key]
+                                        is_void_return = ret_type == "void"
+
+                                    if is_void_return:
+                                        # Void function with explicit return
+                                        # Return to NEXT statement
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
+                                    else:
+                                        # Non-void function (returns a value)
+                                        # Return to SAME statement (call site) to continue expression
+                                        return_target = parent_id
+
+                                if parent_id != fn_id and return_target:
+                                    # Get return node from index
                                     return_key = index_to_key.get(return_id)
 
-                                    if parent_key and return_key:
-                                        parent_node = self.node_list.get(parent_key)
+                                    if is_implicit_return or not return_key:
+                                        # Implicit returns don't have nodes in node_list
+                                        self.add_edge(return_id, return_target, "function_return")
+                                    else:
                                         return_node = self.node_list.get(return_key)
-
-                                        if parent_node and return_node:
+                                        if return_node:
                                             parent_func = self.get_containing_function(parent_node)
                                             return_func = self.get_containing_function(return_node)
                                             # Only add edge if they're in different functions
                                             if parent_func != return_func or parent_func is None:
-                                                self.add_edge(return_id, parent_id, "function_return")
+                                                self.add_edge(return_id, return_target, "function_return")
 
         # Process method calls (similar pattern but consider class context)
         for (method_name, signature), call_list in self.records["method_calls"].items():
@@ -616,23 +724,118 @@ class CFGGraph_cpp(CFGGraph):
                         else:
                             self.add_edge(parent_id, fn_id, f"method_call|{call_id}")
 
-                        # Add return edges
+                        # Add return edges: method return points -> caller
                         # Skip return edges to call sites within the same function
                         if fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
-                                if parent_id != fn_id:
-                                    parent_key = index_to_key.get(parent_id)
+                                # Check if this is a synthetic implicit return node
+                                is_implicit_return = return_id in self.records["implicit_return_map"].values()
+
+                                # Get the call site node
+                                parent_key = index_to_key.get(parent_id)
+                                if not parent_key:
+                                    continue
+                                parent_node = self.node_list.get(parent_key)
+                                if not parent_node:
+                                    continue
+
+                                # Determine return target based on method return type
+                                # For NON-VOID methods: return to call site (value needed in expression)
+                                # For VOID methods/implicit returns: return to next statement
+                                return_target = None
+
+                                if is_implicit_return:
+                                    # Implicit return = void method
+                                    # Return to NEXT statement (no value to evaluate)
+                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                    return_target = next_index if next_index != 2 else None
+                                else:
+                                    # Explicit return = may return a value
+                                    # Check method's return type
+                                    fn_key = None
+                                    for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
+                                        if fn_id_check == fn_id:
+                                            fn_key = ((class_name_check, fn_name_check), fn_sig_check)
+                                            break
+
+                                    is_void_return = False
+                                    if fn_key and fn_key in self.records["return_type"]:
+                                        ret_type = self.records["return_type"][fn_key]
+                                        is_void_return = ret_type == "void"
+
+                                    if is_void_return:
+                                        # Void method with explicit return
+                                        # Return to NEXT statement
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
+                                    else:
+                                        # Non-void method (returns a value)
+                                        # Return to SAME statement (call site) to continue expression
+                                        return_target = parent_id
+
+                                if parent_id != fn_id and return_target:
+                                    # Get return node from index
                                     return_key = index_to_key.get(return_id)
 
-                                    if parent_key and return_key:
-                                        parent_node = self.node_list.get(parent_key)
+                                    if is_implicit_return or not return_key:
+                                        # Implicit returns don't have nodes in node_list
+                                        self.add_edge(return_id, return_target, "method_return")
+                                    else:
                                         return_node = self.node_list.get(return_key)
-
-                                        if parent_node and return_node:
+                                        if return_node:
                                             parent_func = self.get_containing_function(parent_node)
                                             return_func = self.get_containing_function(return_node)
                                             if parent_func != return_func or parent_func is None:
-                                                self.add_edge(return_id, parent_id, "method_return")
+                                                self.add_edge(return_id, return_target, "method_return")
+
+        # Process constructor calls
+        for (class_name, signature), call_list in self.records["constructor_calls"].items():
+            # Find matching constructor in function_list
+            # Constructors are stored with the class name as the function name
+            for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                if fn_class_name == class_name and fn_name == class_name:
+                    # Found matching constructor
+                    for call_id, parent_id in call_list:
+                        # Add call edge: declaration -> constructor
+                        self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
+
+                        # Add return edges: constructor return points -> next statement after declaration
+                        if fn_id in self.records["return_statement_map"]:
+                            for return_id in self.records["return_statement_map"][fn_id]:
+                                # Check if this is a synthetic implicit return node
+                                is_implicit_return = return_id in self.records["implicit_return_map"].values()
+
+                                # Get the call site node to find the next statement
+                                parent_key = index_to_key.get(parent_id)
+                                if not parent_key:
+                                    continue
+                                parent_node = self.node_list.get(parent_key)
+                                if not parent_node:
+                                    continue
+
+                                # Find the next statement after the declaration
+                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
+
+                                # Return should go to the next statement, not back to the declaration
+                                return_target = next_index if next_index != 2 else None
+
+                                if is_implicit_return:
+                                    # For implicit returns, always create the edge
+                                    if parent_id != fn_id and return_target:
+                                        self.add_edge(return_id, return_target, "constructor_return")
+                                else:
+                                    # For regular return statements, check they're in different functions
+                                    if parent_id != fn_id and return_target:
+                                        return_key = index_to_key.get(return_id)
+
+                                        if return_key:
+                                            return_node = self.node_list.get(return_key)
+
+                                            if return_node:
+                                                parent_func = self.get_containing_function(parent_node)
+                                                return_func = self.get_containing_function(return_node)
+                                                if parent_func != return_func or parent_func is None:
+                                                    self.add_edge(return_id, return_target, "constructor_return")
 
         # Process indirect calls through function pointers
         # Handle calls through pointer variables and array subscripts
@@ -651,22 +854,43 @@ class CFGGraph_cpp(CFGGraph):
                                 # Add call edge
                                 self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
 
-                                # Add return edges
+                                # Add return edges: return points -> next statement after caller
                                 if fn_id in self.records["return_statement_map"]:
                                     for return_id in self.records["return_statement_map"][fn_id]:
-                                        if parent_id != fn_id:
-                                            parent_key = index_to_key.get(parent_id)
-                                            return_key = index_to_key.get(return_id)
+                                        # Check if this is a synthetic implicit return node
+                                        is_implicit_return = return_id in self.records["implicit_return_map"].values()
 
-                                            if parent_key and return_key:
-                                                parent_node = self.node_list.get(parent_key)
-                                                return_node = self.node_list.get(return_key)
+                                        # Get the call site node to find the next statement
+                                        parent_key = index_to_key.get(parent_id)
+                                        if not parent_key:
+                                            continue
+                                        parent_node = self.node_list.get(parent_key)
+                                        if not parent_node:
+                                            continue
 
-                                                if parent_node and return_node:
-                                                    parent_func = self.get_containing_function(parent_node)
-                                                    return_func = self.get_containing_function(return_node)
-                                                    if parent_func != return_func or parent_func is None:
-                                                        self.add_edge(return_id, parent_id, "indirect_return")
+                                        # Find the next statement after the call
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+
+                                        # Return should go to the next statement, not back to the call
+                                        return_target = next_index if next_index != 2 else None
+
+                                        if is_implicit_return:
+                                            # For implicit returns, always create the edge
+                                            if parent_id != fn_id and return_target:
+                                                self.add_edge(return_id, return_target, "indirect_return")
+                                        else:
+                                            # For regular return statements, check they're in different functions
+                                            if parent_id != fn_id and return_target:
+                                                return_key = index_to_key.get(return_id)
+
+                                                if return_key:
+                                                    return_node = self.node_list.get(return_key)
+
+                                                    if return_node:
+                                                        parent_func = self.get_containing_function(parent_node)
+                                                        return_func = self.get_containing_function(return_node)
+                                                        if parent_func != return_func or parent_func is None:
+                                                            self.add_edge(return_id, return_target, "indirect_return")
 
         # Also check function_calls for indirect calls (identifiers that don't match any function)
         # These are calls like mathFunc(5, 3) where mathFunc is a function pointer variable
@@ -690,22 +914,43 @@ class CFGGraph_cpp(CFGGraph):
                                 # Add call edge
                                 self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
 
-                                # Add return edges
+                                # Add return edges: return points -> next statement after caller
                                 if fn_id in self.records["return_statement_map"]:
                                     for return_id in self.records["return_statement_map"][fn_id]:
-                                        if parent_id != fn_id:
-                                            parent_key = index_to_key.get(parent_id)
-                                            return_key = index_to_key.get(return_id)
+                                        # Check if this is a synthetic implicit return node
+                                        is_implicit_return = return_id in self.records["implicit_return_map"].values()
 
-                                            if parent_key and return_key:
-                                                parent_node = self.node_list.get(parent_key)
-                                                return_node = self.node_list.get(return_key)
+                                        # Get the call site node to find the next statement
+                                        parent_key = index_to_key.get(parent_id)
+                                        if not parent_key:
+                                            continue
+                                        parent_node = self.node_list.get(parent_key)
+                                        if not parent_node:
+                                            continue
 
-                                                if parent_node and return_node:
-                                                    parent_func = self.get_containing_function(parent_node)
-                                                    return_func = self.get_containing_function(return_node)
-                                                    if parent_func != return_func or parent_func is None:
-                                                        self.add_edge(return_id, parent_id, "indirect_return")
+                                        # Find the next statement after the call
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+
+                                        # Return should go to the next statement, not back to the call
+                                        return_target = next_index if next_index != 2 else None
+
+                                        if is_implicit_return:
+                                            # For implicit returns, always create the edge
+                                            if parent_id != fn_id and return_target:
+                                                self.add_edge(return_id, return_target, "indirect_return")
+                                        else:
+                                            # For regular return statements, check they're in different functions
+                                            if parent_id != fn_id and return_target:
+                                                return_key = index_to_key.get(return_id)
+
+                                                if return_key:
+                                                    return_node = self.node_list.get(return_key)
+
+                                                    if return_node:
+                                                        parent_func = self.get_containing_function(parent_node)
+                                                        return_func = self.get_containing_function(return_node)
+                                                        if parent_func != return_func or parent_func is None:
+                                                            self.add_edge(return_id, return_target, "indirect_return")
 
     def add_lambda_edges(self):
         """
@@ -771,8 +1016,9 @@ class CFGGraph_cpp(CFGGraph):
                 if self.is_last_in_control_block(node):
                     continue
 
-                # Skip nodes with inner definitions
-                if cpp_nodes.has_inner_definition(node):
+                # Skip nodes with inner definitions (but NOT field_declarations or access_specifiers)
+                # Field declarations are class members that need sequential flow despite being "definitions"
+                if node.type not in ["field_declaration", "access_specifier"] and cpp_nodes.has_inner_definition(node):
                     continue
 
                 # Get next statement
@@ -824,25 +1070,48 @@ class CFGGraph_cpp(CFGGraph):
                     first_index, first_node = first_line
                     self.add_edge(current_index, first_index, "first_next_line")
 
-                # For VOID functions, add implicit return from last statement
-                # For non-void functions, only explicit returns should be in return_statement_map
+                # For VOID functions and CONSTRUCTORS, create an explicit implicit return node
+                # This node serves as a collection point for all execution paths that reach the function end
                 return_type_node = node.child_by_field_name("type")
                 is_void = False
+                is_constructor = False
+
                 if return_type_node:
                     return_type_text = return_type_node.text.decode('utf-8')
                     is_void = return_type_text == "void"
+                else:
+                    # No return type = constructor or destructor
+                    is_constructor = True
 
-                if is_void:
-                    # Add implicit return from last statement of void function
-                    last_line, last_type = self.get_block_last_line(node, "body")
-                    if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        # Only add if last line is not already an explicit return/throw
-                        if not self.is_jump_statement(last_line):
-                            last_index = self.get_index(last_line)
-                            if current_index not in self.records["return_statement_map"]:
-                                self.records["return_statement_map"][current_index] = []
-                            if last_index not in self.records["return_statement_map"][current_index]:
-                                self.records["return_statement_map"][current_index].append(last_index)
+                if is_void or is_constructor:
+                    # Create implicit return node
+                    implicit_return_id = self.get_new_synthetic_index()
+
+                    # Get function name for label
+                    declarator = node.child_by_field_name("declarator")
+                    func_name = "unknown"
+                    if declarator:
+                        # Navigate to find the identifier
+                        for child in declarator.named_children:
+                            if child.type == "identifier":
+                                func_name = child.text.decode('utf-8')
+                                break
+                            elif child.type == "field_identifier":
+                                func_name = child.text.decode('utf-8')
+                                break
+
+                    # Add implicit return node to CFG node list
+                    # Format: (node_id, line_number, node_type, label)
+                    implicit_return_label = f"implicit_return_{func_name}"
+                    self.CFG_node_list.append((implicit_return_id, 0, "implicit_return", implicit_return_label))
+
+                    # Store mapping: function_id -> implicit_return_id
+                    self.records["implicit_return_map"][current_index] = implicit_return_id
+
+                    # Add implicit return to return_statement_map so it gets connected to call sites
+                    if current_index not in self.records["return_statement_map"]:
+                        self.records["return_statement_map"][current_index] = []
+                    self.records["return_statement_map"][current_index].append(implicit_return_id)
 
             # ─────────────────────────────────────────────────────────
             # CLASS / STRUCT DEFINITION
@@ -891,6 +1160,15 @@ class CFGGraph_cpp(CFGGraph):
                             next_index, next_node = self.get_next_index(node, node_list)
                             if next_index != 2:
                                 self.add_edge(self.get_index(last_line), next_index, "next_line")
+                            else:
+                                # At function boundary - check if we're in a void function
+                                func = self.get_containing_function(node)
+                                if func:
+                                    func_index = self.get_index(func)
+                                    if func_index in self.records["implicit_return_map"]:
+                                        # Connect to implicit return node
+                                        implicit_return_id = self.records["implicit_return_map"][func_index]
+                                        self.add_edge(self.get_index(last_line), implicit_return_id, "next_line")
 
                 # Get alternative (else branch)
                 alternative = node.child_by_field_name("alternative")
@@ -933,6 +1211,14 @@ class CFGGraph_cpp(CFGGraph):
                                         next_index, next_node = self.get_next_index(node, node_list)
                                         if next_index != 2:
                                             self.add_edge(self.get_index(last_stmt), next_index, "next_line")
+                                        else:
+                                            # At function boundary - check if we're in a void function
+                                            func = self.get_containing_function(node)
+                                            if func:
+                                                func_index = self.get_index(func)
+                                                if func_index in self.records["implicit_return_map"]:
+                                                    implicit_return_id = self.records["implicit_return_map"][func_index]
+                                                    self.add_edge(self.get_index(last_stmt), implicit_return_id, "next_line")
                         else:
                             # Single statement after else
                             if (else_body.start_point, else_body.end_point, else_body.type) in node_list:
@@ -940,6 +1226,14 @@ class CFGGraph_cpp(CFGGraph):
                                     next_index, next_node = self.get_next_index(node, node_list)
                                     if next_index != 2:
                                         self.add_edge(self.get_index(else_body), next_index, "next_line")
+                                    else:
+                                        # At function boundary - check if we're in a void function
+                                        func = self.get_containing_function(node)
+                                        if func:
+                                            func_index = self.get_index(func)
+                                            if func_index in self.records["implicit_return_map"]:
+                                                implicit_return_id = self.records["implicit_return_map"][func_index]
+                                                self.add_edge(self.get_index(else_body), implicit_return_id, "next_line")
                     elif else_body.type == "compound_statement" or else_body.type != "if_statement":
                         # Direct compound_statement (not wrapped in else_clause)
                         last_line, _ = self.get_block_last_line(node, "alternative")
@@ -948,11 +1242,28 @@ class CFGGraph_cpp(CFGGraph):
                                 next_index, next_node = self.get_next_index(node, node_list)
                                 if next_index != 2:
                                     self.add_edge(self.get_index(last_line), next_index, "next_line")
+                                else:
+                                    # At function boundary - check if we're in a void function
+                                    func = self.get_containing_function(node)
+                                    if func:
+                                        func_index = self.get_index(func)
+                                        if func_index in self.records["implicit_return_map"]:
+                                            implicit_return_id = self.records["implicit_return_map"][func_index]
+                                            self.add_edge(self.get_index(last_line), implicit_return_id, "next_line")
                 else:
                     # No else branch - if condition false, go to next statement
                     next_index, next_node = self.get_next_index(node, node_list)
                     if next_index != 2:
                         self.add_edge(current_index, next_index, "neg_next")
+                    else:
+                        # At function boundary - check if we're in a void function
+                        func = self.get_containing_function(node)
+                        if func:
+                            func_index = self.get_index(func)
+                            if func_index in self.records["implicit_return_map"]:
+                                # Connect to implicit return node
+                                implicit_return_id = self.records["implicit_return_map"][func_index]
+                                self.add_edge(current_index, implicit_return_id, "neg_next")
 
             # ─────────────────────────────────────────────────────────
             # WHILE LOOP
@@ -1298,6 +1609,35 @@ class CFGGraph_cpp(CFGGraph):
                             first_stmt = children[0]
                             if (first_stmt.start_point, first_stmt.end_point, first_stmt.type) in node_list:
                                 self.add_edge(current_index, self.get_index(first_stmt), "lambda_next")
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 6.5: Connect dangling paths to implicit returns
+        # ═══════════════════════════════════════════════════════════
+        # After all control flow edges are created, find statements that reach
+        # function boundaries and connect them to implicit return nodes
+        for key, node in node_list.items():
+            if node.type in self.statement_types["non_control_statement"]:
+                # Skip if last in control block (already handled)
+                if self.is_last_in_control_block(node):
+                    continue
+
+                # Skip nodes with inner definitions
+                if cpp_nodes.has_inner_definition(node):
+                    continue
+
+                # Get next statement
+                next_index, next_node = self.get_next_index(node, node_list)
+
+                # If at function boundary, connect to implicit return
+                if next_index == 2:
+                    func = self.get_containing_function(node)
+                    if func:
+                        func_index = self.get_index(func)
+                        if func_index in self.records["implicit_return_map"]:
+                            # Connect to implicit return node
+                            current_index = self.get_index(node)
+                            implicit_return_id = self.records["implicit_return_map"][func_index]
+                            self.add_edge(current_index, implicit_return_id, "next_line")
 
         # ═══════════════════════════════════════════════════════════
         # STEP 7: Add function/method call edges
