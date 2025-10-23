@@ -172,6 +172,12 @@ class CFGGraph_cpp(CFGGraph):
 
             # Check if parent is a function definition - end of function
             if parent.type == "function_definition":
+                # Check if this function has an implicit return node
+                if (parent.start_point, parent.end_point, parent.type) in node_list:
+                    fn_index = self.get_index(parent)
+                    if self.records.get("implicit_return_map") and fn_index in self.records["implicit_return_map"]:
+                        implicit_return_id = self.records["implicit_return_map"][fn_index]
+                        return (implicit_return_id, None)
                 return (2, None)
 
             # Check if parent is a class/struct - end of class
@@ -436,44 +442,196 @@ class CFGGraph_cpp(CFGGraph):
                             self.records["function_calls"][key].append((call_index, parent_index))
 
         # Handle constructor calls from object declarations
-        # Example: Dog myDog("Buddy", 3);
-        # Tree structure: declaration → init_declarator → argument_list
+        # Example patterns:
+        # 1. Parameterized: Dog myDog("Buddy", 3);
+        # 2. Default: ResourceHolder obj1;
+        # 3. Copy: ResourceHolder obj3 = obj2;
+        # 4. Move: ResourceHolder obj4 = std::move(obj2);
         elif root_node.type == "declaration":
             # Get the type (class name)
             type_node = root_node.child_by_field_name("type")
             if type_node and type_node.type == "type_identifier":
                 class_name = type_node.text.decode('utf-8')
 
-                # Look for init_declarator with argument_list (constructor call)
-                for child in root_node.children:
-                    if child.type == "init_declarator":
-                        # Check if it has an argument_list (constructor call with args)
-                        args_node = None
-                        for subchild in child.children:
-                            if subchild.type == "argument_list":
-                                args_node = subchild
-                                break
+                # Find the parent statement node
+                parent_stmt = root_node
+                while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                    parent_stmt = parent_stmt.parent
 
-                        if args_node:
-                            # This is a constructor call!
-                            # Find the parent statement node
-                            parent_stmt = root_node
-                            while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
-                                parent_stmt = parent_stmt.parent
+                if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                    parent_index = self.get_index(parent_stmt)
+                    call_index = parent_index
 
-                            if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
-                                parent_index = self.get_index(parent_stmt)
-                                # Use the declaration statement as the call site
-                                call_index = parent_index
+                    # Check if there's an init_declarator or just a plain declarator
+                    has_init_declarator = False
+                    for child in root_node.children:
+                        if child.type == "init_declarator":
+                            has_init_declarator = True
 
-                                # Get argument signature
+                            # Check for different constructor patterns
+                            args_node = None
+                            has_initializer = False
+                            is_move = False
+                            is_copy = False
+
+                            for subchild in child.children:
+                                if subchild.type == "argument_list":
+                                    # Parameterized constructor: ResourceHolder obj2(101, "ResourceOne");
+                                    args_node = subchild
+                                    break
+                                elif subchild.text.decode('utf-8') == "=":
+                                    has_initializer = True
+                                elif has_initializer and subchild.type == "call_expression":
+                                    # Check if it's std::move
+                                    func_node = subchild.child_by_field_name("function")
+                                    if func_node:
+                                        func_text = func_node.text.decode('utf-8')
+                                        if "move" in func_text:
+                                            # Move constructor: ResourceHolder obj4 = std::move(obj2);
+                                            is_move = True
+                                            # Get the argument to std::move for type checking
+                                            args = subchild.child_by_field_name("arguments")
+                                            if args and args.named_child_count > 0:
+                                                moved_arg = args.named_children[0]
+                                                # Create signature with the moved object's type
+                                                signature = (f"{class_name}&&",)  # Rvalue reference
+                                            break
+                                elif has_initializer and subchild.type == "identifier":
+                                    # Copy constructor: ResourceHolder obj3 = obj2;
+                                    is_copy = True
+                                    # Verify the identifier is of the same class type
+                                    signature = (f"const {class_name}&",)  # Const lvalue reference
+                                    break
+
+                            if args_node:
+                                # Parameterized constructor with explicit arguments
                                 signature = self.get_call_signature(args_node)
-
-                                # Store constructor call
                                 key = (class_name, signature)
                                 if key not in self.records["constructor_calls"]:
                                     self.records["constructor_calls"][key] = []
                                 self.records["constructor_calls"][key].append((call_index, parent_index))
+                            elif is_move:
+                                # Move constructor
+                                key = (class_name, signature)
+                                if key not in self.records["constructor_calls"]:
+                                    self.records["constructor_calls"][key] = []
+                                self.records["constructor_calls"][key].append((call_index, parent_index))
+                            elif is_copy:
+                                # Copy constructor
+                                key = (class_name, signature)
+                                if key not in self.records["constructor_calls"]:
+                                    self.records["constructor_calls"][key] = []
+                                self.records["constructor_calls"][key].append((call_index, parent_index))
+                            else:
+                                # Default constructor: ResourceHolder obj1;
+                                signature = tuple()  # Empty signature for default constructor
+                                key = (class_name, signature)
+                                if key not in self.records["constructor_calls"]:
+                                    self.records["constructor_calls"][key] = []
+                                self.records["constructor_calls"][key].append((call_index, parent_index))
+
+                    # If no init_declarator, it's a plain declaration (default constructor)
+                    # Example: ResourceHolder obj1;
+                    if not has_init_declarator:
+                        signature = tuple()  # Empty signature for default constructor
+                        key = (class_name, signature)
+                        if key not in self.records["constructor_calls"]:
+                            self.records["constructor_calls"][key] = []
+                        self.records["constructor_calls"][key].append((call_index, parent_index))
+
+        # Handle constructor calls from new expressions
+        # Example: Base* basePtr = new Derived();
+        elif root_node.type == "new_expression":
+            # Get the type being constructed
+            type_node = root_node.child_by_field_name("type")
+            if type_node:
+                class_name = None
+                if type_node.type == "type_identifier":
+                    class_name = type_node.text.decode('utf-8')
+
+                if class_name:
+                    # Find the parent statement node
+                    parent_stmt = root_node
+                    while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                        parent_stmt = parent_stmt.parent
+
+                    if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                        parent_index = self.get_index(parent_stmt)
+
+                        # Get the new_expression node itself if it's in node_list
+                        call_index = parent_index
+                        if (root_node.start_point, root_node.end_point, root_node.type) in node_list:
+                            call_index = self.get_index(root_node)
+
+                        # Check for argument_list (constructor arguments)
+                        args_node = root_node.child_by_field_name("arguments")
+
+                        if args_node:
+                            # Parameterized constructor
+                            signature = self.get_call_signature(args_node)
+                        else:
+                            # Default constructor
+                            signature = tuple()
+
+                        key = (class_name, signature)
+                        if key not in self.records["constructor_calls"]:
+                            self.records["constructor_calls"][key] = []
+                        self.records["constructor_calls"][key].append((call_index, parent_index))
+
+        # Handle destructor calls from delete expressions
+        # Example: delete basePtr; or delete[] arrayPtr;
+        # Check if root_node is a delete_expression OR contains one
+        delete_expr_node = None
+        if root_node.type == "delete_expression":
+            delete_expr_node = root_node
+        elif root_node.type == "expression_statement":
+            # Check if this expression_statement contains a delete_expression
+            for child in root_node.children:
+                if child.type == "delete_expression":
+                    delete_expr_node = child
+                    break
+
+        if delete_expr_node:
+            # Get the argument (what's being deleted) - it's the first named child
+            arg_node = None
+            if delete_expr_node.named_child_count > 0:
+                arg_node = delete_expr_node.named_children[0]
+            if arg_node:
+                # Try to determine the type being deleted
+                # This could be an identifier, so look it up in the symbol table
+                class_name = None
+
+                if arg_node.type == "identifier":
+                    arg_text = arg_node.text.decode('utf-8')
+                    # Look up the variable's type in the symbol table
+                    arg_key = (arg_node.start_point, arg_node.end_point, arg_node.type)
+                    if arg_key in self.index:
+                        arg_index = self.index[arg_key]
+                        if arg_index in self.declaration_map:
+                            decl_index = self.declaration_map[arg_index]
+                            if decl_index in self.symbol_table.get("data_type", {}):
+                                data_type = self.symbol_table["data_type"][decl_index]
+                                # Remove pointer/reference markers to get class name
+                                class_name = data_type.replace("*", "").replace("&", "").strip()
+
+                if class_name:
+                    # Find the parent statement node
+                    parent_stmt = root_node
+                    while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                        parent_stmt = parent_stmt.parent
+
+                    if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                        parent_index = self.get_index(parent_stmt)
+
+                        # Get the delete_expression node itself if it's in node_list
+                        call_index = parent_index
+                        if (root_node.start_point, root_node.end_point, root_node.type) in node_list:
+                            call_index = self.get_index(root_node)
+
+                        # Store destructor call
+                        if class_name not in self.records["destructor_calls"]:
+                            self.records["destructor_calls"][class_name] = []
+                        self.records["destructor_calls"][class_name].append((call_index, parent_index))
 
         # Recursively process children
         for child in root_node.children:
@@ -650,10 +808,10 @@ class CFGGraph_cpp(CFGGraph):
                         # Add return edges: function return points -> caller
                         # Skip return edges to call sites within the same function
                         # (e.g., recursive calls in mutually exclusive branches)
-                        if fn_id in self.records["return_statement_map"]:
+                        if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
                                 # Check if this is a synthetic implicit return node
-                                is_implicit_return = return_id in self.records["implicit_return_map"].values()
+                                is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
                                 # Get the call site node
                                 parent_key = index_to_key.get(parent_id)
@@ -726,10 +884,10 @@ class CFGGraph_cpp(CFGGraph):
 
                         # Add return edges: method return points -> caller
                         # Skip return edges to call sites within the same function
-                        if fn_id in self.records["return_statement_map"]:
+                        if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
                                 # Check if this is a synthetic implicit return node
-                                is_implicit_return = return_id in self.records["implicit_return_map"].values()
+                                is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
                                 # Get the call site node
                                 parent_key = index_to_key.get(parent_id)
@@ -793,17 +951,49 @@ class CFGGraph_cpp(CFGGraph):
             # Find matching constructor in function_list
             # Constructors are stored with the class name as the function name
             for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                # Match by class name and function name
                 if fn_class_name == class_name and fn_name == class_name:
-                    # Found matching constructor
-                    for call_id, parent_id in call_list:
-                        # Add call edge: declaration -> constructor
-                        self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
+                    # Check signature match with flexibility for special constructors
+                    sig_match = False
+
+                    # Exact match
+                    if fn_sig == signature:
+                        sig_match = True
+                    # Special case: copy constructor (const T&)
+                    elif signature == (f"const {class_name}&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
+                        sig_match = True
+                    # Special case: move constructor (T&&)
+                    elif signature == (f"{class_name}&&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
+                        sig_match = True
+                    # Flexible matching for parameter types
+                    elif len(fn_sig) == len(signature):
+                        # Try to match each parameter
+                        all_match = True
+                        for fn_param, call_param in zip(fn_sig, signature):
+                            # Simplify both for comparison (remove const, &, *, etc.)
+                            fn_param_simple = fn_param.replace('const', '').replace('&', '').replace('*', '').strip()
+                            call_param_simple = call_param.replace('const', '').replace('&', '').replace('*', '').strip()
+                            # Special case: string literal -> std::string or string
+                            if call_param == 'const char*' and ('string' in fn_param_simple.lower()):
+                                continue
+                            # Check if simplified versions match
+                            if fn_param_simple != call_param_simple:
+                                all_match = False
+                                break
+                        if all_match:
+                            sig_match = True
+
+                    if sig_match:
+                        # Found matching constructor with correct signature
+                        for call_id, parent_id in call_list:
+                            # Add call edge: declaration -> constructor
+                            self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
 
                         # Add return edges: constructor return points -> next statement after declaration
-                        if fn_id in self.records["return_statement_map"]:
+                        if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
                                 # Check if this is a synthetic implicit return node
-                                is_implicit_return = return_id in self.records["implicit_return_map"].values()
+                                is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
                                 # Get the call site node to find the next statement
                                 parent_key = index_to_key.get(parent_id)
@@ -837,11 +1027,64 @@ class CFGGraph_cpp(CFGGraph):
                                                 if parent_func != return_func or parent_func is None:
                                                     self.add_edge(return_id, return_target, "constructor_return")
 
+        # Process destructor calls
+        if self.records.get("destructor_calls"):
+            for class_name, call_list in self.records["destructor_calls"].items():
+                # Find matching destructor in function_list
+                # Destructors are stored with ~ClassName as the function name
+                destructor_name = f"~{class_name}"
+
+                # Also check for derived classes - if we're deleting a base class pointer,
+                # we need to call the derived class destructor first (if virtual)
+                matched_destructors = []
+
+                for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                    # Match destructor by name pattern ~ClassName
+                    if fn_name == destructor_name or (fn_name.startswith("~") and fn_class_name == class_name):
+                        matched_destructors.append((fn_class_name, fn_name, fn_id))
+
+                # Check inheritance to find all destructors that should be called
+                # For virtual destructors, call derived class destructor first, then base
+                for call_id, parent_id in call_list:
+                    # Get the actual runtime type if available
+                    # For now, call all destructors in the inheritance chain
+
+                    # First, find the most-derived destructor
+                    for fn_class_name, fn_name, fn_id in matched_destructors:
+                        # Add call edge: delete statement -> destructor
+                        self.add_edge(parent_id, fn_id, f"destructor_call|{call_id}")
+
+                        # Find the next statement after delete
+                        parent_key = index_to_key.get(parent_id)
+                        if parent_key:
+                            parent_node = self.node_list.get(parent_key)
+                            if parent_node:
+                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                return_target = next_index if next_index != 2 else None
+
+                                # Add return edges: destructor return points -> next statement after delete
+                                if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
+                                    for return_id in self.records["return_statement_map"][fn_id]:
+                                        is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
+
+                                        if return_target and parent_id != fn_id:
+                                            if is_implicit_return:
+                                                self.add_edge(return_id, return_target, "destructor_return")
+                                            else:
+                                                return_key = index_to_key.get(return_id)
+                                                if return_key:
+                                                    return_node = self.node_list.get(return_key)
+                                                    if return_node:
+                                                        parent_func = self.get_containing_function(parent_node)
+                                                        return_func = self.get_containing_function(return_node)
+                                                        if parent_func != return_func or parent_func is None:
+                                                            self.add_edge(return_id, return_target, "destructor_return")
+
         # Process indirect calls through function pointers
         # Handle calls through pointer variables and array subscripts
         for (pointer_var, signature), call_list in self.records["indirect_calls"].items():
             # Look up what function(s) this pointer/array might point to
-            if pointer_var in self.records["function_pointer_assignments"]:
+            if self.records.get("function_pointer_assignments") and pointer_var in self.records["function_pointer_assignments"]:
                 function_names = self.records["function_pointer_assignments"][pointer_var]
 
                 # Create edges to all possible target functions
@@ -855,10 +1098,10 @@ class CFGGraph_cpp(CFGGraph):
                                 self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
 
                                 # Add return edges: return points -> next statement after caller
-                                if fn_id in self.records["return_statement_map"]:
+                                if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                                     for return_id in self.records["return_statement_map"][fn_id]:
                                         # Check if this is a synthetic implicit return node
-                                        is_implicit_return = return_id in self.records["implicit_return_map"].values()
+                                        is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
                                         # Get the call site node to find the next statement
                                         parent_key = index_to_key.get(parent_id)
@@ -915,10 +1158,10 @@ class CFGGraph_cpp(CFGGraph):
                                 self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
 
                                 # Add return edges: return points -> next statement after caller
-                                if fn_id in self.records["return_statement_map"]:
+                                if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                                     for return_id in self.records["return_statement_map"][fn_id]:
                                         # Check if this is a synthetic implicit return node
-                                        is_implicit_return = return_id in self.records["implicit_return_map"].values()
+                                        is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
                                         # Get the call site node to find the next statement
                                         parent_key = index_to_key.get(parent_id)

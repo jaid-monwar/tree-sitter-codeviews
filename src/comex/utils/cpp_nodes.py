@@ -27,7 +27,7 @@ statement_types = {
         "access_specifier",
         "constructor_or_destructor_definition",
         "operator_cast",
-        "delete_expression",
+        # "delete_expression",      # Excluded: delete is an expression, always wrapped in expression_statement
         "lambda_expression",
         # HIGH PRIORITY FEATURES ADDED:
         "enum_specifier",           # Enum types
@@ -36,7 +36,7 @@ statement_types = {
         "friend_declaration",       # Friend declarations
         "catch_clause",             # Exception catch blocks
         # MEDIUM PRIORITY FEATURES ADDED:
-        "new_expression",           # Memory management - new
+        # "new_expression",         # Excluded: new is an expression, not a statement (appears within other statements)
         "static_assert_declaration", # Static assertions
         # "using_declaration",      # Excluded: compile-time only (duplicate, already commented above)
         "namespace_alias_definition", # Namespace aliases
