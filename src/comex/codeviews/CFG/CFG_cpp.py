@@ -57,6 +57,7 @@ class CFGGraph_cpp(CFGGraph):
         # Track objects created in each scope for RAII
         self.scope_objects = {}  # scope_key → [(var_name, class_type, decl_id, order)]
         self.object_scope_map = {}  # var_name → scope_key
+        self.scope_nodes = {}  # scope_key → actual_scope_node
 
         # Access parser data (created by parser_driver)
         self.symbol_table = self.parser.symbol_table
@@ -372,6 +373,121 @@ class CFGGraph_cpp(CFGGraph):
         else:
             self.CFG_edge_list.append((src, dest, edge_type))
 
+    def insert_scope_destructors(self, node_list):
+        """
+        Insert automatic destructor calls for objects going out of scope (RAII).
+        For each scope with tracked objects:
+        1. Find the last statement in that scope
+        2. Create destructor call chain in reverse construction order
+        3. Insert between last statement and next statement outside scope
+        """
+
+        index_to_key = {v: k for k, v in self.index.items()}
+
+        for scope_key, objects in self.scope_objects.items():
+            if not objects:
+                continue
+
+            # Sort objects by construction order
+            objects_sorted = sorted(objects, key=lambda x: x[3])  # Sort by order field
+
+            # Get the scope node from our stored mapping
+            scope_start, scope_end, scope_type = scope_key
+            scope_node = self.scope_nodes.get(scope_key)
+
+            if not scope_node:
+                continue
+
+            # Find the last statement in this scope
+            last_stmt_node = None
+            last_stmt_id = None
+
+            # Traverse scope to find last executable statement
+            for key, node in node_list.items():
+                # Check if this node is inside the scope
+                if (node.start_point >= scope_start and
+                    node.end_point <= scope_end and
+                    node != scope_node):
+                    # Check if it's an executable statement
+                    if node.type in self.statement_types["node_list_type"]:
+                        # Check if it's the last one
+                        if last_stmt_node is None or node.start_point > last_stmt_node.start_point:
+                            last_stmt_node = node
+                            last_stmt_id = self.get_index(node)
+
+            if not last_stmt_node or not last_stmt_id:
+                continue
+
+            # Find what comes after the scope
+            next_after_scope_id, next_after_scope = self.get_next_index(scope_node, node_list)
+
+            if next_after_scope_id == 2:
+                # Scope exits to implicit return or exit
+                # Check if scope is in a function
+                parent = scope_node.parent
+                while parent:
+                    if parent.type == "function_definition":
+                        # Get implicit return for this function
+                        if (parent.start_point, parent.end_point, parent.type) in node_list:
+                            fn_id = self.get_index(parent)
+                            if fn_id in self.records.get("implicit_return_map", {}):
+                                next_after_scope_id = self.records["implicit_return_map"][fn_id]
+                        break
+                    parent = parent.parent
+
+            # Create destructor call chain for all objects (in reverse order)
+            # Reverse order: last constructed is first destroyed
+            objects_reversed = list(reversed(objects_sorted))
+
+            # Build chain: last_stmt -> ~objN -> ~objN-1 -> ... -> ~obj1 -> next_after_scope
+            if next_after_scope_id and next_after_scope_id != 2:
+                # Create destructor call list for each object
+                destructor_ids = []
+                for var_name, class_name, decl_id, order in objects_reversed:
+                    # Find the destructor for this class
+                    destructor_name = f"~{class_name}"
+                    destructor_id = None
+
+                    for ((fn_class_name, fn_name), fn_sig), fn_id in self.records.get("function_list", {}).items():
+                        if fn_name == destructor_name and fn_class_name == class_name:
+                            destructor_id = fn_id
+                            break
+
+                    if destructor_id:
+                        destructor_ids.append((var_name, class_name, destructor_id))
+
+                # Chain them together
+                # The approach: All destructor calls go through the same function,
+                # but we create multiple edges from the implicit return node
+                # Using MultiDiGraph, we can have multiple edges between same nodes
+                if destructor_ids:
+                    # Edge from last statement to first destructor call
+                    first_var_name, first_class_name, first_dest_id = destructor_ids[0]
+                    self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
+
+                    # Chain destructor returns together
+                    # All objects of the same class use the same destructor function
+                    # So we need to add multiple edges from the same implicit_return node
+                    for i in range(len(destructor_ids)):
+                        var_name, class_name, curr_dest_id = destructor_ids[i]
+
+                        # Get the implicit return for this destructor
+                        implicit_return_id = self.records.get("implicit_return_map", {}).get(curr_dest_id)
+
+                        if not implicit_return_id:
+                            continue
+
+                        # Determine where this destructor returns to
+                        if i < len(destructor_ids) - 1:
+                            # Chain to next destructor call
+                            next_var_name, next_class_name, next_dest_id = destructor_ids[i + 1]
+                            edge_label = f"destructor_chain|{var_name}"
+                            self.add_edge(implicit_return_id, next_dest_id, edge_label)
+                        else:
+                            # Last destructor - return to next statement after scope
+                            edge_label = f"scope_destructor_return|{var_name}"
+                            self.add_edge(implicit_return_id, next_after_scope_id, edge_label)
+
     def function_list(self, root_node, node_list):
         """
         Build a map of all function/method calls in the program.
@@ -477,7 +593,9 @@ class CFGGraph_cpp(CFGGraph):
                             scope_key = (scope_node.start_point, scope_node.end_point, scope_node.type)
                             if scope_key not in self.scope_objects:
                                 self.scope_objects[scope_key] = []
-                            # We'll add the object info once we determine the variable name
+                            # Store the actual scope node for later use
+                            if scope_key not in self.scope_nodes:
+                                self.scope_nodes[scope_key] = scope_node
                             break
                         scope_node = scope_node.parent
 
@@ -2003,6 +2121,15 @@ class CFGGraph_cpp(CFGGraph):
                             current_index = self.get_index(node)
                             implicit_return_id = self.records["implicit_return_map"][func_index]
                             self.add_edge(current_index, implicit_return_id, "next_line")
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 6.7: Insert scope-based destructor calls (RAII)
+        # IMPORTANT: Must come AFTER:
+        #   - function_list (STEP 4) to track objects
+        #   - STEP 6 to create implicit returns
+        #   - STEP 6.5 to connect statements to implicit returns
+        # ═══════════════════════════════════════════════════════════
+        self.insert_scope_destructors(node_list)
 
         # ═══════════════════════════════════════════════════════════
         # STEP 7: Add function/method call edges
