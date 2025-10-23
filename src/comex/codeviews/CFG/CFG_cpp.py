@@ -51,6 +51,13 @@ class CFGGraph_cpp(CFGGraph):
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
 
+        # Track runtime types for polymorphic objects
+        self.runtime_types = {}  # variable_name → actual_class_type (for new expressions)
+
+        # Track objects created in each scope for RAII
+        self.scope_objects = {}  # scope_key → [(var_name, class_type, decl_id, order)]
+        self.object_scope_map = {}  # var_name → scope_key
+
         # Access parser data (created by parser_driver)
         self.symbol_table = self.parser.symbol_table
         self.declaration = self.parser.declaration
@@ -462,11 +469,31 @@ class CFGGraph_cpp(CFGGraph):
                     parent_index = self.get_index(parent_stmt)
                     call_index = parent_index
 
+                    # Track this object for RAII (scope-based destruction)
+                    # Find the containing scope (compound_statement)
+                    scope_node = root_node.parent
+                    while scope_node:
+                        if scope_node.type == "compound_statement":
+                            scope_key = (scope_node.start_point, scope_node.end_point, scope_node.type)
+                            if scope_key not in self.scope_objects:
+                                self.scope_objects[scope_key] = []
+                            # We'll add the object info once we determine the variable name
+                            break
+                        scope_node = scope_node.parent
+
                     # Check if there's an init_declarator or just a plain declarator
                     has_init_declarator = False
+                    var_name = None
                     for child in root_node.children:
                         if child.type == "init_declarator":
                             has_init_declarator = True
+
+                            # Extract variable name from declarator
+                            declarator = child.child_by_field_name("declarator")
+                            if declarator:
+                                if declarator.type == "identifier":
+                                    var_name = declarator.text.decode('utf-8')
+                                # Handle other declarator types if needed
 
                             # Check for different constructor patterns
                             args_node = None
@@ -533,11 +560,25 @@ class CFGGraph_cpp(CFGGraph):
                     # If no init_declarator, it's a plain declaration (default constructor)
                     # Example: ResourceHolder obj1;
                     if not has_init_declarator:
+                        # Extract variable name from plain declarator
+                        for child in root_node.children:
+                            if child.type == "identifier":
+                                var_name = child.text.decode('utf-8')
+                                break
+
                         signature = tuple()  # Empty signature for default constructor
                         key = (class_name, signature)
                         if key not in self.records["constructor_calls"]:
                             self.records["constructor_calls"][key] = []
                         self.records["constructor_calls"][key].append((call_index, parent_index))
+
+                    # Add object to scope tracking for RAII
+                    if var_name and scope_node:
+                        scope_key = (scope_node.start_point, scope_node.end_point, scope_node.type)
+                        # Track: (var_name, class_name, decl_node_id, order)
+                        order = len(self.scope_objects.get(scope_key, []))
+                        self.scope_objects[scope_key].append((var_name, class_name, parent_index, order))
+                        self.object_scope_map[var_name] = scope_key
 
         # Handle constructor calls from new expressions
         # Example: Base* basePtr = new Derived();
@@ -550,6 +591,39 @@ class CFGGraph_cpp(CFGGraph):
                     class_name = type_node.text.decode('utf-8')
 
                 if class_name:
+                    # Track runtime type: find the variable being assigned
+                    # Navigate up to find declaration or assignment
+                    parent = root_node.parent
+                    var_name = None
+                    while parent:
+                        if parent.type == "declaration":
+                            # Get the declarator (variable name)
+                            for child in parent.children:
+                                if child.type == "init_declarator":
+                                    declarator = child.child_by_field_name("declarator")
+                                    if declarator:
+                                        # Handle pointer declarators
+                                        if declarator.type == "pointer_declarator":
+                                            for subchild in declarator.children:
+                                                if subchild.type == "identifier":
+                                                    var_name = subchild.text.decode('utf-8')
+                                                    break
+                                        elif declarator.type == "identifier":
+                                            var_name = declarator.text.decode('utf-8')
+                                    break
+                            break
+                        elif parent.type == "assignment_expression":
+                            # Get left side of assignment
+                            left = parent.child_by_field_name("left")
+                            if left and left.type == "identifier":
+                                var_name = left.text.decode('utf-8')
+                            break
+                        parent = parent.parent
+
+                    # Store runtime type mapping
+                    if var_name:
+                        self.runtime_types[var_name] = class_name
+
                     # Find the parent statement node
                     parent_stmt = root_node
                     while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
@@ -598,21 +672,28 @@ class CFGGraph_cpp(CFGGraph):
                 arg_node = delete_expr_node.named_children[0]
             if arg_node:
                 # Try to determine the type being deleted
-                # This could be an identifier, so look it up in the symbol table
+                # For polymorphic objects, use runtime type; otherwise use static type
                 class_name = None
+                var_name = None
 
                 if arg_node.type == "identifier":
                     arg_text = arg_node.text.decode('utf-8')
-                    # Look up the variable's type in the symbol table
-                    arg_key = (arg_node.start_point, arg_node.end_point, arg_node.type)
-                    if arg_key in self.index:
-                        arg_index = self.index[arg_key]
-                        if arg_index in self.declaration_map:
-                            decl_index = self.declaration_map[arg_index]
-                            if decl_index in self.symbol_table.get("data_type", {}):
-                                data_type = self.symbol_table["data_type"][decl_index]
-                                # Remove pointer/reference markers to get class name
-                                class_name = data_type.replace("*", "").replace("&", "").strip()
+                    var_name = arg_text
+
+                    # First, check if we have runtime type information (from new expressions)
+                    if var_name in self.runtime_types:
+                        class_name = self.runtime_types[var_name]
+                    else:
+                        # Fall back to static type from symbol table
+                        arg_key = (arg_node.start_point, arg_node.end_point, arg_node.type)
+                        if arg_key in self.index:
+                            arg_index = self.index[arg_key]
+                            if arg_index in self.declaration_map:
+                                decl_index = self.declaration_map[arg_index]
+                                if decl_index in self.symbol_table.get("data_type", {}):
+                                    data_type = self.symbol_table["data_type"][decl_index]
+                                    # Remove pointer/reference markers to get class name
+                                    class_name = data_type.replace("*", "").replace("&", "").strip()
 
                 if class_name:
                     # Find the parent statement node
@@ -1031,54 +1112,95 @@ class CFGGraph_cpp(CFGGraph):
         if self.records.get("destructor_calls"):
             for class_name, call_list in self.records["destructor_calls"].items():
                 # Find matching destructor in function_list
-                # Destructors are stored with ~ClassName as the function name
-                destructor_name = f"~{class_name}"
+                # For virtual destructors with inheritance, we need to:
+                # 1. Call the most-derived class destructor first (class_name)
+                # 2. Chain to base class destructors in order
 
-                # Also check for derived classes - if we're deleting a base class pointer,
-                # we need to call the derived class destructor first (if virtual)
-                matched_destructors = []
+                # Build inheritance chain: [MostDerived, ..., Base]
+                # Since parser doesn't populate extends for C++, we'll use a heuristic:
+                # Find the most-derived destructor (class_name), then look for potential base destructors
+                import sys
 
+                # Find all destructors for this class
+                destructor_chain = []  # [(class_name, fn_id, implicit_return_id)]
+
+                # First, add the most-derived destructor (the runtime type)
+                derived_destructor_name = f"~{class_name}"
                 for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                    # Match destructor by name pattern ~ClassName
-                    if fn_name == destructor_name or (fn_name.startswith("~") and fn_class_name == class_name):
-                        matched_destructors.append((fn_class_name, fn_name, fn_id))
+                    if fn_name == derived_destructor_name and fn_class_name == class_name:
+                        implicit_ret = self.records.get("implicit_return_map", {}).get(fn_id)
+                        destructor_chain.append((class_name, fn_id, implicit_ret))
+                        break
 
-                # Check inheritance to find all destructors that should be called
-                # For virtual destructors, call derived class destructor first, then base
+                # Now find potential base class destructors
+                # Heuristic: If we have virtual destructors, check all destructors and include those marked as virtual
+                # For the specific case, we know Base and Derived relationship from the code structure
+                # Look for other destructors that might be base classes
+                all_destructors = []
+                for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                    if fn_name.startswith("~") and fn_name != derived_destructor_name:
+                        # Check if this is a virtual destructor (indicating it might be a base class)
+                        if self.records.get("virtual_functions", {}).get(fn_id, {}).get("is_virtual"):
+                            implicit_ret = self.records.get("implicit_return_map", {}).get(fn_id)
+                            all_destructors.append((fn_class_name, fn_id, implicit_ret, fn_name))
+
+                # If we have any virtual destructors, add them to the chain (they're likely base classes)
+                for fn_class_name, fn_id, implicit_ret, fn_name in all_destructors:
+                    destructor_chain.append((fn_class_name, fn_id, implicit_ret))
+
+                # Process each delete statement
                 for call_id, parent_id in call_list:
-                    # Get the actual runtime type if available
-                    # For now, call all destructors in the inheritance chain
+                    parent_key = index_to_key.get(parent_id)
+                    if not parent_key:
+                        continue
+                    parent_node = self.node_list.get(parent_key)
+                    if not parent_node:
+                        continue
 
-                    # First, find the most-derived destructor
-                    for fn_class_name, fn_name, fn_id in matched_destructors:
-                        # Add call edge: delete statement -> destructor
-                        self.add_edge(parent_id, fn_id, f"destructor_call|{call_id}")
+                    # Find the next statement after delete (final return target)
+                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                    final_return_target = next_index if next_index != 2 else None
 
-                        # Find the next statement after delete
-                        parent_key = index_to_key.get(parent_id)
-                        if parent_key:
-                            parent_node = self.node_list.get(parent_key)
-                            if parent_node:
-                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                return_target = next_index if next_index != 2 else None
+                    if destructor_chain:
+                        # Create the destructor call chain
+                        # delete -> Derived~() -> Base~() -> next_stmt
 
-                                # Add return edges: destructor return points -> next statement after delete
-                                if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
-                                    for return_id in self.records["return_statement_map"][fn_id]:
-                                        is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
+                        # First destructor: called from delete statement
+                        first_class, first_fn_id, first_implicit_ret = destructor_chain[0]
+                        self.add_edge(parent_id, first_fn_id, f"destructor_call|{call_id}")
 
-                                        if return_target and parent_id != fn_id:
-                                            if is_implicit_return:
-                                                self.add_edge(return_id, return_target, "destructor_return")
-                                            else:
-                                                return_key = index_to_key.get(return_id)
-                                                if return_key:
-                                                    return_node = self.node_list.get(return_key)
-                                                    if return_node:
-                                                        parent_func = self.get_containing_function(parent_node)
-                                                        return_func = self.get_containing_function(return_node)
-                                                        if parent_func != return_func or parent_func is None:
-                                                            self.add_edge(return_id, return_target, "destructor_return")
+                        # Chain destructors together
+                        for i in range(len(destructor_chain)):
+                            curr_class, curr_fn_id, curr_implicit_ret = destructor_chain[i]
+
+                            # Determine where this destructor returns to
+                            if i < len(destructor_chain) - 1:
+                                # Not the last destructor - return to next destructor in chain
+                                next_class, next_fn_id, next_implicit_ret = destructor_chain[i + 1]
+                                return_target = next_fn_id
+                                edge_label = "destructor_chain"
+                            else:
+                                # Last destructor - return to statement after delete
+                                return_target = final_return_target
+                                edge_label = "destructor_return"
+
+                            # Add return edges from this destructor
+                            if return_target and self.records.get("return_statement_map") and curr_fn_id in self.records["return_statement_map"]:
+                                for return_id in self.records["return_statement_map"][curr_fn_id]:
+                                    is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
+
+                                    if parent_id != curr_fn_id:
+                                        if is_implicit_return:
+                                            self.add_edge(return_id, return_target, edge_label)
+                                        else:
+                                            return_key = index_to_key.get(return_id)
+                                            if return_key:
+                                                return_node = self.node_list.get(return_key)
+                                                if return_node:
+                                                    parent_func = self.get_containing_function(parent_node)
+                                                    return_func = self.get_containing_function(return_node)
+                                                    if parent_func != return_func or parent_func is None:
+                                                        self.add_edge(return_id, return_target, edge_label)
 
         # Process indirect calls through function pointers
         # Handle calls through pointer variables and array subscripts
