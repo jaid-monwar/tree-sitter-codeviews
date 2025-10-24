@@ -385,16 +385,56 @@ class CFGGraph_cpp(CFGGraph):
 
         return None
 
+    def get_last_statement_in_function_body(self, function_node, node_list):
+        """
+        Find the last executable statement in a function body.
+        Used for destructor chaining - we need to find where the destructor body ends
+        so we can connect it directly to the base class destructor.
+
+        Args:
+            function_node: The function_definition AST node
+            node_list: Dictionary of all nodes in the CFG
+
+        Returns:
+            (node_id, node) tuple of the last statement, or None if not found
+        """
+        body_node = function_node.child_by_field_name("body")
+
+        if body_node is None:
+            # Try to find compound_statement
+            for child in function_node.children:
+                if child.type == "compound_statement":
+                    body_node = child
+                    break
+
+        if body_node is None:
+            return None
+
+        # Find last statement in body (iterate backwards)
+        named_children = list(body_node.named_children)
+        for child in reversed(named_children):
+            if (child.start_point, child.end_point, child.type) in node_list:
+                return (self.get_index(child), child)
+
+        return None
+
     def add_edge(self, src, dest, edge_type, additional_data=None):
-        """Add an edge to the CFG edge list with validation"""
+        """Add an edge to the CFG edge list with validation and deduplication"""
         if src is None or dest is None:
             logger.error(f"Attempting to add edge with None: {src} -> {dest}")
             return
 
+        # Check for duplicate edges (Fix #3: Deduplicate edges)
         if additional_data:
-            self.CFG_edge_list.append((src, dest, edge_type, additional_data))
+            edge_tuple = (src, dest, edge_type, additional_data)
         else:
-            self.CFG_edge_list.append((src, dest, edge_type))
+            edge_tuple = (src, dest, edge_type)
+
+        # Prevent duplicate edges
+        if edge_tuple in self.CFG_edge_list:
+            return
+
+        self.CFG_edge_list.append(edge_tuple)
 
     def insert_scope_destructors(self, node_list):
         """
@@ -1134,8 +1174,20 @@ class CFGGraph_cpp(CFGGraph):
                                     return_key = index_to_key.get(return_id)
 
                                     if is_implicit_return or not return_key:
-                                        # Implicit returns don't have nodes in node_list
-                                        self.add_edge(return_id, return_target, "function_return")
+                                        # FIX #2: For implicit returns, connect from last statement of function body
+                                        # Find the function node
+                                        fn_key = index_to_key.get(fn_id)
+                                        fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                        if fn_node:
+                                            # Get last statement in function body
+                                            last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                            if last_stmt:
+                                                last_stmt_id, _ = last_stmt
+                                                self.add_edge(last_stmt_id, return_target, "function_return")
+                                            else:
+                                                # Fallback: empty function body, connect from function entry
+                                                self.add_edge(fn_id, return_target, "function_return")
                                     else:
                                         return_node = self.node_list.get(return_key)
                                         if return_node:
@@ -1147,11 +1199,35 @@ class CFGGraph_cpp(CFGGraph):
 
         # Process method calls (similar pattern but consider class context)
         for (method_name, signature), call_list in self.records["method_calls"].items():
+            # FIX #5: Check if ANY function with this method name is virtual, OR
+            # if there are multiple implementations (indicating polymorphism)
+            # If the base class method is virtual, ALL potential targets (base and derived)
+            # should be labeled as virtual_call to correctly represent polymorphic dispatch
+
+            # Count how many different implementations exist for this method name
+            matching_functions = []
+            for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
+                if fn_name_check == method_name:
+                    matching_functions.append(fn_id_check)
+
+            # Determine if this is a virtual call:
+            # 1. Explicit virtual marking, OR
+            # 2. Multiple implementations (polymorphism)
+            is_virtual_method = False
+            for fn_id_check in matching_functions:
+                if fn_id_check in self.records["virtual_functions"]:
+                    is_virtual_method = True
+                    break
+
+            # If multiple implementations exist, it's polymorphic (virtual)
+            if len(matching_functions) > 1:
+                is_virtual_method = True
+
             for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                 if fn_name == method_name:
                     for call_id, parent_id in call_list:
-                        # Check if it's a virtual function
-                        if fn_id in self.records["virtual_functions"]:
+                        # Label consistently: if virtual or polymorphic, ALL targets are virtual calls
+                        if is_virtual_method:
                             self.add_edge(parent_id, fn_id, f"virtual_call|{call_id}")
                         else:
                             self.add_edge(parent_id, fn_id, f"method_call|{call_id}")
@@ -1210,8 +1286,20 @@ class CFGGraph_cpp(CFGGraph):
                                     return_key = index_to_key.get(return_id)
 
                                     if is_implicit_return or not return_key:
-                                        # Implicit returns don't have nodes in node_list
-                                        self.add_edge(return_id, return_target, "method_return")
+                                        # FIX #2: For implicit returns, connect from last statement of method body
+                                        # Find the method node
+                                        fn_key = index_to_key.get(fn_id)
+                                        fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                        if fn_node:
+                                            # Get last statement in method body
+                                            last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                            if last_stmt:
+                                                last_stmt_id, _ = last_stmt
+                                                self.add_edge(last_stmt_id, return_target, "method_return")
+                                            else:
+                                                # Fallback: empty method body, connect from method entry
+                                                self.add_edge(fn_id, return_target, "method_return")
                                     else:
                                         return_node = self.node_list.get(return_key)
                                         if return_node:
@@ -1309,12 +1397,27 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
 
                                     if is_implicit_return:
-                                        # For implicit returns, always create the edge
-                                        if parent_id != fn_id and return_target:
-                                            self.add_edge(return_id, return_target, "constructor_return")
-                                        elif is_base_constructor_call and return_target:
-                                            # Special case: base constructor returning to derived constructor body
-                                            self.add_edge(return_id, return_target, "base_constructor_return")
+                                        # FIX #2: For implicit returns, connect from last statement of constructor body
+                                        # Find the constructor node
+                                        fn_key = index_to_key.get(fn_id)
+                                        fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                        if fn_node and return_target:
+                                            # Get last statement in constructor body
+                                            last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                            if last_stmt:
+                                                last_stmt_id, _ = last_stmt
+                                                if parent_id != fn_id:
+                                                    self.add_edge(last_stmt_id, return_target, "constructor_return")
+                                                elif is_base_constructor_call:
+                                                    # Special case: base constructor returning to derived constructor body
+                                                    self.add_edge(last_stmt_id, return_target, "base_constructor_return")
+                                            else:
+                                                # Fallback: empty constructor body, connect from constructor entry
+                                                if parent_id != fn_id:
+                                                    self.add_edge(fn_id, return_target, "constructor_return")
+                                                elif is_base_constructor_call:
+                                                    self.add_edge(fn_id, return_target, "base_constructor_return")
                                     else:
                                         # For regular return statements, check they're in different functions
                                         if parent_id != fn_id and return_target:
@@ -1387,19 +1490,24 @@ class CFGGraph_cpp(CFGGraph):
 
                     if destructor_chain:
                         # Create the destructor call chain
-                        # delete -> Derived~() -> Base~() -> next_stmt
+                        # FIX #1: Connect destructor bodies directly without implicit return nodes
+                        # delete -> Derived~() body -> Base~() entry -> next_stmt
 
                         # First destructor: called from delete statement
                         first_class, first_fn_id, first_implicit_ret = destructor_chain[0]
                         self.add_edge(parent_id, first_fn_id, f"destructor_call|{call_id}")
 
-                        # Chain destructors together
+                        # Chain destructors together by connecting bodies directly
                         for i in range(len(destructor_chain)):
                             curr_class, curr_fn_id, curr_implicit_ret = destructor_chain[i]
 
+                            # Get the function node for the current destructor
+                            curr_fn_key = index_to_key.get(curr_fn_id)
+                            curr_fn_node = self.node_list.get(curr_fn_key) if curr_fn_key else None
+
                             # Determine where this destructor returns to
                             if i < len(destructor_chain) - 1:
-                                # Not the last destructor - return to next destructor in chain
+                                # Not the last destructor - connect to next destructor in chain
                                 next_class, next_fn_id, next_implicit_ret = destructor_chain[i + 1]
                                 return_target = next_fn_id
                                 edge_label = "destructor_chain"
@@ -1408,23 +1516,17 @@ class CFGGraph_cpp(CFGGraph):
                                 return_target = final_return_target
                                 edge_label = "destructor_return"
 
-                            # Add return edges from this destructor
-                            if return_target and self.records.get("return_statement_map") and curr_fn_id in self.records["return_statement_map"]:
-                                for return_id in self.records["return_statement_map"][curr_fn_id]:
-                                    is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
+                            # FIX #1: Connect from last statement of destructor body to next target
+                            if return_target and curr_fn_node:
+                                # Find last statement in current destructor body
+                                last_stmt = self.get_last_statement_in_function_body(curr_fn_node, self.node_list)
 
-                                    if parent_id != curr_fn_id:
-                                        if is_implicit_return:
-                                            self.add_edge(return_id, return_target, edge_label)
-                                        else:
-                                            return_key = index_to_key.get(return_id)
-                                            if return_key:
-                                                return_node = self.node_list.get(return_key)
-                                                if return_node:
-                                                    parent_func = self.get_containing_function(parent_node)
-                                                    return_func = self.get_containing_function(return_node)
-                                                    if parent_func != return_func or parent_func is None:
-                                                        self.add_edge(return_id, return_target, edge_label)
+                                if last_stmt:
+                                    last_stmt_id, last_stmt_node = last_stmt
+                                    self.add_edge(last_stmt_id, return_target, edge_label)
+                                else:
+                                    # Fallback: No body statements, connect destructor entry to target
+                                    self.add_edge(curr_fn_id, return_target, edge_label)
 
         # Process indirect calls through function pointers
         # Handle calls through pointer variables and array subscripts
@@ -1464,9 +1566,21 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
 
                                         if is_implicit_return:
-                                            # For implicit returns, always create the edge
+                                            # FIX #2: For implicit returns, connect from last statement of function body
                                             if parent_id != fn_id and return_target:
-                                                self.add_edge(return_id, return_target, "indirect_return")
+                                                # Find the function node
+                                                fn_key = index_to_key.get(fn_id)
+                                                fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                                if fn_node:
+                                                    # Get last statement in function body
+                                                    last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                                    if last_stmt:
+                                                        last_stmt_id, _ = last_stmt
+                                                        self.add_edge(last_stmt_id, return_target, "indirect_return")
+                                                    else:
+                                                        # Fallback: empty function body
+                                                        self.add_edge(fn_id, return_target, "indirect_return")
                                         else:
                                             # For regular return statements, check they're in different functions
                                             if parent_id != fn_id and return_target:
@@ -1524,9 +1638,21 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
 
                                         if is_implicit_return:
-                                            # For implicit returns, always create the edge
+                                            # FIX #2: For implicit returns, connect from last statement of function body
                                             if parent_id != fn_id and return_target:
-                                                self.add_edge(return_id, return_target, "indirect_return")
+                                                # Find the function node
+                                                fn_key = index_to_key.get(fn_id)
+                                                fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                                if fn_node:
+                                                    # Get last statement in function body
+                                                    last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                                    if last_stmt:
+                                                        last_stmt_id, _ = last_stmt
+                                                        self.add_edge(last_stmt_id, return_target, "indirect_return")
+                                                    else:
+                                                        # Fallback: empty function body
+                                                        self.add_edge(fn_id, return_target, "indirect_return")
                                         else:
                                             # For regular return statements, check they're in different functions
                                             if parent_id != fn_id and return_target:
@@ -1673,10 +1799,11 @@ class CFGGraph_cpp(CFGGraph):
                     is_constructor = True
 
                 if is_void or is_constructor:
-                    # Create implicit return node
+                    # Create implicit return node for internal tracking only
+                    # FIX #2: Don't add to CFG_node_list - keep only for internal bookkeeping
                     implicit_return_id = self.get_new_synthetic_index()
 
-                    # Get function name for label
+                    # Get function name for label (used in debugging)
                     declarator = node.child_by_field_name("declarator")
                     func_name = "unknown"
                     if declarator:
@@ -1689,12 +1816,13 @@ class CFGGraph_cpp(CFGGraph):
                                 func_name = child.text.decode('utf-8')
                                 break
 
-                    # Add implicit return node to CFG node list
-                    # Format: (node_id, line_number, node_type, label)
-                    implicit_return_label = f"implicit_return_{func_name}"
-                    self.CFG_node_list.append((implicit_return_id, 0, "implicit_return", implicit_return_label))
+                    # FIX #2: DON'T add implicit return node to CFG node list
+                    # These are synthetic nodes that don't correspond to actual code
+                    # They're kept only for internal tracking in implicit_return_map
+                    # implicit_return_label = f"implicit_return_{func_name}"
+                    # self.CFG_node_list.append((implicit_return_id, 0, "implicit_return", implicit_return_label))
 
-                    # Store mapping: function_id -> implicit_return_id
+                    # Store mapping: function_id -> implicit_return_id (for internal use only)
                     self.records["implicit_return_map"][current_index] = implicit_return_id
 
                     # Add implicit return to return_statement_map so it gets connected to call sites
@@ -2201,32 +2329,37 @@ class CFGGraph_cpp(CFGGraph):
 
         # ═══════════════════════════════════════════════════════════
         # STEP 6.5: Connect dangling paths to implicit returns
+        # FIX #2: DISABLED - Implicit returns are no longer added to CFG output
         # ═══════════════════════════════════════════════════════════
         # After all control flow edges are created, find statements that reach
         # function boundaries and connect them to implicit return nodes
-        for key, node in node_list.items():
-            if node.type in self.statement_types["non_control_statement"]:
-                # Skip if last in control block (already handled)
-                if self.is_last_in_control_block(node):
-                    continue
-
-                # Skip nodes with inner definitions
-                if cpp_nodes.has_inner_definition(node):
-                    continue
-
-                # Get next statement
-                next_index, next_node = self.get_next_index(node, node_list)
-
-                # If at function boundary, connect to implicit return
-                if next_index == 2:
-                    func = self.get_containing_function(node)
-                    if func:
-                        func_index = self.get_index(func)
-                        if func_index in self.records["implicit_return_map"]:
-                            # Connect to implicit return node
-                            current_index = self.get_index(node)
-                            implicit_return_id = self.records["implicit_return_map"][func_index]
-                            self.add_edge(current_index, implicit_return_id, "next_line")
+        # NOTE: This step is now disabled because implicit returns are not in the CFG_node_list
+        # The function return edges are now created directly in add_function_call_edges()
+        # by connecting from the last statement of function bodies to the return target
+        #
+        # for key, node in node_list.items():
+        #     if node.type in self.statement_types["non_control_statement"]:
+        #         # Skip if last in control block (already handled)
+        #         if self.is_last_in_control_block(node):
+        #             continue
+        #
+        #         # Skip nodes with inner definitions
+        #         if cpp_nodes.has_inner_definition(node):
+        #             continue
+        #
+        #         # Get next statement
+        #         next_index, next_node = self.get_next_index(node, node_list)
+        #
+        #         # If at function boundary, connect to implicit return
+        #         if next_index == 2:
+        #             func = self.get_containing_function(node)
+        #             if func:
+        #                 func_index = self.get_index(func)
+        #                 if func_index in self.records["implicit_return_map"]:
+        #                     # Connect to implicit return node
+        #                     current_index = self.get_index(node)
+        #                     implicit_return_id = self.records["implicit_return_map"][func_index]
+        #                     self.add_edge(current_index, implicit_return_id, "next_line")
 
         # ═══════════════════════════════════════════════════════════
         # STEP 6.7: Insert scope-based destructor calls (RAII)
@@ -2236,6 +2369,41 @@ class CFGGraph_cpp(CFGGraph):
         #   - STEP 6.5 to connect statements to implicit returns
         # ═══════════════════════════════════════════════════════════
         self.insert_scope_destructors(node_list)
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 6.8: Add global scope flow (FIX #4)
+        # Connect top-level declarations in sequential order to show
+        # program initialization and declaration order
+        # ═══════════════════════════════════════════════════════════
+        # Find all top-level declarations (direct children of root or translation_unit)
+        global_declarations = []
+
+        for key, node in node_list.items():
+            # Check if node is at global scope (parent is root or translation_unit)
+            if node.parent and node.parent.type == "translation_unit":
+                # Include classes, functions, structs, enums, typedefs, namespaces
+                if node.type in ["class_specifier", "struct_specifier", "function_definition",
+                                "enum_specifier", "type_definition", "namespace_definition",
+                                "declaration"]:
+                    node_id = self.get_index(node)
+                    # Store (node_id, line_number) for sorting
+                    global_declarations.append((node_id, node.start_point[0]))
+
+        # Sort by line number to preserve declaration order
+        global_declarations.sort(key=lambda x: x[1])
+
+        # Connect sequential global declarations
+        for i in range(len(global_declarations) - 1):
+            curr_id = global_declarations[i][0]
+            next_id = global_declarations[i + 1][0]
+            self.add_edge(curr_id, next_id, "global_sequence")
+
+        # If there are global declarations and no main function is marked,
+        # optionally connect start node to first declaration
+        # (This is commented out to avoid conflicting with main function entry)
+        # if global_declarations and "main_function" not in self.records:
+        #     first_decl_id = global_declarations[0][0]
+        #     self.add_edge(1, first_decl_id, "program_entry")
 
         # ═══════════════════════════════════════════════════════════
         # STEP 7: Add function/method call edges
