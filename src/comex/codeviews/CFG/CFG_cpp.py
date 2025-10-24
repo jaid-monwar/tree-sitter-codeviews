@@ -30,6 +30,7 @@ class CFGGraph_cpp(CFGGraph):
             "extends": {},                         # class_name → [base_classes]
             "function_calls": {},                  # sig → [(call_id, parent_id)]
             "method_calls": {},                    # sig → [(call_id, parent_id)]
+            "static_method_calls": {},             # (class_name, func_name, sig) → [(call_id, parent_id)]
             "constructor_calls": {},               # sig → [(call_id, parent_id)]
             "destructor_calls": {},                # class_name → [(call_id, parent_id)]
             "virtual_functions": {},               # function_id → {is_virtual, is_pure_virtual}
@@ -568,6 +569,7 @@ class CFGGraph_cpp(CFGGraph):
                 func_name = None
                 is_indirect_call = False
                 pointer_var = None
+                qualified_scope = None  # For static method calls (Class::staticMethod)
 
                 # Case 1: Simple identifier (could be regular call or function pointer)
                 if function_node.type == "identifier":
@@ -581,7 +583,18 @@ class CFGGraph_cpp(CFGGraph):
 
                 # Case 3: Qualified identifier (namespace::function or Class::method)
                 elif function_node.type == "qualified_identifier":
-                    func_name = function_node.text.decode('utf-8')
+                    full_name = function_node.text.decode('utf-8')
+                    # Parse qualified identifier to extract class/namespace and function name
+                    # Format: Class::staticMethod or namespace::Class::method
+                    parts = full_name.split("::")
+                    if len(parts) >= 2:
+                        # For now, assume last part is the function name
+                        # and everything before is the class/namespace
+                        func_name = parts[-1]
+                        qualified_scope = "::".join(parts[:-1])
+                    else:
+                        func_name = full_name
+                        qualified_scope = None
 
                 # Case 4: Subscript expression (array of function pointers: operations[0](args))
                 elif function_node.type == "subscript_expression":
@@ -615,13 +628,21 @@ class CFGGraph_cpp(CFGGraph):
                         # For now, treat all identifiers as potential direct calls
                         # We'll handle the distinction in add_function_call_edges
 
-                        # Determine if this is a method call or function call
+                        # Determine if this is a method call, static method call, or function call
                         if function_node.type == "field_expression":
+                            # Instance method call: obj.method()
                             key = (func_name, signature)
                             if key not in self.records["method_calls"]:
                                 self.records["method_calls"][key] = []
                             self.records["method_calls"][key].append((call_index, parent_index))
+                        elif qualified_scope:
+                            # Static method call: Class::staticMethod()
+                            key = (qualified_scope, func_name, signature)
+                            if key not in self.records["static_method_calls"]:
+                                self.records["static_method_calls"][key] = []
+                            self.records["static_method_calls"][key].append((call_index, parent_index))
                         else:
+                            # Regular function call
                             key = (func_name, signature)
                             if key not in self.records["function_calls"]:
                                 self.records["function_calls"][key] = []
@@ -1307,6 +1328,93 @@ class CFGGraph_cpp(CFGGraph):
                                             return_func = self.get_containing_function(return_node)
                                             if parent_func != return_func or parent_func is None:
                                                 self.add_edge(return_id, return_target, "method_return")
+
+        # Process static method calls (Class::staticMethod())
+        for (class_name, method_name, signature), call_list in self.records["static_method_calls"].items():
+            # Find matching static method in function_list
+            # Static methods are stored with class name and function name
+            for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                if fn_class_name == class_name and fn_name == method_name:
+                    # Found matching static method
+                    for call_id, parent_id in call_list:
+                        # Add call edge: caller -> static method
+                        self.add_edge(parent_id, fn_id, f"static_call|{call_id}")
+
+                        # Add return edges: static method return points -> caller
+                        # Skip return edges to call sites within the same function
+                        if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
+                            for return_id in self.records["return_statement_map"][fn_id]:
+                                # Check if this is a synthetic implicit return node
+                                is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
+
+                                # Get the call site node
+                                parent_key = index_to_key.get(parent_id)
+                                if not parent_key:
+                                    continue
+                                parent_node = self.node_list.get(parent_key)
+                                if not parent_node:
+                                    continue
+
+                                # Determine return target based on method return type
+                                # For NON-VOID methods: return to call site (value needed in expression)
+                                # For VOID methods/implicit returns: return to next statement
+                                return_target = None
+
+                                if is_implicit_return:
+                                    # Implicit return = void function
+                                    # Return to NEXT statement (no value to evaluate)
+                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                    return_target = next_index if next_index != 2 else None
+                                else:
+                                    # Explicit return = may return a value
+                                    # Check method's return type
+                                    fn_key = None
+                                    for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
+                                        if fn_id_check == fn_id:
+                                            fn_key = ((class_name_check, fn_name_check), fn_sig_check)
+                                            break
+
+                                    is_void_return = False
+                                    if fn_key and fn_key in self.records["return_type"]:
+                                        ret_type = self.records["return_type"][fn_key]
+                                        is_void_return = ret_type == "void"
+
+                                    if is_void_return:
+                                        # Void function with explicit return
+                                        # Return to NEXT statement
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
+                                    else:
+                                        # Non-void function (returns a value)
+                                        # Return to SAME statement (call site) to continue expression
+                                        return_target = parent_id
+
+                                if parent_id != fn_id and return_target:
+                                    # Get return node from index
+                                    return_key = index_to_key.get(return_id)
+
+                                    if is_implicit_return or not return_key:
+                                        # For implicit returns, connect from last statement of method body
+                                        # Find the method node
+                                        fn_key = index_to_key.get(fn_id)
+                                        fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                        if fn_node:
+                                            # Get last statement in method body
+                                            last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                            if last_stmt:
+                                                last_stmt_id, _ = last_stmt
+                                                self.add_edge(last_stmt_id, return_target, "static_return")
+                                            else:
+                                                # Fallback: empty method body, connect from method entry
+                                                self.add_edge(fn_id, return_target, "static_return")
+                                    else:
+                                        return_node = self.node_list.get(return_key)
+                                        if return_node:
+                                            parent_func = self.get_containing_function(parent_node)
+                                            return_func = self.get_containing_function(return_node)
+                                            if parent_func != return_func or parent_func is None:
+                                                self.add_edge(return_id, return_target, "static_return")
 
         # Process constructor calls
         for (class_name, signature), call_list in self.records["constructor_calls"].items():
