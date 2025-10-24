@@ -565,14 +565,42 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 function_name_node = None
                 if declarator:
                     if declarator.type == "function_declarator":
-                        function_name_node = declarator.child_by_field_name("declarator")
+                        # Check for operator overload first (operator_name node)
+                        operator_name_node = None
+                        for child in declarator.children:
+                            if child.type == "operator_name":
+                                operator_name_node = child
+                                break
+
+                        if operator_name_node:
+                            function_name_node = operator_name_node
+                        else:
+                            function_name_node = declarator.child_by_field_name("declarator")
                     elif declarator.type == "pointer_declarator" or declarator.type == "reference_declarator":
                         # Handle pointer/reference return types
+                        # Navigate through pointer/reference layers to find the function_declarator
                         nested = declarator
                         while nested and nested.type in ["pointer_declarator", "reference_declarator"]:
-                            nested = nested.children[0] if nested.children else None
+                            # Find the function_declarator child (skip * and & symbols)
+                            found_nested = None
+                            for child in nested.children:
+                                if child.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
+                                    found_nested = child
+                                    break
+                            nested = found_nested
+
                         if nested and nested.type == "function_declarator":
-                            function_name_node = nested.child_by_field_name("declarator")
+                            # Check for operator overload in nested declarator
+                            operator_name_node = None
+                            for child in nested.children:
+                                if child.type == "operator_name":
+                                    operator_name_node = child
+                                    break
+
+                            if operator_name_node:
+                                function_name_node = operator_name_node
+                            else:
+                                function_name_node = nested.child_by_field_name("declarator")
 
                 if function_name_node:
                     function_name = function_name_node.text.decode("UTF-8")
@@ -583,7 +611,26 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 type_label = root_node.type
 
                 try:
-                    signature = get_signature(declarator if declarator and declarator.type == "function_declarator" else root_node)
+                    # Find the function_declarator for signature extraction
+                    # It may be nested inside pointer_declarator or reference_declarator
+                    sig_node = declarator
+                    if declarator and declarator.type in ["pointer_declarator", "reference_declarator"]:
+                        # Navigate through pointer/reference layers to find function_declarator
+                        nested = declarator
+                        while nested and nested.type in ["pointer_declarator", "reference_declarator"]:
+                            found_nested = None
+                            for child in nested.children:
+                                if child.type == "function_declarator":
+                                    sig_node = child
+                                    break
+                                elif child.type in ["pointer_declarator", "reference_declarator"]:
+                                    found_nested = child
+                                    break
+                            if sig_node and sig_node.type == "function_declarator":
+                                break
+                            nested = found_nested
+
+                    signature = get_signature(sig_node if sig_node and sig_node.type == "function_declarator" else root_node)
                     class_info = get_class_name(root_node, index)
 
                     if class_info:

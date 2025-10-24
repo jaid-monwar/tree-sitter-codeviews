@@ -31,6 +31,7 @@ class CFGGraph_cpp(CFGGraph):
             "function_calls": {},                  # sig → [(call_id, parent_id)]
             "method_calls": {},                    # sig → [(call_id, parent_id)]
             "static_method_calls": {},             # (class_name, func_name, sig) → [(call_id, parent_id)]
+            "operator_calls": {},                  # (operator_name, is_member) → [(call_id, parent_id, operand_type)]
             "constructor_calls": {},               # sig → [(call_id, parent_id)]
             "destructor_calls": {},                # class_name → [(call_id, parent_id)]
             "virtual_functions": {},               # function_id → {is_virtual, is_pure_virtual}
@@ -571,9 +572,45 @@ class CFGGraph_cpp(CFGGraph):
                 pointer_var = None
                 qualified_scope = None  # For static method calls (Class::staticMethod)
 
-                # Case 1: Simple identifier (could be regular call or function pointer)
+                # Case 1: Simple identifier (could be regular call, function pointer, or constructor)
                 if function_node.type == "identifier":
                     func_name = function_node.text.decode('utf-8')
+
+                    # Check if this is a constructor call (identifier matching a class name)
+                    # This happens in return statements: return Vector2D(x, y);
+                    is_constructor = False
+                    for ((fn_class_name, fn_name), fn_sig), fn_id in self.records.get("function_list", {}).items():
+                        if fn_class_name == func_name and fn_name == func_name:
+                            # This is a constructor (class name == function name)
+                            is_constructor = True
+                            break
+
+                    if is_constructor:
+                        # This is a constructor call
+                        class_name = func_name
+                        # Find the parent statement node
+                        parent_stmt = root_node
+                        while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                            parent_stmt = parent_stmt.parent
+
+                        if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                            parent_index = self.get_index(parent_stmt)
+                            call_index = self.get_index(root_node)  # Use call_expression as call_index
+
+                            # Get argument types for signature matching
+                            args_node = root_node.child_by_field_name("arguments")
+                            signature = self.get_call_signature(args_node)
+
+                            # Track constructor call
+                            key = (class_name, signature)
+                            if key not in self.records["constructor_calls"]:
+                                self.records["constructor_calls"][key] = []
+                            self.records["constructor_calls"][key].append((call_index, parent_index))
+
+                        # Skip normal function call processing for constructor calls
+                        for child in root_node.children:
+                            self.function_list(child, node_list)
+                        return
 
                 # Case 2: Field expression (member function call: obj.method())
                 elif function_node.type == "field_expression":
@@ -968,9 +1005,181 @@ class CFGGraph_cpp(CFGGraph):
                                         self.records["constructor_calls"][key] = []
                                     self.records["constructor_calls"][key].append((call_id, constructor_index))
 
+        # Handle operator overload calls
+        # Operator calls are represented as binary_expression, assignment_expression, or update_expression
+        elif root_node.type in ["binary_expression", "assignment_expression", "update_expression"]:
+            # Find the parent statement node
+            parent_stmt = root_node
+            while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
+                parent_stmt = parent_stmt.parent
+
+            if parent_stmt and (parent_stmt.start_point, parent_stmt.end_point, parent_stmt.type) in node_list:
+                parent_index = self.get_index(parent_stmt)
+                call_index = self.get_index(root_node)
+
+                operator_symbol = None
+                left_operand = None
+                right_operand = None
+                is_member_operator = True  # Most operators are member functions
+
+                if root_node.type == "binary_expression":
+                    # Binary operators: +, -, *, ==, !=, <, >, <=, >=, <<, >>, etc.
+                    left_operand = root_node.child_by_field_name("left")
+                    right_operand = root_node.child_by_field_name("right")
+                    # The operator is the middle child
+                    for child in root_node.children:
+                        if child.type in ["+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "<<", ">>", "&", "|", "^", "&&", "||"]:
+                            operator_symbol = child.type
+                            break
+
+                    # Stream operators (<<, >>) are typically non-member functions
+                    if operator_symbol in ["<<", ">>"]:
+                        is_member_operator = False
+
+                elif root_node.type == "assignment_expression":
+                    # Assignment operator: =
+                    operator_symbol = "="
+                    left_operand = root_node.child_by_field_name("left")
+                    right_operand = root_node.child_by_field_name("right")
+
+                elif root_node.type == "update_expression":
+                    # Increment/decrement operators: ++, --
+                    # Check if prefix or postfix
+                    operand = root_node.child_by_field_name("argument")
+                    if operand:
+                        left_operand = operand
+                        # Find the operator
+                        for child in root_node.children:
+                            if child.type in ["++", "--"]:
+                                operator_symbol = child.type
+                                # Determine if prefix or postfix based on position
+                                if child.start_byte < operand.start_byte:
+                                    # Prefix: ++var
+                                    operator_symbol = f"{child.type}_prefix"
+                                else:
+                                    # Postfix: var++
+                                    operator_symbol = f"{child.type}_postfix"
+                                break
+
+                # Track the operator call if we found the operator
+                if operator_symbol and left_operand:
+                    # Get the type of the operand
+                    # For stream operators (<<, >>), the custom type is on the RIGHT (stream is on LEFT)
+                    # For other operators, the custom type is on the LEFT
+                    if operator_symbol in ["<<", ">>"] and right_operand:
+                        # Stream operators: check right operand (e.g., cout << v1, cin >> v4)
+                        operand_type = self.get_operand_type(right_operand)
+                    else:
+                        # Regular operators: check left operand (e.g., v1 + v2)
+                        operand_type = self.get_operand_type(left_operand)
+
+                    key = (operator_symbol, is_member_operator)
+                    if key not in self.records["operator_calls"]:
+                        self.records["operator_calls"][key] = []
+                    self.records["operator_calls"][key].append((call_index, parent_index, operand_type))
+
         # Recursively process children
         for child in root_node.children:
             self.function_list(child, node_list)
+
+    def get_operand_type(self, operand_node):
+        """
+        Determine the type of an operand (variable/object).
+        Used for operator overload resolution.
+        """
+        if not operand_node:
+            return None
+
+        # If it's an identifier, look it up in the parser's symbol table
+        if operand_node.type == "identifier":
+            # Get the node's index in the parser's index system
+            node_key = (operand_node.start_point, operand_node.end_point, operand_node.type)
+            if node_key in self.index:
+                node_id = self.index[node_key]
+                # Check parser's symbol table for type information
+                if hasattr(self.parser, 'symbol_table') and isinstance(self.parser.symbol_table, dict):
+                    data_type = self.parser.symbol_table.get('data_type', {})
+
+                    # First check if node_id directly has type info (it's a declaration)
+                    if node_id in data_type:
+                        return data_type[node_id]
+
+                    # Otherwise, check if it's a usage that maps to a declaration
+                    if hasattr(self.parser, 'declaration_map') and node_id in self.parser.declaration_map:
+                        decl_id = self.parser.declaration_map[node_id]
+                        if decl_id in data_type:
+                            return data_type[decl_id]
+
+            # Fallback: return the variable name itself (we'll try to resolve it later)
+            var_name = operand_node.text.decode('utf-8')
+            return var_name
+
+        # If it's a field expression (obj.field), get the type of the object
+        elif operand_node.type == "field_expression":
+            argument = operand_node.child_by_field_name("argument")
+            if argument:
+                return self.get_operand_type(argument)
+
+        # If it's a subscript expression (arr[i]), get the element type
+        elif operand_node.type == "subscript_expression":
+            argument = operand_node.child_by_field_name("argument")
+            if argument:
+                return self.get_operand_type(argument)
+
+        # If it's a qualified identifier (std::cout), extract the name
+        elif operand_node.type == "qualified_identifier":
+            return operand_node.text.decode('utf-8')
+
+        # If it's a parenthesized expression, unwrap it
+        elif operand_node.type == "parenthesized_expression":
+            # Get the inner expression
+            for child in operand_node.children:
+                if child.type not in ["(", ")"]:
+                    return self.get_operand_type(child)
+            return None
+
+        # If it's a pointer expression (*ptr), get the pointed-to type
+        elif operand_node.type == "pointer_expression":
+            argument = operand_node.child_by_field_name("argument")
+            if argument:
+                # Special case: *this dereferences the current object pointer
+                if argument.type == "this":
+                    # Determine the containing class
+                    containing_class = self.get_containing_class(operand_node)
+                    if containing_class:
+                        # Get class name
+                        class_name_node = None
+                        for child in containing_class.children:
+                            if child.type == "type_identifier":
+                                class_name_node = child
+                                break
+                        if class_name_node:
+                            return class_name_node.text.decode('utf-8')
+                    return None
+
+                base_type = self.get_operand_type(argument)
+                # Remove pointer indicator if present
+                if base_type and base_type.endswith("*"):
+                    return base_type[:-1]
+                return base_type
+
+        # Special case: 'this' keyword (pointer to current object)
+        elif operand_node.type == "this":
+            containing_class = self.get_containing_class(operand_node)
+            if containing_class:
+                # Get class name
+                class_name_node = None
+                for child in containing_class.children:
+                    if child.type == "type_identifier":
+                        class_name_node = child
+                        break
+                if class_name_node:
+                    # this is a pointer, so return Type*
+                    return class_name_node.text.decode('utf-8') + "*"
+            return None
+
+        # For other expressions, return None
+        return None
 
     def get_call_signature(self, args_node):
         """
@@ -1416,6 +1625,134 @@ class CFGGraph_cpp(CFGGraph):
                                             if parent_func != return_func or parent_func is None:
                                                 self.add_edge(return_id, return_target, "static_return")
 
+        # Process operator overload calls
+        for (operator_symbol, is_member), call_list in self.records["operator_calls"].items():
+            # Map operator symbols to function names
+            operator_to_function_name = {
+                "+": "operator+",
+                "-": "operator-",
+                "*": "operator*",
+                "/": "operator/",
+                "%": "operator%",
+                "==": "operator==",
+                "!=": "operator!=",
+                "<": "operator<",
+                ">": "operator>",
+                "<=": "operator<=",
+                ">=": "operator>=",
+                "<<": "operator<<",
+                ">>": "operator>>",
+                "&": "operator&",
+                "|": "operator|",
+                "^": "operator^",
+                "&&": "operator&&",
+                "||": "operator||",
+                "=": "operator=",
+                "++_prefix": "operator++",
+                "++_postfix": "operator++",
+                "--_prefix": "operator--",
+                "--_postfix": "operator--",
+            }
+
+            operator_func_name = operator_to_function_name.get(operator_symbol)
+            if not operator_func_name:
+                continue
+
+            # For each operator call
+            for call_id, parent_id, operand_type in call_list:
+                # Find matching operator overload in function_list
+                # For member operators: match by class name and function name
+                # For non-member operators: match by function name only
+                matching_functions = []
+
+                for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                    if fn_name == operator_func_name:
+                        if is_member:
+                            # Member operator: check if operand type matches class name
+                            if operand_type and fn_class_name == operand_type:
+                                # Handle prefix vs postfix for ++ and --
+                                if operator_symbol in ["++_prefix", "--_prefix"]:
+                                    # Prefix version: no int parameter
+                                    if fn_sig == () or fn_sig == ("",):
+                                        matching_functions.append(fn_id)
+                                elif operator_symbol in ["++_postfix", "--_postfix"]:
+                                    # Postfix version: has int parameter
+                                    if fn_sig == ("int",) or "int" in str(fn_sig):
+                                        matching_functions.append(fn_id)
+                                else:
+                                    matching_functions.append(fn_id)
+                        else:
+                            # Non-member operator (like << for streams)
+                            # For non-member operators, check if operand type matches one of the parameter types
+                            # This prevents matching built-in operators (e.g., stream >> double)
+                            if operand_type and fn_sig:
+                                # Check if operand_type appears in the function signature
+                                # For operator<<(ostream&, Vector2D&), operand should be Vector2D
+                                type_match = False
+                                for param_type in fn_sig:
+                                    # Simplify parameter type for comparison
+                                    param_simple = param_type.replace('const', '').replace('&', '').replace('*', '').strip()
+                                    if operand_type in param_simple or param_simple in operand_type:
+                                        type_match = True
+                                        break
+                                if type_match:
+                                    matching_functions.append(fn_id)
+                            elif not operand_type:
+                                # If we can't determine operand type, assume it might match
+                                matching_functions.append(fn_id)
+
+                # Add CFG edges for all matching operator overloads
+                for fn_id in matching_functions:
+                    # Add call edge: caller -> operator function
+                    edge_label = f"operator_call|{call_id}"
+                    if operator_symbol.startswith("++") or operator_symbol.startswith("--"):
+                        edge_label = f"{operator_symbol.split('_')[1]}_increment_call|{call_id}"
+                    self.add_edge(parent_id, fn_id, edge_label)
+
+                    # Add return edges: operator return points -> caller
+                    if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
+                        for return_id in self.records["return_statement_map"][fn_id]:
+                            # Check if this is a synthetic implicit return node
+                            is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
+
+                            # Get the call site node
+                            parent_key = index_to_key.get(parent_id)
+                            if not parent_key:
+                                continue
+                            parent_node = self.node_list.get(parent_key)
+                            if not parent_node:
+                                continue
+
+                            # Determine return target
+                            # For operators that return values, return to call site
+                            # Assignment operator returns a reference (for chaining), so return to call site
+                            # The call site then naturally flows to the next statement via next_line edge
+                            return_target = parent_id
+
+                            if parent_id != fn_id and return_target:
+                                # Get return node from index
+                                return_key = index_to_key.get(return_id)
+
+                                if is_implicit_return or not return_key:
+                                    # For implicit returns, connect from last statement
+                                    fn_key = index_to_key.get(fn_id)
+                                    fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                    if fn_node:
+                                        last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                        if last_stmt:
+                                            last_stmt_id, _ = last_stmt
+                                            self.add_edge(last_stmt_id, return_target, "operator_return")
+                                        else:
+                                            self.add_edge(fn_id, return_target, "operator_return")
+                                else:
+                                    return_node = self.node_list.get(return_key)
+                                    if return_node:
+                                        parent_func = self.get_containing_function(parent_node)
+                                        return_func = self.get_containing_function(return_node)
+                                        if parent_func != return_func or parent_func is None:
+                                            self.add_edge(return_id, return_target, "operator_return")
+
         # Process constructor calls
         for (class_name, signature), call_list in self.records["constructor_calls"].items():
             # Find matching constructor in function_list
@@ -1435,21 +1772,39 @@ class CFGGraph_cpp(CFGGraph):
                     # Special case: move constructor (T&&)
                     elif signature == (f"{class_name}&&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
                         sig_match = True
-                    # Flexible matching for parameter types
-                    elif len(fn_sig) == len(signature):
-                        # Try to match each parameter
+                    # Handle default parameters: call can have fewer args than definition
+                    elif len(signature) <= len(fn_sig):
+                        # Try to match each parameter provided in the call
                         all_match = True
-                        for fn_param, call_param in zip(fn_sig, signature):
-                            # Simplify both for comparison (remove const, &, *, etc.)
-                            fn_param_simple = fn_param.replace('const', '').replace('&', '').replace('*', '').strip()
-                            call_param_simple = call_param.replace('const', '').replace('&', '').replace('*', '').strip()
-                            # Special case: string literal -> std::string or string
-                            if call_param == 'const char*' and ('string' in fn_param_simple.lower()):
-                                continue
-                            # Check if simplified versions match
-                            if fn_param_simple != call_param_simple:
-                                all_match = False
-                                break
+                        for i, call_param in enumerate(signature):
+                            if i < len(fn_sig):
+                                fn_param = fn_sig[i]
+                                # Simplify both for comparison (remove const, &, *, etc.)
+                                fn_param_simple = fn_param.replace('const', '').replace('&', '').replace('*', '').strip()
+                                call_param_simple = call_param.replace('const', '').replace('&', '').replace('*', '').strip()
+
+                                # Allow 'unknown' type to match any type
+                                if call_param_simple == 'unknown':
+                                    # Type inference failed, assume it matches
+                                    continue
+
+                                # Allow implicit numeric conversions
+                                numeric_types = ['int', 'double', 'float', 'long', 'short', 'char']
+                                fn_is_numeric = any(nt in fn_param_simple for nt in numeric_types)
+                                call_is_numeric = any(nt in call_param_simple for nt in numeric_types)
+
+                                if fn_is_numeric and call_is_numeric:
+                                    # Allow any numeric type to match any other numeric type
+                                    continue
+
+                                # Special case: string literal -> std::string or string
+                                if call_param == 'const char*' and ('string' in fn_param_simple.lower()):
+                                    continue
+
+                                # Check if simplified versions match
+                                if fn_param_simple != call_param_simple:
+                                    all_match = False
+                                    break
                         if all_match:
                             sig_match = True
 
@@ -1498,11 +1853,15 @@ class CFGGraph_cpp(CFGGraph):
                                             else:
                                                 return_target = None
                                     else:
-                                        # Regular constructor call from declaration
-                                        # Find the next statement after the declaration
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        # Return should go to the next statement, not back to the declaration
-                                        return_target = next_index if next_index != 2 else None
+                                        # Check if this is a constructor call in a return statement
+                                        if parent_node.type == "return_statement":
+                                            # Constructor in return statement: return to the return statement itself
+                                            return_target = parent_id
+                                        else:
+                                            # Regular constructor call from declaration
+                                            # Return should go back to the call site (the declaration statement)
+                                            # The declaration then naturally flows to the next statement via next_line edge
+                                            return_target = parent_id
 
                                     if is_implicit_return:
                                         # FIX #2: For implicit returns, connect from last statement of constructor body
@@ -1844,10 +2203,24 @@ class CFGGraph_cpp(CFGGraph):
                 if node.type not in ["field_declaration", "access_specifier"] and cpp_nodes.has_inner_definition(node):
                     continue
 
+                # Skip creating next_line edges for class/struct members
+                # Class members are declarations, not sequential execution steps
+                parent = node.parent
+                if parent and parent.type == "field_declaration_list":
+                    # This node is a direct child of a class/struct definition
+                    # Do not create sequential edges between class members
+                    continue
+
                 # Get next statement
                 next_index, next_node = self.get_next_index(node, node_list)
 
                 if next_index != 2 and next_node is not None:
+                    # Also check if next node is a class member
+                    next_parent = next_node.parent if next_node else None
+                    if next_parent and next_parent.type == "field_declaration_list":
+                        # Next node is a class member, skip edge
+                        continue
+
                     current_index = self.get_index(node)
                     self.add_edge(current_index, next_index, "next_line")
 
@@ -2489,8 +2862,9 @@ class CFGGraph_cpp(CFGGraph):
         for key, node in node_list.items():
             # Check if node is at global scope (parent is root or translation_unit)
             if node.parent and node.parent.type == "translation_unit":
-                # Include classes, functions, structs, enums, typedefs, namespaces
-                if node.type in ["class_specifier", "struct_specifier", "function_definition",
+                # Include classes, structs, enums, typedefs, namespaces, and declarations
+                # EXCLUDE function_definition - functions don't have initialization order semantics
+                if node.type in ["class_specifier", "struct_specifier",
                                 "enum_specifier", "type_definition", "namespace_definition",
                                 "declaration"]:
                     node_id = self.get_index(node)
