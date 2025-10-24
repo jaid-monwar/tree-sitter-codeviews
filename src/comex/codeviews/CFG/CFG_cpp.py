@@ -130,6 +130,29 @@ class CFGGraph_cpp(CFGGraph):
             node = node.parent
         return None
 
+    def get_base_classes(self, class_node):
+        """
+        Extract base class names from a class_specifier node.
+        Returns a set of base class names.
+        Example: class Circle : public Shape { } -> {'Shape'}
+        Example: class PaintedCircle : public Circle, public Paintable { } -> {'Circle', 'Paintable'}
+        """
+        base_classes = set()
+        if class_node is None:
+            return base_classes
+
+        # Look for base_class_clause in the class definition
+        for child in class_node.children:
+            if child.type == "base_class_clause":
+                # The base_class_clause contains type_identifier nodes for each base class
+                for subchild in child.children:
+                    if subchild.type == "type_identifier":
+                        base_class_name = subchild.text.decode('utf-8')
+                        base_classes.add(base_class_name)
+                break
+
+        return base_classes
+
     def is_jump_statement(self, node):
         """
         Check if a node is a jump statement that transfers control elsewhere.
@@ -832,6 +855,58 @@ class CFGGraph_cpp(CFGGraph):
                             self.records["destructor_calls"][class_name] = []
                         self.records["destructor_calls"][class_name].append((call_index, parent_index))
 
+        # Handle base class constructor calls from field_initializer_list
+        # Example: Circle(double radius) : Shape("Circle"), radius(radius) { }
+        # The field_initializer_list contains both base class constructor calls and member initializations
+        elif root_node.type == "function_definition":
+            # Check if this constructor has a field_initializer_list
+            field_init_list = None
+            for child in root_node.children:
+                if child.type == "field_initializer_list":
+                    field_init_list = child
+                    break
+
+            if field_init_list:
+                # This is a constructor with initializer list
+                # Get the constructor's function index
+                if (root_node.start_point, root_node.end_point, root_node.type) in node_list:
+                    constructor_index = self.get_index(root_node)
+
+                    # Get the class this constructor belongs to
+                    containing_class = self.get_containing_class(root_node)
+                    if containing_class:
+                        # Get base classes for this class
+                        base_class_names = self.get_base_classes(containing_class)
+
+                        # Parse each field_initializer in the list
+                        for child in field_init_list.children:
+                            if child.type == "field_initializer":
+                                # Extract field name (could be base class or member)
+                                field_id = None
+                                args_node = None
+
+                                for subchild in child.children:
+                                    if subchild.type == "field_identifier":
+                                        field_id = subchild.text.decode('utf-8')
+                                    elif subchild.type == "argument_list":
+                                        args_node = subchild
+
+                                # Check if this is a base class constructor call
+                                if field_id and field_id in base_class_names:
+                                    # This is a base class constructor call
+                                    signature = self.get_call_signature(args_node) if args_node else tuple()
+                                    key = (field_id, signature)
+
+                                    # Use the field_initializer node as call_id if available
+                                    call_id = constructor_index
+                                    if (child.start_point, child.end_point, child.type) in node_list:
+                                        call_id = self.get_index(child)
+
+                                    # Record the base class constructor call
+                                    if key not in self.records["constructor_calls"]:
+                                        self.records["constructor_calls"][key] = []
+                                    self.records["constructor_calls"][key].append((call_id, constructor_index))
+
         # Recursively process children
         for child in root_node.children:
             self.function_list(child, node_list)
@@ -1189,42 +1264,73 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
 
                         # Add return edges: constructor return points -> next statement after declaration
+                        # Need to create return edges for EACH call site
                         if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
                                 # Check if this is a synthetic implicit return node
                                 is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
-                                # Get the call site node to find the next statement
-                                parent_key = index_to_key.get(parent_id)
-                                if not parent_key:
-                                    continue
-                                parent_node = self.node_list.get(parent_key)
-                                if not parent_node:
-                                    continue
+                                # Iterate through each call site to create return edges
+                                for call_id, parent_id in call_list:
+                                    # Get the call site node to find the next statement
+                                    parent_key = index_to_key.get(parent_id)
+                                    if not parent_key:
+                                        continue
+                                    parent_node = self.node_list.get(parent_key)
+                                    if not parent_node:
+                                        continue
 
-                                # Find the next statement after the declaration
-                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                    # Check if parent is a constructor (base class constructor call from initializer list)
+                                    is_base_constructor_call = False
+                                    if parent_node.type == "function_definition":
+                                        # Check if parent has field_initializer_list (it's a constructor with initializers)
+                                        for pchild in parent_node.children:
+                                            if pchild.type == "field_initializer_list":
+                                                is_base_constructor_call = True
+                                                break
 
-                                # Return should go to the next statement, not back to the declaration
-                                return_target = next_index if next_index != 2 else None
+                                    if is_base_constructor_call:
+                                        # This is a base class constructor call from an initializer list
+                                        # Return should go to the first statement in the derived constructor body
+                                        first_line = self.edge_first_line(parent_node, self.node_list)
+                                        if first_line:
+                                            return_target = first_line[0]
+                                        else:
+                                            # No body statements, return to implicit return of derived constructor
+                                            if parent_id in self.records.get("implicit_return_map", {}):
+                                                return_target = self.records["implicit_return_map"][parent_id]
+                                            else:
+                                                return_target = None
+                                    else:
+                                        # Regular constructor call from declaration
+                                        # Find the next statement after the declaration
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        # Return should go to the next statement, not back to the declaration
+                                        return_target = next_index if next_index != 2 else None
 
-                                if is_implicit_return:
-                                    # For implicit returns, always create the edge
-                                    if parent_id != fn_id and return_target:
-                                        self.add_edge(return_id, return_target, "constructor_return")
-                                else:
-                                    # For regular return statements, check they're in different functions
-                                    if parent_id != fn_id and return_target:
-                                        return_key = index_to_key.get(return_id)
+                                    if is_implicit_return:
+                                        # For implicit returns, always create the edge
+                                        if parent_id != fn_id and return_target:
+                                            self.add_edge(return_id, return_target, "constructor_return")
+                                        elif is_base_constructor_call and return_target:
+                                            # Special case: base constructor returning to derived constructor body
+                                            self.add_edge(return_id, return_target, "base_constructor_return")
+                                    else:
+                                        # For regular return statements, check they're in different functions
+                                        if parent_id != fn_id and return_target:
+                                            return_key = index_to_key.get(return_id)
 
-                                        if return_key:
-                                            return_node = self.node_list.get(return_key)
+                                            if return_key:
+                                                return_node = self.node_list.get(return_key)
 
-                                            if return_node:
-                                                parent_func = self.get_containing_function(parent_node)
-                                                return_func = self.get_containing_function(return_node)
-                                                if parent_func != return_func or parent_func is None:
-                                                    self.add_edge(return_id, return_target, "constructor_return")
+                                                if return_node:
+                                                    parent_func = self.get_containing_function(parent_node)
+                                                    return_func = self.get_containing_function(return_node)
+                                                    if parent_func != return_func or parent_func is None:
+                                                        self.add_edge(return_id, return_target, "constructor_return")
+                                        elif is_base_constructor_call and return_target:
+                                            # Special case: base constructor returning to derived constructor body
+                                            self.add_edge(return_id, return_target, "base_constructor_return")
 
         # Process destructor calls
         if self.records.get("destructor_calls"):
