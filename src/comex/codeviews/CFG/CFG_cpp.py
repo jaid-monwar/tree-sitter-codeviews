@@ -29,7 +29,7 @@ class CFGGraph_cpp(CFGGraph):
             "template_list": {},                   # template_name → node_id
             "extends": {},                         # class_name → [base_classes]
             "function_calls": {},                  # sig → [(call_id, parent_id)]
-            "method_calls": {},                    # sig → [(call_id, parent_id)]
+            "method_calls": {},                    # sig → [(call_id, parent_id, object_name)]
             "static_method_calls": {},             # (class_name, func_name, sig) → [(call_id, parent_id)]
             "operator_calls": {},                  # (operator_name, is_member) → [(call_id, parent_id, operand_type)]
             "constructor_calls": {},               # sig → [(call_id, parent_id)]
@@ -55,6 +55,9 @@ class CFGGraph_cpp(CFGGraph):
 
         # Track runtime types for polymorphic objects
         self.runtime_types = {}  # variable_name → actual_class_type (for new expressions)
+
+        # Track template instantiations for each object
+        self.template_instantiations = {}  # variable_name → (base_class_name, tuple_of_template_args, function_id_of_specialization)
 
         # Track objects created in each scope for RAII
         self.scope_objects = {}  # scope_key → [(var_name, class_type, decl_id, order)]
@@ -131,6 +134,265 @@ class CFGGraph_cpp(CFGGraph):
                 return node
             node = node.parent
         return None
+
+    def resolve_template_specialization(self, base_class_name, template_args, method_name):
+        """
+        Resolve which template specialization matches the given template arguments.
+        Returns the function_id of the matching specialization's method, or None if not found.
+
+        Template specialization resolution follows C++ rules:
+        1. Exact match (full specialization) takes highest priority
+        2. Partial specialization takes next priority (most specific match)
+        3. Primary template is the fallback
+
+        Args:
+            base_class_name: The base template class name (e.g., "Container")
+            template_args: Tuple of template argument strings (e.g., ("int", "std::string"))
+            method_name: The method being called (e.g., "display")
+
+        Returns:
+            function_id of the matching method, or None if no match found
+        """
+        if not template_args:
+            return None
+
+        # Search for matching template specialization
+        # Priority: full specialization > partial specialization > primary template
+
+        # Look through all functions to find methods with this name in classes
+        # that could be specializations of the base class
+        candidates = []  # (specificity, function_id, class_name)
+
+        for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+            if fn_name != method_name:
+                continue
+
+            # Get the class node to check if it's a template specialization
+            fn_key = None
+            for key, fid in self.index.items():
+                if fid == fn_id:
+                    fn_key = key
+                    break
+
+            if not fn_key:
+                continue
+
+            fn_node = self.node_list.get(fn_key)
+            if not fn_node:
+                continue
+
+            # Find the containing class
+            class_node = self.get_containing_class(fn_node)
+            if not class_node:
+                continue
+
+            # Check if this class is a template specialization by looking at its parent
+            parent = class_node.parent
+            if not parent or parent.type != "template_declaration":
+                # Not a template class - skip
+                continue
+
+            # Analyze the template declaration to determine specialization type
+            template_params = []
+            template_specs = []
+
+            for child in parent.children:
+                if child.type == "template_parameter_list":
+                    # Count template parameters
+                    for param in child.named_children:
+                        if param.type in ["type_parameter_declaration", "parameter_declaration"]:
+                            template_params.append(param)
+
+            # Also check for specialization syntax in class_specifier
+            # Full specialization: template <> class Container<int, double>
+            # Partial specialization: template <typename T> class Container<T, T>
+            # Primary template: template <typename T, typename U> class Container
+
+            is_full_specialization = len(template_params) == 0
+            is_primary_template = False
+            specificity = 0
+
+            # Extract any explicit template arguments from the class name
+            for child in class_node.children:
+                if child.type == "template_argument_list":
+                    # This class has explicit template arguments - it's a specialization
+                    template_specs = []
+                    for arg in child.named_children:
+                        template_specs.append(arg.text.decode('utf-8'))
+                    break
+
+            if not template_specs:
+                # Primary template (no explicit template arguments)
+                is_primary_template = True
+                specificity = 0  # Lowest priority
+            elif is_full_specialization:
+                # Full specialization: check for exact match
+                if len(template_specs) == len(template_args):
+                    # Normalize type strings for comparison (remove whitespace)
+                    specs_normalized = [s.replace(" ", "") for s in template_specs]
+                    args_normalized = [a.replace(" ", "") for a in template_args]
+
+                    if specs_normalized == args_normalized:
+                        specificity = 100  # Highest priority for exact match
+                    else:
+                        continue  # Not a match - skip
+                else:
+                    continue  # Arity mismatch - skip
+            else:
+                # Partial specialization: check for pattern match
+                # For simplicity, we'll do pattern matching here
+                # This is complex in general - for now, handle common cases:
+                # - Container<T, T> matches if both args are the same type
+                # - Container<T, T*> matches if second arg is pointer to first
+                if len(template_specs) == len(template_args):
+                    match = self._match_template_pattern(template_specs, template_args)
+                    if match:
+                        specificity = 50  # Medium priority for partial specialization
+                    else:
+                        continue
+                else:
+                    continue
+
+            candidates.append((specificity, fn_id, class_name))
+
+        if not candidates:
+            return None
+
+        # Sort by specificity (highest first) and return the most specific match
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]  # Return function_id
+
+    def _match_template_pattern(self, pattern, args):
+        """
+        Check if template arguments match a partial specialization pattern.
+
+        Args:
+            pattern: List of pattern strings from partial specialization (e.g., ["T", "T"])
+            args: List of actual template arguments (e.g., ["int", "int"])
+
+        Returns:
+            True if args match the pattern, False otherwise
+        """
+        if len(pattern) != len(args):
+            return False
+
+        # Build a mapping from template parameters to actual types
+        param_map = {}
+
+        for p, a in zip(pattern, args):
+            # Normalize strings
+            p_norm = p.replace(" ", "")
+            a_norm = a.replace(" ", "")
+
+            # Check for pointer pattern (e.g., "T*")
+            if p_norm.endswith("*"):
+                # Extract base type
+                base_p = p_norm[:-1]
+                # Check if argument is a pointer
+                if not a_norm.endswith("*"):
+                    return False
+                base_a = a_norm[:-1]
+
+                # Check if base types match the pattern
+                if base_p in param_map:
+                    if param_map[base_p] != base_a:
+                        return False
+                else:
+                    param_map[base_p] = base_a
+            else:
+                # Direct type or template parameter
+                if p_norm in param_map:
+                    # We've seen this parameter before - must match
+                    if param_map[p_norm] != a_norm:
+                        return False
+                else:
+                    # New parameter - record it
+                    # Check if this looks like a template parameter (single letter or "typename ...")
+                    if len(p_norm) == 1 and p_norm.isupper():
+                        param_map[p_norm] = a_norm
+                    elif p_norm == a_norm:
+                        # Exact type match
+                        continue
+                    else:
+                        # Pattern doesn't match
+                        return False
+
+        return True
+
+    def register_template_specializations(self, node_list):
+        """
+        Scan the AST for template class specializations and register their methods.
+        This fixes the issue where partial specializations are recorded as "anonymous_class"
+        and not properly added to the function_list.
+        """
+        for key, node in node_list.items():
+            # Look for function definitions
+            if node.type == "function_definition":
+                # Check if this function is inside a template class
+                class_node = self.get_containing_class(node)
+                if not class_node or not class_node.parent:
+                    continue
+
+                parent = class_node.parent
+                if parent.type != "template_declaration":
+                    continue
+
+                # This is a method in a template class
+                # Extract the class name and template arguments (if specialized)
+                class_name = "Container"  # Default base name
+                template_args = []
+
+                # Look for type_identifier or template_argument_list in class_node
+                for child in class_node.children:
+                    if child.type == "type_identifier":
+                        class_name = child.text.decode('utf-8')
+                    elif child.type == "template_argument_list":
+                        # This class has explicit template arguments - it's a specialization
+                        for arg in child.named_children:
+                            template_args.append(arg.text.decode('utf-8'))
+
+                # Get function signature using declarator field
+                fn_name = None
+                fn_sig = []
+
+                # Use tree-sitter's field-based access for more reliable extraction
+                declarator = None
+                for child in node.children:
+                    if child.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
+                        declarator = child
+                        break
+
+                if declarator:
+                    # Recursively search for identifier/field_identifier and parameter_list
+                    def extract_from_declarator(decl_node):
+                        nonlocal fn_name, fn_sig
+                        for gc in decl_node.children:
+                            # Methods use field_identifier, standalone functions use identifier
+                            if gc.type in ["identifier", "field_identifier"]:
+                                fn_name = gc.text.decode('utf-8')
+                            elif gc.type == "parameter_list":
+                                # Extract parameter types
+                                for param in gc.named_children:
+                                    if param.type == "parameter_declaration":
+                                        param_type_node = param.child_by_field_name("type")
+                                        if param_type_node:
+                                            fn_sig.append(param_type_node.text.decode('utf-8'))
+                            elif gc.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
+                                # Recurse
+                                extract_from_declarator(gc)
+
+                    extract_from_declarator(declarator)
+
+                if not fn_name:
+                    continue
+
+                fn_id = self.get_index(node)
+                key = ((class_name, fn_name), tuple(fn_sig))
+
+                # Check if this function is already in function_list
+                if key not in self.records["function_list"]:
+                    # Add it
+                    self.records["function_list"][key] = fn_id
 
     def get_base_classes(self, class_node):
         """
@@ -681,10 +943,16 @@ class CFGGraph_cpp(CFGGraph):
                         # Determine if this is a method call, static method call, or function call
                         if function_node.type == "field_expression":
                             # Instance method call: obj.method()
+                            # Extract object name from field_expression
+                            object_name = None
+                            argument_node = function_node.child_by_field_name("argument")
+                            if argument_node and argument_node.type == "identifier":
+                                object_name = argument_node.text.decode('utf-8')
+
                             key = (func_name, signature)
                             if key not in self.records["method_calls"]:
                                 self.records["method_calls"][key] = []
-                            self.records["method_calls"][key].append((call_index, parent_index))
+                            self.records["method_calls"][key].append((call_index, parent_index, object_name))
                         elif qualified_scope:
                             # Static method call: Class::staticMethod()
                             key = (qualified_scope, func_name, signature)
@@ -704,11 +972,32 @@ class CFGGraph_cpp(CFGGraph):
         # 2. Default: ResourceHolder obj1;
         # 3. Copy: ResourceHolder obj3 = obj2;
         # 4. Move: ResourceHolder obj4 = std::move(obj2);
+        # 5. Template instantiation: Container<int, std::string> container1(1, "Hello");
         elif root_node.type == "declaration":
             # Get the type (class name)
             type_node = root_node.child_by_field_name("type")
+
+            # Handle both regular types and template types
+            class_name = None
+            template_args = None
+
             if type_node and type_node.type == "type_identifier":
                 class_name = type_node.text.decode('utf-8')
+            elif type_node and type_node.type == "template_type":
+                # Extract base class name and template arguments
+                # Structure: template_type -> name (type_identifier) + arguments (template_argument_list)
+                for child in type_node.named_children:
+                    if child.type == "type_identifier":
+                        class_name = child.text.decode('utf-8')
+                    elif child.type == "template_argument_list":
+                        # Extract template arguments as a tuple of strings
+                        template_args = []
+                        for arg in child.named_children:
+                            arg_text = arg.text.decode('utf-8')
+                            template_args.append(arg_text)
+                        template_args = tuple(template_args)
+
+            if class_name:
 
                 # Find the parent statement node
                 parent_stmt = root_node
@@ -831,6 +1120,11 @@ class CFGGraph_cpp(CFGGraph):
                         order = len(self.scope_objects.get(scope_key, []))
                         self.scope_objects[scope_key].append((var_name, class_name, parent_index, order))
                         self.object_scope_map[var_name] = scope_key
+
+                    # Store template instantiation information if this is a template type
+                    if var_name and template_args:
+                        # Will resolve the specialization later during edge generation
+                        self.template_instantiations[var_name] = (class_name, template_args, None)
 
         # Handle constructor calls from new expressions
         # Example: Base* basePtr = new Derived();
@@ -1441,115 +1735,127 @@ class CFGGraph_cpp(CFGGraph):
                                             if parent_func != return_func or parent_func is None:
                                                 self.add_edge(return_id, return_target, "function_return")
 
-        # Process method calls (similar pattern but consider class context)
+        # Process method calls with template specialization resolution
         for (method_name, signature), call_list in self.records["method_calls"].items():
-            # FIX #5: Check if ANY function with this method name is virtual, OR
-            # if there are multiple implementations (indicating polymorphism)
-            # If the base class method is virtual, ALL potential targets (base and derived)
-            # should be labeled as virtual_call to correctly represent polymorphic dispatch
+            # Process each call site individually since each may have different template instantiations
+            for call_id, parent_id, object_name in call_list:
+                # Check if this object has a template instantiation
+                template_instantiation = None
+                if object_name and object_name in self.template_instantiations:
+                    template_instantiation = self.template_instantiations[object_name]
 
-            # Count how many different implementations exist for this method name
-            matching_functions = []
-            for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
-                if fn_name_check == method_name:
-                    matching_functions.append(fn_id_check)
+                # Find matching function(s)
+                matching_functions = []
+                for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                    if fn_name == method_name:
+                        matching_functions.append((fn_id, class_name))
 
-            # Determine if this is a virtual call:
-            # 1. Explicit virtual marking, OR
-            # 2. Multiple implementations (polymorphism)
-            is_virtual_method = False
-            for fn_id_check in matching_functions:
-                if fn_id_check in self.records["virtual_functions"]:
-                    is_virtual_method = True
-                    break
+                # Determine target function(s) and whether it's a virtual call
+                target_functions = []  # List of (fn_id, is_virtual) tuples
 
-            # If multiple implementations exist, it's polymorphic (virtual)
-            if len(matching_functions) > 1:
-                is_virtual_method = True
+                if template_instantiation:
+                    # Template instantiation: resolve statically to the correct specialization
+                    base_class, template_args, _ = template_instantiation
+                    resolved_fn_id = self.resolve_template_specialization(base_class, template_args, method_name)
 
-            for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                if fn_name == method_name:
-                    for call_id, parent_id in call_list:
-                        # Label consistently: if virtual or polymorphic, ALL targets are virtual calls
-                        if is_virtual_method:
-                            self.add_edge(parent_id, fn_id, f"virtual_call|{call_id}")
-                        else:
-                            self.add_edge(parent_id, fn_id, f"method_call|{call_id}")
+                    if resolved_fn_id:
+                        # Template specialization resolved - this is a static (non-virtual) call
+                        target_functions.append((resolved_fn_id, False))
+                    else:
+                        # Failed to resolve - fall back to primary template or any matching function
+                        # This should ideally not happen, but we'll handle it gracefully
+                        for fn_id, class_name in matching_functions:
+                            target_functions.append((fn_id, False))
+                else:
+                    # Not a template call - check for virtual dispatch
+                    is_virtual_method = False
 
-                        # Add return edges: method return points -> caller
-                        # Skip return edges to call sites within the same function
-                        if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
+                    # Check if ANY matching function is marked as virtual
+                    for fn_id, _ in matching_functions:
+                        if fn_id in self.records["virtual_functions"]:
+                            is_virtual_method = True
+                            break
+
+                    # If multiple implementations exist AND one is virtual, treat as polymorphic
+                    # BUT exclude template specializations from this count
+                    non_template_matches = []
+                    for fn_id, class_name in matching_functions:
+                        # Check if this is part of a template class
+                        fn_key = index_to_key.get(fn_id)
+                        if fn_key:
+                            fn_node = self.node_list.get(fn_key)
+                            if fn_node:
+                                class_node = self.get_containing_class(fn_node)
+                                if class_node and class_node.parent:
+                                    if class_node.parent.type == "template_declaration":
+                                        # This is a template - skip for polymorphism check
+                                        continue
+                        non_template_matches.append((fn_id, class_name))
+
+                    # If multiple non-template implementations exist, it's polymorphic (virtual)
+                    if len(non_template_matches) > 1 and is_virtual_method:
+                        # Virtual dispatch - all targets are candidates
+                        for fn_id, _ in non_template_matches:
+                            target_functions.append((fn_id, True))
+                    elif non_template_matches:
+                        # Single non-template match or no virtual marking
+                        for fn_id, _ in non_template_matches:
+                            target_functions.append((fn_id, False))
+                    elif matching_functions:
+                        # Only template matches - shouldn't happen, but handle gracefully
+                        for fn_id, _ in matching_functions:
+                            target_functions.append((fn_id, False))
+
+                # Create call edges to target function(s)
+                for fn_id, is_virtual in target_functions:
+                    # Add call edge
+                    if is_virtual:
+                        self.add_edge(parent_id, fn_id, f"virtual_call|{call_id}")
+                    else:
+                        self.add_edge(parent_id, fn_id, f"method_call|{call_id}")
+
+                    # Add return edge: from this specific function back to the caller's next statement
+                    if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
+                        # Get the call site node to find the return target
+                        parent_key = index_to_key.get(parent_id)
+                        if not parent_key:
+                            continue
+                        parent_node = self.node_list.get(parent_key)
+                        if not parent_node:
+                            continue
+
+                        # Calculate the return target (next statement after the call)
+                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                        return_target = next_index if next_index != 2 else None
+
+                        if return_target and parent_id != fn_id:
+                            # Add return edges from all return statements in this function
                             for return_id in self.records["return_statement_map"][fn_id]:
                                 # Check if this is a synthetic implicit return node
                                 is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
-                                # Get the call site node
-                                parent_key = index_to_key.get(parent_id)
-                                if not parent_key:
-                                    continue
-                                parent_node = self.node_list.get(parent_key)
-                                if not parent_node:
-                                    continue
-
-                                # Determine return target based on method return type
-                                # For all methods: return to next statement after call completes
-                                return_target = None
-
                                 if is_implicit_return:
-                                    # Implicit return = void method
-                                    # Return to NEXT statement (no value to evaluate)
-                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                    return_target = next_index if next_index != 2 else None
+                                    # Implicit return: connect from last statement of method body
+                                    fn_key = index_to_key.get(fn_id)
+                                    fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                                    if fn_node:
+                                        last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                        if last_stmt:
+                                            last_stmt_id, _ = last_stmt
+                                            self.add_edge(last_stmt_id, return_target, "method_return")
+                                        else:
+                                            # Empty method body
+                                            self.add_edge(fn_id, return_target, "method_return")
                                 else:
-                                    # Explicit return = may return a value
-                                    # Check method's return type
-                                    fn_key = None
-                                    for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
-                                        if fn_id_check == fn_id:
-                                            fn_key = ((class_name_check, fn_name_check), fn_sig_check)
-                                            break
-
-                                    is_void_return = False
-                                    if fn_key and fn_key in self.records["return_type"]:
-                                        ret_type = self.records["return_type"][fn_key]
-                                        is_void_return = ret_type == "void"
-
-                                    if is_void_return:
-                                        # Void method with explicit return
-                                        # Return to NEXT statement
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
-                                    else:
-                                        # Non-void method (returns a value)
-                                        # Return to NEXT statement after the call completes
-                                        # The call statement is atomic: it calls, receives return value, and completes
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
-
-                                if parent_id != fn_id and return_target:
-                                    # Get return node from index
+                                    # Explicit return: connect from return statement
                                     return_key = index_to_key.get(return_id)
-
-                                    if is_implicit_return or not return_key:
-                                        # FIX #2: For implicit returns, connect from last statement of method body
-                                        # Find the method node
-                                        fn_key = index_to_key.get(fn_id)
-                                        fn_node = self.node_list.get(fn_key) if fn_key else None
-
-                                        if fn_node:
-                                            # Get last statement in method body
-                                            last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
-                                            if last_stmt:
-                                                last_stmt_id, _ = last_stmt
-                                                self.add_edge(last_stmt_id, return_target, "method_return")
-                                            else:
-                                                # Fallback: empty method body, connect from method entry
-                                                self.add_edge(fn_id, return_target, "method_return")
-                                    else:
+                                    if return_key:
                                         return_node = self.node_list.get(return_key)
                                         if return_node:
                                             parent_func = self.get_containing_function(parent_node)
                                             return_func = self.get_containing_function(return_node)
+                                            # Only add edge if they're in different functions
                                             if parent_func != return_func or parent_func is None:
                                                 self.add_edge(return_id, return_target, "method_return")
 
@@ -2204,6 +2510,11 @@ class CFGGraph_cpp(CFGGraph):
         self.node_list = node_list
         self.CFG_node_list = graph_node_list
         self.records = records
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 1.5: Register missing template specializations
+        # ═══════════════════════════════════════════════════════════
+        self.register_template_specializations(node_list)
 
         # ═══════════════════════════════════════════════════════════
         # STEP 2: Create initial sequential edges (non-control statements)
