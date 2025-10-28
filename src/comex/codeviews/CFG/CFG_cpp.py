@@ -2538,6 +2538,23 @@ class CFGGraph_cpp(CFGGraph):
                     # Do not create sequential edges between class members
                     continue
 
+                # Skip creating next_line edges for namespace members and global declarations
+                # Namespace-level and global declarations are compile-time constructs:
+                # - Global variables are initialized during static initialization before main()
+                # - Function definitions are not executable code
+                # - There is no sequential execution flow at namespace/global scope
+                if parent and parent.type == "declaration_list":
+                    # Check if this is a namespace's declaration_list
+                    grandparent = parent.parent if parent else None
+                    if grandparent and grandparent.type == "namespace_definition":
+                        # This node is inside a namespace - skip sequential edges
+                        continue
+
+                # Skip global scope declarations (parent is translation_unit)
+                if parent and parent.type == "translation_unit":
+                    # This node is at global scope - skip sequential edges
+                    continue
+
                 # Get next statement
                 next_index, next_node = self.get_next_index(node, node_list)
 
@@ -2546,6 +2563,17 @@ class CFGGraph_cpp(CFGGraph):
                     next_parent = next_node.parent if next_node else None
                     if next_parent and next_parent.type == "field_declaration_list":
                         # Next node is a class member, skip edge
+                        continue
+
+                    # Also check if next node is at namespace/global scope
+                    if next_parent and next_parent.type == "declaration_list":
+                        next_grandparent = next_parent.parent if next_parent else None
+                        if next_grandparent and next_grandparent.type == "namespace_definition":
+                            # Next node is inside a namespace - skip edge
+                            continue
+
+                    if next_parent and next_parent.type == "translation_unit":
+                        # Next node is at global scope - skip edge
                         continue
 
                     current_index = self.get_index(node)
@@ -2652,11 +2680,10 @@ class CFGGraph_cpp(CFGGraph):
             # NAMESPACE DEFINITION
             # ─────────────────────────────────────────────────────────
             elif node.type == "namespace_definition":
-                # Edge to first declaration in namespace
-                first_line = self.edge_first_line(node, node_list)
-                if first_line:
-                    first_index, first_node = first_line
-                    self.add_edge(current_index, first_index, "namespace_entry")
+                # Namespaces are compile-time constructs, not runtime execution nodes
+                # They should not have control flow edges in the CFG
+                # Execution flow is determined by function calls, not namespace structure
+                pass
 
             # ─────────────────────────────────────────────────────────
             # IF STATEMENT
@@ -3201,11 +3228,14 @@ class CFGGraph_cpp(CFGGraph):
         # Sort by line number to preserve declaration order
         global_declarations.sort(key=lambda x: x[1])
 
-        # Connect sequential global declarations
-        for i in range(len(global_declarations) - 1):
-            curr_id = global_declarations[i][0]
-            next_id = global_declarations[i + 1][0]
-            self.add_edge(curr_id, next_id, "global_sequence")
+        # Global declarations (classes, namespaces, etc.) are compile-time constructs
+        # They should not have sequential control flow edges in the CFG
+        # Execution flow starts from main() and follows function calls
+        # Commenting out global_sequence edges:
+        # for i in range(len(global_declarations) - 1):
+        #     curr_id = global_declarations[i][0]
+        #     next_id = global_declarations[i + 1][0]
+        #     self.add_edge(curr_id, next_id, "global_sequence")
 
         # If there are global declarations and no main function is marked,
         # optionally connect start node to first declaration

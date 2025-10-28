@@ -432,8 +432,45 @@ def check_lambda(node):
 
 
 def get_class_name(node, index):
-    """Returns the class name when a function definition or method is passed to it"""
+    """Returns the class name or namespace when a function definition or method is passed to it.
+
+    For namespaces, builds the fully qualified name (e.g., "Outer::Inner").
+    Returns tuple: (index, [name]) where name can be class, struct, or namespace.
+    """
     type_identifiers = ["type_identifier", "template_type", "qualified_identifier"]
+
+    # First, check if function is in a namespace by traversing up to build namespace path
+    namespace_parts = []
+    temp_node = node
+    while temp_node is not None:
+        if temp_node.type == "namespace_definition":
+            # Get namespace name (or mark as anonymous if unnamed)
+            namespace_name_node = temp_node.child_by_field_name("name")
+            if namespace_name_node:
+                namespace_name = namespace_name_node.text.decode("UTF-8")
+                # Prepend to build qualified name from outer to inner
+                namespace_parts.insert(0, namespace_name)
+            else:
+                # Anonymous namespace - don't include in qualified name
+                # Functions in anonymous namespaces have internal linkage
+                # They should be treated as global functions for CFG purposes
+                pass
+        temp_node = temp_node.parent
+
+    # If we found namespace(s), return the qualified namespace name
+    if namespace_parts:
+        # Build fully qualified namespace (e.g., "Outer::Inner")
+        qualified_namespace = "::".join(namespace_parts)
+        # Find the innermost namespace node for index
+        temp_node = node
+        while temp_node is not None:
+            if temp_node.type == "namespace_definition":
+                namespace_index = index.get((temp_node.start_point, temp_node.end_point, temp_node.type))
+                if namespace_index is not None:
+                    return namespace_index, [qualified_namespace]
+            temp_node = temp_node.parent
+
+    # Otherwise, check for class/struct as before
     while node is not None:
         if node.type == "field_declaration_list" and node.parent.type == "class_specifier":
             node = node.parent
@@ -718,12 +755,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                                 records['extends'][class_name] = [parent_name]
 
             elif root_node.type == "namespace_definition":
-                namespace_name = None
-                for child in root_node.children:
-                    if child.type == "identifier":
-                        namespace_name = child.text.decode("UTF-8")
-                        break
-                if namespace_name:
+                # Use field-based access to get namespace name
+                namespace_name_node = root_node.child_by_field_name("name")
+                if namespace_name_node:
+                    namespace_name = namespace_name_node.text.decode("UTF-8")
                     label = f"namespace {namespace_name}"
                 else:
                     label = "anonymous namespace"
