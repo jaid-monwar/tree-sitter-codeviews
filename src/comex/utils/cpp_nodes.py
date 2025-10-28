@@ -491,6 +491,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         # These are compile-time constructs and should not appear in CFG
         if is_function_declaration(root_node):
             pass  # Skip this node
+        # Skip template_declaration nodes (compile-time constructs)
+        # The actual function/class definition inside the template will be processed separately
+        elif root_node.type == "template_declaration":
+            pass  # Skip template wrapper, process its contents
         # Skip access_specifiers inside base_class_clause (inheritance specifiers like "public" in "struct Foo : public Bar")
         elif root_node.type == "access_specifier" and root_node.parent and root_node.parent.type == "base_class_clause":
             pass  # Skip inheritance access specifiers

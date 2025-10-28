@@ -641,6 +641,19 @@ class CFGGraph_cpp(CFGGraph):
                     if argument and argument.type == "identifier":
                         pointer_var = argument.text.decode('utf-8')
 
+                # Case 5: Template function (template instantiation: add<float>(...))
+                elif function_node.type == "template_function":
+                    # Extract the identifier from the template_function node
+                    # Structure: template_function -> identifier + template_argument_list
+                    identifier_node = None
+                    for child in function_node.named_children:
+                        if child.type == "identifier":
+                            identifier_node = child
+                            break
+
+                    if identifier_node:
+                        func_name = identifier_node.text.decode('utf-8')
+
                 # Find the parent statement node
                 parent_stmt = root_node
                 while parent_stmt and parent_stmt.type not in self.statement_types["node_list_type"]:
@@ -1366,8 +1379,7 @@ class CFGGraph_cpp(CFGGraph):
                                     continue
 
                                 # Determine return target based on function return type
-                                # For NON-VOID functions: return to call site (value needed in expression)
-                                # For VOID functions/implicit returns: return to next statement
+                                # For all functions: return to next statement after call completes
                                 return_target = None
 
                                 if is_implicit_return:
@@ -1396,8 +1408,10 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
                                     else:
                                         # Non-void function (returns a value)
-                                        # Return to SAME statement (call site) to continue expression
-                                        return_target = parent_id
+                                        # Return to NEXT statement after the call completes
+                                        # The call statement is atomic: it calls, receives return value, and completes
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
@@ -1478,8 +1492,7 @@ class CFGGraph_cpp(CFGGraph):
                                     continue
 
                                 # Determine return target based on method return type
-                                # For NON-VOID methods: return to call site (value needed in expression)
-                                # For VOID methods/implicit returns: return to next statement
+                                # For all methods: return to next statement after call completes
                                 return_target = None
 
                                 if is_implicit_return:
@@ -1508,8 +1521,10 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
                                     else:
                                         # Non-void method (returns a value)
-                                        # Return to SAME statement (call site) to continue expression
-                                        return_target = parent_id
+                                        # Return to NEXT statement after the call completes
+                                        # The call statement is atomic: it calls, receives return value, and completes
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
@@ -1565,8 +1580,7 @@ class CFGGraph_cpp(CFGGraph):
                                     continue
 
                                 # Determine return target based on method return type
-                                # For NON-VOID methods: return to call site (value needed in expression)
-                                # For VOID methods/implicit returns: return to next statement
+                                # For all methods: return to next statement after call completes
                                 return_target = None
 
                                 if is_implicit_return:
@@ -1595,8 +1609,10 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
                                     else:
                                         # Non-void function (returns a value)
-                                        # Return to SAME statement (call site) to continue expression
-                                        return_target = parent_id
+                                        # Return to NEXT statement after the call completes
+                                        # The call statement is atomic: it calls, receives return value, and completes
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
