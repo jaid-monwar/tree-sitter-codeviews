@@ -1986,10 +1986,9 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
                                     else:
                                         # Non-void function (returns a value)
-                                        # Return to NEXT statement after the call completes
-                                        # The call statement is atomic: it calls, receives return value, and completes
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
+                                        # Return to CALL SITE to complete the expression
+                                        # The call site then naturally flows to the next statement via next_line edge
+                                        return_target = parent_id
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
@@ -2199,10 +2198,9 @@ class CFGGraph_cpp(CFGGraph):
                                         return_target = next_index if next_index != 2 else None
                                     else:
                                         # Non-void function (returns a value)
-                                        # Return to NEXT statement after the call completes
-                                        # The call statement is atomic: it calls, receives return value, and completes
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
+                                        # Return to CALL SITE to complete the expression
+                                        # The call site then naturally flows to the next statement via next_line edge
+                                        return_target = parent_id
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
