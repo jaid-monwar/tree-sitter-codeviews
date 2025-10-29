@@ -1049,6 +1049,10 @@ class CFGGraph_cpp(CFGGraph):
             # Find what comes after the scope
             next_after_scope_id, next_after_scope = self.get_next_index(scope_node, node_list)
 
+            # Special case: Check if last statement is a return statement
+            # In this case, destructors must be called BEFORE the return executes
+            is_return_at_scope_exit = last_stmt_node.type == "return_statement"
+
             if next_after_scope_id == 2:
                 # Scope exits to implicit return or exit
                 # Check if scope is in a function
@@ -1060,6 +1064,10 @@ class CFGGraph_cpp(CFGGraph):
                             fn_id = self.get_index(parent)
                             if fn_id in self.records.get("implicit_return_map", {}):
                                 next_after_scope_id = self.records["implicit_return_map"][fn_id]
+                            elif is_return_at_scope_exit:
+                                # For non-void functions, use the return statement as the target
+                                # Destructors will be inserted BEFORE the return statement
+                                next_after_scope_id = last_stmt_id
                         break
                     parent = parent.parent
 
@@ -1067,7 +1075,7 @@ class CFGGraph_cpp(CFGGraph):
             # Reverse order: last constructed is first destroyed
             objects_reversed = list(reversed(objects_sorted))
 
-            # Build chain: last_stmt -> ~objN -> ~objN-1 -> ... -> ~obj1 -> next_after_scope
+            # Build chain: prev_stmt -> ~objN -> ~objN-1 -> ... -> ~obj1 -> return_stmt (or next_after_scope)
             if next_after_scope_id and next_after_scope_id != 2:
                 # Create destructor call list for each object
                 destructor_ids = []
@@ -1089,9 +1097,32 @@ class CFGGraph_cpp(CFGGraph):
                 # but we create multiple edges from the implicit return node
                 # Using MultiDiGraph, we can have multiple edges between same nodes
                 if destructor_ids:
-                    # Edge from last statement to first destructor call
-                    first_var_name, first_class_name, first_dest_id = destructor_ids[0]
-                    self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
+                    # Special handling when last statement is a return statement
+                    # We need to insert destructors BEFORE the return statement
+                    if is_return_at_scope_exit:
+                        # Find the statement before the return statement
+                        # We'll redirect the edge: prev_stmt -> destructors -> return_stmt
+                        prev_stmt_id = None
+                        for src, dest, label in list(self.CFG_edge_list):
+                            if dest == last_stmt_id and label in ["next_line", "first_next_line"]:
+                                prev_stmt_id = src
+                                # Remove the direct edge to return statement
+                                self.CFG_edge_list.remove((src, dest, label))
+                                break
+
+                        if prev_stmt_id:
+                            # Edge from previous statement to first destructor call
+                            first_var_name, first_class_name, first_dest_id = destructor_ids[0]
+                            self.add_edge(prev_stmt_id, first_dest_id, "scope_exit_destructor")
+                        else:
+                            # No previous statement found, connect from return to destructors
+                            # This shouldn't happen in normal code, but handle it gracefully
+                            first_var_name, first_class_name, first_dest_id = destructor_ids[0]
+                            self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
+                    else:
+                        # Normal case: destructors after last statement
+                        first_var_name, first_class_name, first_dest_id = destructor_ids[0]
+                        self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
 
                     # Chain destructor returns together
                     # All objects of the same class use the same destructor function
@@ -1113,8 +1144,163 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(implicit_return_id, next_dest_id, edge_label)
                         else:
                             # Last destructor - return to next statement after scope
+                            # BUT: Only add this edge if the destructor doesn't have base class destructors
+                            # Base class destructor chaining (in chain_base_class_destructors) will handle
+                            # connecting through base destructors first
+                            # Check if this destructor's class has base classes (will be handled by chain_base_class_destructors)
+                            # For now, always add the edge - chain_base_class_destructors will add additional edges
+                            # and the CFG will show both paths (one through base destructors, one direct)
+                            # NOTE: This creates a MultiDiGraph with multiple edges from the same source
                             edge_label = f"scope_destructor_return|{var_name}"
-                            self.add_edge(implicit_return_id, next_after_scope_id, edge_label)
+                            # Only add if no base class destructor will be called
+                            # We'll check this after chain_base_class_destructors runs
+                            # For now, DON'T add this edge - let base destructor chaining handle it
+                            # self.add_edge(implicit_return_id, next_after_scope_id, edge_label)
+                            # Actually, we need to mark this edge to be added conditionally
+                            # Store it for now
+                            if not hasattr(self, '_pending_destructor_returns'):
+                                self._pending_destructor_returns = []
+                            self._pending_destructor_returns.append((implicit_return_id, next_after_scope_id, edge_label, class_name))
+
+    def chain_base_class_destructors(self):
+        """
+        Chain base class destructors to derived class destructors.
+        In C++, when a derived class destructor completes, the base class destructor
+        is automatically called. This method creates edges from the end of derived
+        class destructors to their base class destructors.
+
+        For each derived class destructor:
+        1. Find its implicit return point
+        2. Find base class destructors from inheritance hierarchy
+        3. Chain: ~Derived() implicit_return -> ~Base() entry
+        4. Chain base destructors if there are multiple levels of inheritance
+        """
+
+        # Build a map of class inheritance: derived_class -> [base_classes]
+        # Extract inheritance info directly from AST if not in records
+        inheritance_map = {}
+
+        # Try to use extends from records first
+        if "extends" in self.records and self.records["extends"]:
+            for class_name, base_classes in self.records["extends"].items():
+                if base_classes:
+                    inheritance_map[class_name] = base_classes if isinstance(base_classes, list) else [base_classes]
+
+        # If extends is empty, parse it from the AST
+        if not inheritance_map:
+            # Find all class/struct definitions and extract their base classes
+            def extract_inheritance(node):
+                if node.type in ["class_specifier", "struct_specifier"]:
+                    # Get class name
+                    name_node = node.child_by_field_name("name")
+                    if name_node:
+                        class_name = name_node.text.decode('utf-8')
+
+                        # Get base class list by iterating through all children (not just named)
+                        base_classes = []
+                        for child in node.children:
+                            if child.type == "base_class_clause":
+                                # Get the base class name from base_class_clause children
+                                for subchild in child.children:
+                                    if subchild.type in ["type_identifier", "qualified_identifier"]:
+                                        base_name = subchild.text.decode('utf-8')
+                                        base_classes.append(base_name)
+
+                        if base_classes:
+                            inheritance_map[class_name] = base_classes
+
+                # Recursively process children
+                for child in node.children:
+                    extract_inheritance(child)
+
+            extract_inheritance(self.root_node)
+
+        # Process each destructor to see if it needs base class destructor chaining
+        for ((fn_class_name, fn_name), fn_sig), fn_id in self.records.get("function_list", {}).items():
+            # Check if this is a destructor (name starts with ~)
+            if not fn_name.startswith("~"):
+                continue
+
+            # Check if this class has base classes
+            if fn_class_name not in inheritance_map:
+                continue
+
+            base_classes = inheritance_map[fn_class_name]
+            if not base_classes:
+                continue
+
+            # Get the implicit return for this destructor
+            implicit_return_id = self.records.get("implicit_return_map", {}).get(fn_id)
+            if not implicit_return_id:
+                continue
+
+            # For each base class, find its destructor and chain it
+            for base_class in base_classes:
+                base_destructor_name = f"~{base_class}"
+                base_destructor_id = None
+
+                # Find the base class destructor
+                # Prefer implementations (with bodies) over declarations
+                # Note: Out-of-class destructor definitions may have class_name="None" in function_list
+                # e.g., "None::Base::~Base" for "Base::~Base() { ... }" defined outside class
+                candidates = []
+                index_to_key = {v: k for k, v in self.index.items()}
+                for ((base_fn_class, base_fn_name), base_fn_sig), base_fn_id in self.records.get("function_list", {}).items():
+                    # Match by function name, and check if class name matches or if it's an out-of-class definition
+                    is_match = False
+                    if base_fn_class == base_class and base_fn_name == base_destructor_name:
+                        is_match = True
+                    elif base_fn_class in [None, "None"] and base_fn_name.startswith(f"{base_class}::~"):
+                        # Out-of-class definition: None::Base::~Base
+                        is_match = True
+
+                    if is_match:
+                        # Check if this function has a body (compound_statement)
+                        has_body = False
+                        fn_key = index_to_key.get(base_fn_id)
+                        if fn_key:
+                            fn_node = self.node_list.get(fn_key)
+                            if fn_node:
+                                # Check for compound_statement child
+                                for child in fn_node.children:
+                                    if child.type == "compound_statement":
+                                        has_body = True
+                                        break
+                        candidates.append((base_fn_id, has_body))
+
+                # Prefer functions with bodies (implementations) over declarations
+                for candidate_id, has_body in candidates:
+                    if has_body:
+                        base_destructor_id = candidate_id
+                        break
+
+                # If no implementation found, use the first candidate
+                if not base_destructor_id and candidates:
+                    base_destructor_id = candidates[0][0]
+
+                if base_destructor_id:
+                    # Add edge from derived destructor's implicit return to base destructor entry
+                    self.add_edge(implicit_return_id, base_destructor_id, "base_destructor_call")
+
+                    # Now chain the base destructor's return to the original target
+                    # Get the base destructor's implicit return
+                    base_implicit_return_id = self.records.get("implicit_return_map", {}).get(base_destructor_id)
+                    if base_implicit_return_id:
+                        # Check if there are pending destructor returns for this derived destructor
+                        if hasattr(self, '_pending_destructor_returns'):
+                            for pend_src, pend_dest, pend_label, pend_class in list(self._pending_destructor_returns):
+                                if pend_src == implicit_return_id:
+                                    # Redirect: instead of derived -> dest, go derived -> base -> dest
+                                    # The derived -> base edge is already added above
+                                    # Now add base -> dest
+                                    self.add_edge(base_implicit_return_id, pend_dest, pend_label)
+                                    # Remove from pending list
+                                    self._pending_destructor_returns.remove((pend_src, pend_dest, pend_label, pend_class))
+
+        # Add any remaining pending destructor returns (for classes without base classes)
+        if hasattr(self, '_pending_destructor_returns'):
+            for pend_src, pend_dest, pend_label, pend_class in self._pending_destructor_returns:
+                self.add_edge(pend_src, pend_dest, pend_label)
 
     def function_list(self, root_node, node_list):
         """
@@ -2423,18 +2609,11 @@ class CFGGraph_cpp(CFGGraph):
                                         continue
 
                                 if is_implicit_return:
-                                    # Implicit return: connect from last statement of method body
-                                    fn_key = index_to_key.get(fn_id)
-                                    fn_node = self.node_list.get(fn_key) if fn_key else None
-
-                                    if fn_node:
-                                        last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
-                                        if last_stmt:
-                                            last_stmt_id, _ = last_stmt
-                                            self.add_edge(last_stmt_id, return_target, "method_return")
-                                        else:
-                                            # Empty method body
-                                            self.add_edge(fn_id, return_target, "method_return")
+                                    # Implicit return: connect from implicit return node to return target
+                                    # The edge from last statement to implicit return was already created in STEP 6
+                                    # Now we just need to connect implicit return to the next statement after call
+                                    if return_target:
+                                        self.add_edge(return_id, return_target, "method_return")
                                 else:
                                     # Explicit return: connect from return statement
                                     return_key = index_to_key.get(return_id)
@@ -4369,6 +4548,15 @@ class CFGGraph_cpp(CFGGraph):
         #   - STEP 6.5 to connect statements to implicit returns
         # ═══════════════════════════════════════════════════════════
         self.insert_scope_destructors(node_list)
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 6.7.5: Chain base class destructors to derived destructors
+        # In C++, when a derived class destructor completes, the base class
+        # destructor is automatically called. This adds those implicit edges.
+        # IMPORTANT: Must come AFTER:
+        #   - STEP 6 to create implicit returns for all destructors
+        # ═══════════════════════════════════════════════════════════
+        self.chain_base_class_destructors()
 
         # ═══════════════════════════════════════════════════════════
         # STEP 6.8: Add global scope flow (FIX #4)

@@ -668,9 +668,12 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         # The actual function/class definition inside the template will be processed separately
         elif root_node.type == "template_declaration":
             pass  # Skip template wrapper, process its contents
-        # Skip access_specifiers inside base_class_clause (inheritance specifiers like "public" in "struct Foo : public Bar")
-        elif root_node.type == "access_specifier" and root_node.parent and root_node.parent.type == "base_class_clause":
-            pass  # Skip inheritance access specifiers
+        # Skip access_specifiers (public:, private:, protected:)
+        # These are compile-time directives, not executable code
+        # 1. Inside base_class_clause (inheritance specifiers like "public" in "struct Foo : public Bar")
+        # 2. Inside class/struct bodies (access modifiers like "public:" in class definitions)
+        elif root_node.type == "access_specifier":
+            pass  # Skip all access specifiers - they're not executable code
         # Skip statements that are children of attributed_statement (the attributed_statement itself will be processed)
         elif root_node.parent and root_node.parent.type == "attributed_statement":
             pass  # Skip inner statements - the attributed_statement wrapper is the CFG node
