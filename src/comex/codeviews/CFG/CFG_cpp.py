@@ -1084,6 +1084,15 @@ class CFGGraph_cpp(CFGGraph):
                 if function_node.type == "identifier":
                     func_name = function_node.text.decode('utf-8')
 
+                    # Skip compile-time operators that look like function calls
+                    # These are evaluated at compile-time and should not appear in runtime CFG
+                    # Note: We also skip processing their arguments because those are compile-time expressions
+                    if func_name in {'noexcept', 'sizeof', 'alignof', 'decltype', 'typeid',
+                                     'static_assert', 'requires'}:
+                        # Don't record as function call and don't process arguments
+                        # (arguments to compile-time operators are not executed at runtime)
+                        return
+
                     # Check if this is a constructor call (identifier matching a class name)
                     # This happens in return statements: return Vector2D(x, y);
                     is_constructor = False
@@ -1763,6 +1772,62 @@ class CFGGraph_cpp(CFGGraph):
 
         return tuple(signature)
 
+    def signatures_match(self, call_sig, func_sig):
+        """
+        Check if a call signature matches a function signature with lenient matching rules.
+
+        Lenient matching rules:
+        - Exact match: 'int' matches 'int'
+        - Lvalue to value: 'int&' matches 'int' (lvalue can bind to value parameter)
+        - Const reference to value: 'const int&' matches 'int'
+        - 'unknown' matches any type (for cases where we can't infer the type)
+
+        Args:
+            call_sig: Tuple of argument types from the call site
+            func_sig: Tuple of parameter types from the function definition
+
+        Returns:
+            bool: True if signatures are compatible, False otherwise
+        """
+        # Different number of parameters
+        if len(call_sig) != len(func_sig):
+            return False
+
+        # Check each parameter
+        for call_type, func_type in zip(call_sig, func_sig):
+            # Exact match
+            if call_type == func_type:
+                continue
+
+            # Unknown type matches anything
+            if call_type == "unknown" or func_type == "unknown":
+                continue
+
+            # Strip whitespace for comparison
+            call_type_clean = call_type.strip()
+            func_type_clean = func_type.strip()
+
+            # Lvalue reference (T&) can bind to value parameter (T)
+            if call_type_clean.endswith('&') and not call_type_clean.endswith('&&'):
+                base_call_type = call_type_clean[:-1].strip()
+                # Remove 'const' from base type if present
+                base_call_type_no_const = base_call_type.replace('const', '').strip()
+                func_type_no_const = func_type_clean.replace('const', '').strip()
+                if base_call_type_no_const == func_type_no_const:
+                    continue
+
+            # Const reference (const T&) can bind to value parameter (T)
+            if 'const' in call_type_clean and call_type_clean.endswith('&'):
+                base_call_type = call_type_clean.replace('const', '').replace('&', '').strip()
+                func_type_no_const = func_type_clean.replace('const', '').strip()
+                if base_call_type == func_type_no_const:
+                    continue
+
+            # No match found
+            return False
+
+        return True
+
     def get_argument_type(self, arg_node):
         """
         Infer the type of an argument expression for C++ with value category detection.
@@ -2034,7 +2099,7 @@ class CFGGraph_cpp(CFGGraph):
         for (func_name, signature), call_list in self.records["function_calls"].items():
             # Find matching function definition
             for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                if fn_name == func_name and signature == fn_sig:
+                if fn_name == func_name and self.signatures_match(signature, fn_sig):
                     # Found matching function with matching signature (overload resolution)
                     for call_id, parent_id in call_list:
                         # Add call edge: caller -> function
@@ -2091,6 +2156,11 @@ class CFGGraph_cpp(CFGGraph):
                                     # If found matching catch, skip normal return logic
                                     if found_caller_try:
                                         continue
+                                    # If it's a throw with no catch, also skip normal return logic
+                                    # (program will terminate via std::terminate, not return normally)
+                                    else:
+                                        # Uncaught exception - no normal return edge
+                                        continue
 
                                 # Determine return target based on function return type
                                 # For all functions: return to next statement after call completes
@@ -2142,7 +2212,10 @@ class CFGGraph_cpp(CFGGraph):
                 # Find matching function(s) with signature matching for overload resolution
                 matching_functions = []
                 for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                    if fn_name == method_name and signature == fn_sig:
+                    # Match method name - handle both exact matches and out-of-line definitions
+                    # (e.g., "displayPrivateMember" should match "FriendClass::displayPrivateMember")
+                    name_matches = (fn_name == method_name or fn_name.endswith("::" + method_name))
+                    if name_matches and self.signatures_match(signature, fn_sig):
                         matching_functions.append((fn_id, class_name))
 
                 # Determine target function(s) and whether it's a virtual call
@@ -2229,6 +2302,47 @@ class CFGGraph_cpp(CFGGraph):
                                 # Check if this is a synthetic implicit return node
                                 is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
+                                # Check if this "return" is actually a throw statement that escaped the function
+                                return_key = index_to_key.get(return_id)
+                                return_node = self.node_list.get(return_key) if return_key else None
+                                is_throw_statement = return_node and return_node.type == "throw_statement"
+
+                                # If it's a throw that escaped, route it to caller's catch blocks
+                                if is_throw_statement:
+                                    # Find enclosing try block at call site
+                                    caller_parent = parent_node.parent
+                                    found_caller_try = False
+                                    while caller_parent is not None:
+                                        if caller_parent.type == "try_statement":
+                                            # Extract thrown type from the throw statement
+                                            thrown_type = self.extract_thrown_type(return_node)
+
+                                            # Find matching catch clause in caller's try block
+                                            for child in caller_parent.children:
+                                                if child.type == "catch_clause":
+                                                    if (child.start_point, child.end_point, child.type) in self.node_list:
+                                                        # Extract catch parameter type
+                                                        catch_type = self.extract_catch_parameter_type(child)
+
+                                                        # Check if thrown type matches this catch block
+                                                        if self.exception_type_matches(thrown_type, catch_type):
+                                                            catch_index = self.get_index(child)
+                                                            self.add_edge(return_id, catch_index, "method_return")
+                                                            found_caller_try = True
+                                                            break  # Stop at first matching catch
+
+                                            break  # Stop looking for try blocks
+                                        caller_parent = caller_parent.parent
+
+                                    # If found matching catch, skip normal return logic
+                                    if found_caller_try:
+                                        continue
+                                    # If it's a throw with no catch, also skip normal return logic
+                                    # (program will terminate via std::terminate, not return normally)
+                                    else:
+                                        # Uncaught exception - no normal return edge
+                                        continue
+
                                 if is_implicit_return:
                                     # Implicit return: connect from last statement of method body
                                     fn_key = index_to_key.get(fn_id)
@@ -2259,7 +2373,7 @@ class CFGGraph_cpp(CFGGraph):
             # Find matching static method in function_list
             # Static methods are stored with class name and function name
             for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                if fn_class_name == class_name and fn_name == method_name and signature == fn_sig:
+                if fn_class_name == class_name and fn_name == method_name and self.signatures_match(signature, fn_sig):
                     # Found matching static method with matching signature (overload resolution)
                     for call_id, parent_id in call_list:
                         # Add call edge: caller -> static method
@@ -2279,6 +2393,47 @@ class CFGGraph_cpp(CFGGraph):
                                 parent_node = self.node_list.get(parent_key)
                                 if not parent_node:
                                     continue
+
+                                # Check if this "return" is actually a throw statement that escaped the function
+                                return_key = index_to_key.get(return_id)
+                                return_node = self.node_list.get(return_key) if return_key else None
+                                is_throw_statement = return_node and return_node.type == "throw_statement"
+
+                                # If it's a throw that escaped, route it to caller's catch blocks
+                                if is_throw_statement:
+                                    # Find enclosing try block at call site
+                                    caller_parent = parent_node.parent
+                                    found_caller_try = False
+                                    while caller_parent is not None:
+                                        if caller_parent.type == "try_statement":
+                                            # Extract thrown type from the throw statement
+                                            thrown_type = self.extract_thrown_type(return_node)
+
+                                            # Find matching catch clause in caller's try block
+                                            for child in caller_parent.children:
+                                                if child.type == "catch_clause":
+                                                    if (child.start_point, child.end_point, child.type) in self.node_list:
+                                                        # Extract catch parameter type
+                                                        catch_type = self.extract_catch_parameter_type(child)
+
+                                                        # Check if thrown type matches this catch block
+                                                        if self.exception_type_matches(thrown_type, catch_type):
+                                                            catch_index = self.get_index(child)
+                                                            self.add_edge(return_id, catch_index, "static_return")
+                                                            found_caller_try = True
+                                                            break  # Stop at first matching catch
+
+                                            break  # Stop looking for try blocks
+                                        caller_parent = caller_parent.parent
+
+                                    # If found matching catch, skip normal return logic
+                                    if found_caller_try:
+                                        continue
+                                    # If it's a throw with no catch, also skip normal return logic
+                                    # (program will terminate via std::terminate, not return normally)
+                                    else:
+                                        # Uncaught exception - no normal return edge
+                                        continue
 
                                 # Determine return target based on method return type
                                 # For all methods: return to next statement after call completes
