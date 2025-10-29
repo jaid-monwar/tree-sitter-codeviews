@@ -35,6 +35,7 @@ statement_types = {
         "type_definition",          # Typedef declarations
         "friend_declaration",       # Friend declarations
         "catch_clause",             # Exception catch blocks
+        "attributed_statement",     # Statements with C++ attributes (e.g., [[fallthrough]];)
         # MEDIUM PRIORITY FEATURES ADDED:
         # "new_expression",         # Excluded: new is an expression, not a statement (appears within other statements)
         "static_assert_declaration", # Static assertions
@@ -59,6 +60,7 @@ statement_types = {
         "friend_declaration",
         "static_assert_declaration",
         "namespace_alias_definition",
+        "attributed_statement",       # Statements with attributes like [[fallthrough]];
         # Preprocessor directives excluded - they are compile-time only, not runtime:
         # "preproc_include",          # Excluded: preprocessor directive
         # "preproc_def",              # Excluded: preprocessor directive
@@ -565,6 +567,9 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         # Skip access_specifiers inside base_class_clause (inheritance specifiers like "public" in "struct Foo : public Bar")
         elif root_node.type == "access_specifier" and root_node.parent and root_node.parent.type == "base_class_clause":
             pass  # Skip inheritance access specifiers
+        # Skip statements that are children of attributed_statement (the attributed_statement itself will be processed)
+        elif root_node.parent and root_node.parent.type == "attributed_statement":
+            pass  # Skip inner statements - the attributed_statement wrapper is the CFG node
         elif (
             root_node.type in statement_types["inner_node_type"]
             and root_node.parent is not None
@@ -984,6 +989,24 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 if len(label) > 80:
                     label = label[:77] + "..."
                 type_label = "preprocessor"
+
+            elif root_node.type == "attributed_statement":
+                # [[fallthrough]]; or [[maybe_unused]] int x;
+                # Extract attribute names for label
+                attributes = []
+                for child in root_node.children:
+                    if child.type == "attribute_declaration":
+                        for attr_child in child.named_children:
+                            if attr_child.type == "attribute":
+                                attr_text = attr_child.text.decode('utf-8')
+                                attr_name = attr_text.split('(')[0].strip()
+                                attributes.append(attr_name)
+
+                # Get the statement text (excluding the body if it's a compound statement)
+                label = root_node.text.decode("UTF-8")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "expression_statement"
 
             elif root_node.type == "new_expression":
                 # new int(5) or new MyClass()

@@ -895,6 +895,52 @@ class CFGGraph_cpp(CFGGraph):
 
         return None
 
+    def extract_attributes_from_node(self, node):
+        """
+        Extract C++ attributes from a node (e.g., [[noreturn]], [[fallthrough]], etc.)
+        Returns a list of attribute names.
+        """
+        attributes = []
+        for child in node.children:
+            if child.type == "attribute_declaration":
+                # Find all attribute nodes within the attribute_declaration
+                for attr_child in child.named_children:
+                    if attr_child.type == "attribute":
+                        attr_text = attr_child.text.decode('utf-8')
+                        # Extract just the attribute name (e.g., "noreturn" from "noreturn")
+                        # or "deprecated" from "deprecated(...)"
+                        attr_name = attr_text.split('(')[0].strip()
+                        attributes.append(attr_name)
+        return attributes
+
+    def contains_function_call(self, node):
+        """
+        Check if a statement node contains a function call, method call, or constructor call.
+        Used to determine if a statement should have sequential flow or if control transfers to a function.
+
+        Returns True if the node contains:
+        - call_expression (regular function calls)
+        - An identifier followed by parentheses (function calls)
+
+        Returns False otherwise (simple statements, assignments without calls, etc.)
+        """
+        if node is None:
+            return False
+
+        # Check the node itself
+        if node.type == "call_expression":
+            return True
+
+        # Recursively check all children
+        for child in node.children:
+            if child.type == "call_expression":
+                return True
+            # Recursively check nested nodes
+            if self.contains_function_call(child):
+                return True
+
+        return False
+
     def get_last_statement_in_function_body(self, function_node, node_list):
         """
         Find the last executable statement in a function body.
@@ -2105,6 +2151,17 @@ class CFGGraph_cpp(CFGGraph):
                         # Add call edge: caller -> function
                         self.add_edge(parent_id, fn_id, f"function_call|{call_id}")
 
+                        # Check if the function has [[noreturn]] attribute
+                        has_noreturn = False
+                        if fn_id in self.records.get("attributed_functions", {}):
+                            attributes = self.records["attributed_functions"][fn_id]
+                            has_noreturn = "noreturn" in attributes
+
+                        # Skip return edges for [[noreturn]] functions
+                        # These functions never return to their caller (e.g., std::exit, std::terminate)
+                        if has_noreturn:
+                            continue
+
                         # Add return edges: function return points -> caller
                         # Skip return edges to call sites within the same function
                         # (e.g., recursive calls in mutually exclusive branches)
@@ -2176,8 +2233,15 @@ class CFGGraph_cpp(CFGGraph):
                                     # Get return node from index
                                     return_key = index_to_key.get(return_id)
 
-                                    if is_implicit_return or not return_key:
-                                        # FIX #2: For implicit returns, connect from last statement of function body
+                                    if is_implicit_return:
+                                        # FIX #3: For implicit returns, use the implicit return node itself
+                                        # The implicit return node (e.g., 166) is the convergence point where all
+                                        # execution paths (including break statements from switch/loops) meet
+                                        # before returning to the caller. Don't substitute with "last statement"
+                                        # because that would incorrectly use the switch/loop entry point.
+                                        self.add_edge(return_id, return_target, "function_return")
+                                    elif not return_key:
+                                        # For other synthetic returns (not implicit), try to find last statement
                                         # Find the function node
                                         fn_key = index_to_key.get(fn_id)
                                         fn_node = self.node_list.get(fn_key) if fn_key else None
@@ -2974,6 +3038,32 @@ class CFGGraph_cpp(CFGGraph):
                                                         if parent_func != return_func or parent_func is None:
                                                             self.add_edge(return_id, return_target, "indirect_return")
 
+        # ═══════════════════════════════════════════════════════════
+        # CLEANUP: Remove sequential edges after [[noreturn]] function calls
+        # ═══════════════════════════════════════════════════════════
+        # After adding all function call edges, remove next_line edges from statements
+        # that call [[noreturn]] functions, since those calls never return
+        edges_to_remove = []
+        for (func_name, signature), call_list in self.records["function_calls"].items():
+            # Find matching function definition
+            for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                if fn_name == func_name and self.signatures_match(signature, fn_sig):
+                    # Check if the function has [[noreturn]] attribute
+                    if fn_id in self.records.get("attributed_functions", {}):
+                        attributes = self.records["attributed_functions"][fn_id]
+                        if "noreturn" in attributes:
+                            # This is a [[noreturn]] function - remove next_line edges from its call sites
+                            for call_id, parent_id in call_list:
+                                # Find and mark for removal any next_line edge from parent_id
+                                for edge in self.CFG_edge_list:
+                                    if edge[0] == parent_id and edge[2] == "next_line":
+                                        edges_to_remove.append(edge)
+
+        # Remove marked edges
+        for edge in edges_to_remove:
+            if edge in self.CFG_edge_list:
+                self.CFG_edge_list.remove(edge)
+
     def extract_lambda_variable_name(self, statement_node, lambda_node):
         """
         Extract the variable name that a lambda is assigned to.
@@ -3295,6 +3385,45 @@ class CFGGraph_cpp(CFGGraph):
                     # This node is at global scope - skip sequential edges
                     continue
 
+                # Special handling for [[fallthrough]] attributed statements
+                # Fallthrough should connect to the first statement in the next case, not the case label
+                if node.type == "attributed_statement":
+                    # Check if this is a fallthrough statement
+                    attributes = self.extract_attributes_from_node(node)
+                    if "fallthrough" in attributes:
+                        # Find the next case statement
+                        # Fallthrough is typically inside a case_statement, so we need to:
+                        # 1. Find the parent case_statement
+                        # 2. Find its next sibling (the next case)
+                        # 3. Find the first executable statement in that next case
+                        parent_case = node.parent
+                        while parent_case and parent_case.type != "case_statement":
+                            parent_case = parent_case.parent
+
+                        next_case = None
+                        if parent_case:
+                            # Get the next sibling of the parent case
+                            sibling = parent_case.next_sibling
+                            while sibling:
+                                if sibling.type == "case_statement":
+                                    next_case = sibling
+                                    break
+                                sibling = sibling.next_sibling
+
+                        if next_case:
+                            # Find the first executable statement in the case
+                            # Skip the case value and go to the first statement
+                            for child in next_case.named_children:
+                                # Skip the value field (case expression or default marker)
+                                if child.type in self.statement_types["node_list_type"]:
+                                    if (child.start_point, child.end_point, child.type) in node_list:
+                                        current_index = self.get_index(node)
+                                        first_stmt_index = self.get_index(child)
+                                        self.add_edge(current_index, first_stmt_index, "fallthrough")
+                                        break
+                            # Skip normal next_index processing for fallthrough
+                            continue
+
                 # Get next statement
                 next_index, next_node = self.get_next_index(node, node_list)
 
@@ -3314,6 +3443,16 @@ class CFGGraph_cpp(CFGGraph):
 
                     if next_parent and next_parent.type == "translation_unit":
                         # Next node is at global scope - skip edge
+                        continue
+
+                    # FIX #5: Skip next_line edge for statements containing function calls
+                    # When a statement contains a function call, control transfers TO the function,
+                    # and then returns FROM the function to the next statement via function_return edge.
+                    # Creating a direct next_line edge would incorrectly show parallel execution paths.
+                    # Example: call(); next_stmt; should be: call -> function -> return -> next_stmt
+                    # NOT: call -> function AND call -> next_stmt (parallel)
+                    if self.contains_function_call(node):
+                        # Skip creating next_line edge - function_return edge will handle flow
                         continue
 
                     current_index = self.get_index(node)
@@ -3359,6 +3498,11 @@ class CFGGraph_cpp(CFGGraph):
                 if "main_function" in self.records and self.records["main_function"] == current_index:
                     # start -> main
                     self.add_edge(1, current_index, "next")
+
+                # Extract and store function attributes (e.g., [[noreturn]], [[nodiscard]])
+                attributes = self.extract_attributes_from_node(node)
+                if attributes:
+                    self.records["attributed_functions"][current_index] = attributes
 
                 # Edge to first line in function body
                 first_line = self.edge_first_line(node, node_list)
@@ -3410,6 +3554,25 @@ class CFGGraph_cpp(CFGGraph):
                     if current_index not in self.records["return_statement_map"]:
                         self.records["return_statement_map"][current_index] = []
                     self.records["return_statement_map"][current_index].append(implicit_return_id)
+
+                    # FIX #4: Connect last statement in function to implicit return node
+                    # This ensures that functions without explicit returns have proper control flow
+                    # from their last statement to the implicit return point
+                    # IMPORTANT: Do NOT create this edge for [[noreturn]] functions
+                    has_noreturn = "noreturn" in attributes if attributes else False
+
+                    if not has_noreturn:
+                        last_stmt = self.get_last_statement_in_function_body(node, node_list)
+                        if last_stmt:
+                            last_stmt_id, last_stmt_node = last_stmt
+                            # Only connect if the last statement is not a jump statement
+                            # AND not a compound control flow statement (if/while/for/switch/try)
+                            # Compound control statements already manage their own exit paths
+                            compound_control_stmts = ["if_statement", "while_statement", "for_statement",
+                                                      "for_range_loop", "do_statement", "switch_statement",
+                                                      "try_statement"]
+                            if not self.is_jump_statement(last_stmt_node) and last_stmt_node.type not in compound_control_stmts:
+                                self.add_edge(last_stmt_id, implicit_return_id, "implicit_return")
 
             # ─────────────────────────────────────────────────────────
             # CLASS / STRUCT DEFINITION
@@ -3768,11 +3931,15 @@ class CFGGraph_cpp(CFGGraph):
             elif node.type == "switch_statement":
                 # Find all case statements
                 body = node.child_by_field_name("body")
+                has_default = False
                 if body:
                     case_nodes = []
                     for child in body.named_children:
                         if child.type == "case_statement":
                             case_nodes.append(child)
+                            # Check if this is a default case (no value field)
+                            if child.child_by_field_name("value") is None:
+                                has_default = True
 
                     # Edge from switch to each case
                     for case_node in case_nodes:
@@ -3781,9 +3948,12 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, case_index, "switch_case")
 
                 # Edge from switch to after switch (if no matching case)
-                next_index, next_node = self.get_next_index(node, node_list)
-                if next_index != 2:
-                    self.add_edge(current_index, next_index, "switch_exit")
+                # Only add this edge if there's NO default case
+                # A default case guarantees that one case will always be executed
+                if not has_default:
+                    next_index, next_node = self.get_next_index(node, node_list)
+                    if next_index != 2:
+                        self.add_edge(current_index, next_index, "switch_exit")
 
             # ─────────────────────────────────────────────────────────
             # CASE STATEMENT
