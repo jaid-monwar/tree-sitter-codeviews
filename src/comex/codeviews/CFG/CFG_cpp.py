@@ -436,6 +436,175 @@ class CFGGraph_cpp(CFGGraph):
 
         return node.type in jump_types
 
+    def extract_thrown_type(self, throw_node):
+        """
+        Extract the type of the expression being thrown.
+        Returns a tuple: (type_category, type_string)
+
+        type_category: 'int', 'float', 'string', 'class', 'catch_all'
+        type_string: detailed type information
+        """
+        if throw_node.type != "throw_statement":
+            return ('unknown', None)
+
+        # Find the thrown expression (child after 'throw' keyword)
+        thrown_expr = None
+        for child in throw_node.children:
+            if child.type not in ["throw", ";"]:
+                thrown_expr = child
+                break
+
+        if thrown_expr is None:
+            # Re-throw: throw;
+            return ('rethrow', None)
+
+        # Analyze the expression type
+        if thrown_expr.type == "number_literal":
+            literal_text = thrown_expr.text.decode('utf-8')
+            # Check for float suffix
+            if 'f' in literal_text.lower() or '.' in literal_text:
+                return ('float', 'float')
+            else:
+                return ('int', 'int')
+
+        elif thrown_expr.type == "string_literal":
+            return ('string', 'const char*')
+
+        elif thrown_expr.type == "call_expression":
+            # This is likely a class constructor: throw std::runtime_error(...)
+            func_node = thrown_expr.child_by_field_name("function")
+            if func_node:
+                func_text = func_node.text.decode('utf-8')
+                # Extract class name (handle std::exception, MyException, etc.)
+                return ('class', func_text)
+
+        elif thrown_expr.type == "identifier":
+            # Throwing a variable - would need type inference
+            # For now, return identifier name
+            return ('variable', thrown_expr.text.decode('utf-8'))
+
+        return ('unknown', thrown_expr.text.decode('utf-8') if thrown_expr else None)
+
+    def extract_catch_parameter_type(self, catch_node):
+        """
+        Extract the parameter type from a catch clause.
+        Returns a tuple: (type_category, type_string)
+
+        type_category: 'int', 'float', 'string', 'class', 'catch_all'
+        type_string: detailed type information
+        """
+        if catch_node.type != "catch_clause":
+            return ('unknown', None)
+
+        # Find parameter_list child
+        param_list = None
+        for child in catch_node.children:
+            if child.type == "parameter_list":
+                param_list = child
+                break
+
+        if param_list is None:
+            return ('catch_all', '...')
+
+        param_text = param_list.text.decode('utf-8')
+        # Strip parentheses
+        if param_text.startswith("(") and param_text.endswith(")"):
+            param_text = param_text[1:-1].strip()
+
+        # Check for catch-all
+        if param_text == "...":
+            return ('catch_all', '...')
+
+        # Parse parameter type
+        # Examples: "int errorCode", "const char* message", "const std::exception& e"
+
+        # Split to get type (everything except last identifier which is parameter name)
+        parts = param_text.split()
+        if not parts:
+            return ('catch_all', '...')
+
+        # The type is everything except potentially the last identifier (variable name)
+        # But we need to handle cases like "int", "int&", "const char*", "std::exception&"
+
+        # Check for basic types
+        if 'int' in param_text and 'point' not in param_text.lower():
+            return ('int', 'int')
+        elif 'float' in param_text or 'double' in param_text:
+            return ('float', 'float')
+        elif 'char*' in param_text or 'char *' in param_text:
+            return ('string', 'const char*')
+        elif 'exception' in param_text.lower() or '::' in param_text:
+            # This is a class type, potentially with namespace
+            # Extract the class name
+            type_part = param_text
+            # Remove const, &, and variable name
+            type_part = type_part.replace('const', '').replace('&', '').strip()
+            # Take everything except last word (which might be variable name)
+            words = type_part.split()
+            if len(words) > 1:
+                # Last word is likely variable name, take everything before
+                class_name = ' '.join(words[:-1])
+            else:
+                class_name = words[0]
+            return ('class', class_name.strip())
+
+        # Default: treat as class type
+        return ('class', param_text)
+
+    def exception_type_matches(self, thrown_type, catch_type):
+        """
+        Check if a thrown exception type matches a catch parameter type.
+
+        Returns True if the exception can be caught by the catch block.
+        Implements C++ exception matching rules:
+        1. Exact type match
+        2. Derived class to base class (polymorphism)
+        3. Catch-all (...) catches everything
+
+        Args:
+            thrown_type: tuple (type_category, type_string) from extract_thrown_type
+            catch_type: tuple (type_category, type_string) from extract_catch_parameter_type
+        """
+        thrown_cat, thrown_str = thrown_type
+        catch_cat, catch_str = catch_type
+
+        # Catch-all catches everything
+        if catch_cat == 'catch_all':
+            return True
+
+        # Re-throw doesn't match any catch (it propagates)
+        if thrown_cat == 'rethrow':
+            return False
+
+        # Exact category match
+        if thrown_cat == catch_cat:
+            # For primitives, categories match is enough
+            if thrown_cat in ['int', 'float', 'string']:
+                return True
+
+            # For classes, check inheritance
+            if thrown_cat == 'class':
+                # Normalize scope operators (handle both :: and _SCOPE_)
+                thrown_normalized = thrown_str.replace('_SCOPE_', '::').replace(' ', '') if thrown_str else ''
+                catch_normalized = catch_str.replace('_SCOPE_', '::').replace(' ', '') if catch_str else ''
+
+                # Check for exact match
+                if thrown_normalized == catch_normalized:
+                    return True
+
+                # Check for inheritance: std::runtime_error is a std::exception
+                # C++ standard exception hierarchy: all std::*_error and std::*exception classes inherit from std::exception
+                if catch_normalized in ['std::exception', 'exception']:
+                    # Check if thrown type is a standard exception or error
+                    if thrown_normalized.startswith('std::'):
+                        # Standard library exceptions: std::runtime_error, std::logic_error, std::bad_alloc, etc.
+                        # Pattern: std::*error or std::*exception all inherit from std::exception
+                        if ('error' in thrown_normalized.lower() or
+                            'exception' in thrown_normalized.lower()):
+                            return True
+
+        return False
+
     def get_next_index(self, current_node, node_list):
         """
         Find the next executable statement after current_node.
@@ -465,6 +634,22 @@ class CFGGraph_cpp(CFGGraph):
                 current_node = parent
                 next_node = current_node.next_named_sibling
                 continue
+
+            # Check if parent is a try_statement or catch_clause - skip to next after entire try-catch
+            if parent.type in ["try_statement", "catch_clause"]:
+                # For try/catch blocks, get the next statement after the entire try-catch construct
+                if parent.type == "catch_clause":
+                    # If we're in a catch, need to find the parent try statement first
+                    try_parent = parent.parent
+                    if try_parent and try_parent.type == "try_statement":
+                        current_node = try_parent
+                        next_node = current_node.next_named_sibling
+                        continue
+                else:
+                    # We're at a try_statement, get next sibling
+                    current_node = parent
+                    next_node = current_node.next_named_sibling
+                    continue
 
             # Check if parent is a function definition - end of function
             if parent.type == "function_definition":
@@ -536,7 +721,7 @@ class CFGGraph_cpp(CFGGraph):
 
     def is_last_in_control_block(self, node):
         """
-        Check if a node is the last statement in a control flow block (if/else/loop).
+        Check if a node is the last statement in a control flow block (if/else/loop/try/catch).
         These nodes should NOT have edges added in the sequential flow step,
         as they will be handled by the control flow step.
         """
@@ -552,7 +737,8 @@ class CFGGraph_cpp(CFGGraph):
                 grandparent = parent.parent
                 if grandparent and grandparent.type in [
                     "if_statement", "while_statement", "for_statement",
-                    "for_range_loop", "do_statement", "else_clause"
+                    "for_range_loop", "do_statement", "else_clause",
+                    "catch_clause", "try_statement"
                 ]:
                     return True
 
@@ -571,6 +757,12 @@ class CFGGraph_cpp(CFGGraph):
         if parent.type == "else_clause":
             children = list(parent.named_children)
             if children and node in children:
+                return True
+
+        # Case 4: Parent is a catch_clause or try_statement (exception handling blocks)
+        if parent.type in ["catch_clause", "try_statement"]:
+            body = parent.child_by_field_name("body")
+            if body and body == node:
                 return True
 
         return False
@@ -1721,15 +1913,50 @@ class CFGGraph_cpp(CFGGraph):
                                 if not parent_node:
                                     continue
 
+                                # Check if this "return" is actually a throw statement that escaped the function
+                                return_key = index_to_key.get(return_id)
+                                return_node = self.node_list.get(return_key) if return_key else None
+                                is_throw_statement = return_node and return_node.type == "throw_statement"
+
+                                # If it's a throw that escaped, route it to caller's catch blocks
+                                if is_throw_statement:
+                                    # Find enclosing try block at call site
+                                    caller_parent = parent_node.parent
+                                    found_caller_try = False
+                                    while caller_parent is not None:
+                                        if caller_parent.type == "try_statement":
+                                            # Extract thrown type from the throw statement
+                                            thrown_type = self.extract_thrown_type(return_node)
+
+                                            # Find matching catch clause in caller's try block
+                                            for child in caller_parent.children:
+                                                if child.type == "catch_clause":
+                                                    if (child.start_point, child.end_point, child.type) in self.node_list:
+                                                        # Extract catch parameter type
+                                                        catch_type = self.extract_catch_parameter_type(child)
+
+                                                        # Check if thrown type matches this catch block
+                                                        if self.exception_type_matches(thrown_type, catch_type):
+                                                            catch_index = self.get_index(child)
+                                                            self.add_edge(return_id, catch_index, "function_return")
+                                                            found_caller_try = True
+                                                            break  # Stop at first matching catch
+
+                                            break  # Stop looking for try blocks
+                                        caller_parent = caller_parent.parent
+
+                                    # If found matching catch, skip normal return logic
+                                    if found_caller_try:
+                                        continue
+
                                 # Determine return target based on function return type
                                 # For all functions: return to next statement after call completes
                                 return_target = None
 
                                 if is_implicit_return:
                                     # Implicit return = void function or constructor
-                                    # Return to NEXT statement (no value to evaluate)
-                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                    return_target = next_index if next_index != 2 else None
+                                    # Return to the CALL SITE (parent_id), which already has edges to the next statement
+                                    return_target = parent_id
                                 else:
                                     # Explicit return = may return a value
                                     # Check function's return type
@@ -2889,10 +3116,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to loop header
-                    # BUT: Don't add edge if last statement is a jump statement
+                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
+                    # try_statement manages its own exit paths through try block and catch clauses
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        if not self.is_jump_statement(last_line):
+                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
                             self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Edge to next statement after loop (condition false)
@@ -2921,10 +3149,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to loop header
-                    # BUT: Don't add edge if last statement is a jump statement
+                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
+                    # try_statement manages its own exit paths through try block and catch clauses
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        if not self.is_jump_statement(last_line):
+                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
                             self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Edge to next statement after loop
@@ -2953,10 +3182,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to loop header
-                    # BUT: Don't add edge if last statement is a jump statement
+                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
+                    # try_statement manages its own exit paths through try block and catch clauses
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        if not self.is_jump_statement(last_line):
+                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
                             self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Exit edge
@@ -2985,10 +3215,11 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
                     # Back edge from last statement to do node (condition check)
-                    # BUT: Don't add edge if last statement is a jump statement
+                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
+                    # try_statement manages its own exit paths through try block and catch clauses
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        if not self.is_jump_statement(last_line):
+                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
                             self.add_edge(self.get_index(last_line), current_index, "loop_control")
 
                 # Edge to next statement after loop (condition false)
@@ -3176,18 +3407,29 @@ class CFGGraph_cpp(CFGGraph):
             # THROW STATEMENT
             # ─────────────────────────────────────────────────────────
             elif node.type == "throw_statement":
+                # Extract the type of the thrown exception
+                thrown_type = self.extract_thrown_type(node)
+
                 # Find enclosing try block
                 parent = node.parent
                 found_try = False
                 while parent is not None:
                     if parent.type == "try_statement":
-                        # Jump to catch clauses
+                        # Jump to ONLY the FIRST matching catch clause
+                        # C++ searches catch blocks sequentially and stops at first match
                         for child in parent.children:
                             if child.type == "catch_clause":
                                 if (child.start_point, child.end_point, child.type) in node_list:
-                                    catch_index = self.get_index(child)
-                                    self.add_edge(current_index, catch_index, "throw_exit")
-                                    found_try = True
+                                    # Extract catch parameter type
+                                    catch_type = self.extract_catch_parameter_type(child)
+
+                                    # Check if thrown type matches this catch block
+                                    if self.exception_type_matches(thrown_type, catch_type):
+                                        catch_index = self.get_index(child)
+                                        self.add_edge(current_index, catch_index, "throw_exit")
+                                        found_try = True
+                                        break  # Stop at first matching catch (C++ behavior)
+
                         break
                     parent = parent.parent
 

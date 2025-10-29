@@ -515,9 +515,18 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
     if root_node.type == "catch_clause":
         node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
         # Get the parameter from catch clause
-        catch_parameter = list(filter(lambda child: child.type == "parameter_declaration", root_node.children))
+        catch_parameter = list(filter(lambda child: child.type == "parameter_list", root_node.children))
         if catch_parameter:
-            label = "catch (" + catch_parameter[0].text.decode("UTF-8") + ")"
+            param_text = catch_parameter[0].text.decode("UTF-8")
+            # Strip parentheses if present (they're included in parameter_list)
+            if param_text.startswith("(") and param_text.endswith(")"):
+                param_text = param_text[1:-1]
+
+            # Check for catch-all
+            if param_text.strip() == "...":
+                label = "catch (...)"
+            else:
+                label = "catch (" + param_text + ")"
         else:
             label = "catch (...)"
         type_label = "catch"
