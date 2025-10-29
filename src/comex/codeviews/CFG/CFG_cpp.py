@@ -2016,12 +2016,53 @@ class CFGGraph_cpp(CFGGraph):
 
         return tuple(signature)
 
+    def is_template_parameter(self, type_name):
+        """
+        Check if a type name is a template parameter.
+
+        Template parameters are typically:
+        - Single uppercase letters: T, U, V, K, etc.
+        - Common template parameter names: _Tp, _Ty, TValue, etc.
+        - Type names used in template declarations
+
+        Args:
+            type_name: The type name to check
+
+        Returns:
+            bool: True if type_name is a template parameter
+        """
+        if not type_name:
+            return False
+
+        type_clean = type_name.strip()
+
+        # Check for single uppercase letter (most common convention)
+        # Examples: T, U, V, K, E, etc.
+        if len(type_clean) == 1 and type_clean.isupper():
+            return True
+
+        # Check for common template parameter naming conventions
+        # Examples: _Tp, _Ty, TValue, TKey, etc.
+        if type_clean.startswith('_T') and len(type_clean) <= 4:
+            return True
+
+        if type_clean.startswith('T') and len(type_clean) <= 10 and type_clean[0].isupper():
+            # Likely a template parameter like TValue, TKey, TData
+            # But exclude common types like "Table", "Tree", etc.
+            # by checking if it's not in a known type list
+            common_types = {'Table', 'Tree', 'Time', 'Token', 'Type', 'Text', 'Tuple'}
+            if type_clean not in common_types:
+                return True
+
+        return False
+
     def signatures_match(self, call_sig, func_sig):
         """
         Check if a call signature matches a function signature with lenient matching rules.
 
         Lenient matching rules:
         - Exact match: 'int' matches 'int'
+        - Template parameters: 'T' matches any concrete type like 'int', 'double', etc.
         - Lvalue to value: 'int&' matches 'int' (lvalue can bind to value parameter)
         - Const reference to value: 'const int&' matches 'int'
         - 'unknown' matches any type (for cases where we can't infer the type)
@@ -2045,6 +2086,11 @@ class CFGGraph_cpp(CFGGraph):
 
             # Unknown type matches anything
             if call_type == "unknown" or func_type == "unknown":
+                continue
+
+            # Template parameter matches any concrete type
+            # This handles cases like: template<typename T> where 'T' matches 'int', 'double', etc.
+            if self.is_template_parameter(func_type):
                 continue
 
             # Strip whitespace for comparison
@@ -2421,14 +2467,14 @@ class CFGGraph_cpp(CFGGraph):
                                         continue
 
                                 # Determine return target based on function return type
-                                # For all functions: return to next statement after call completes
+                                # For all functions: return to the CALL SITE (not the next statement)
+                                # This matches Java CFG semantics and creates correct control flow
                                 return_target = None
 
-                                # FIXED: Always return to the NEXT statement after the call site
-                                # The call site is already executed when the function is called
-                                # After the function returns, execution continues with the next statement
-                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                return_target = next_index if next_index != 2 else None
+                                # FIX: Return to the call site (parent_id), NOT to the next statement
+                                # The sequential edge from call site to next statement will handle continuation
+                                # This creates the correct flow: call → function → return → call_site → next
+                                return_target = parent_id
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
@@ -3282,59 +3328,37 @@ class CFGGraph_cpp(CFGGraph):
                                 self.add_lambda_return_edges(lambda_node, lambda_id, parent_id, self.node_list)
 
         # ═══════════════════════════════════════════════════════════
-        # CLEANUP: Remove redundant sequential edges for resolved function calls
+        # CLEANUP: Remove redundant sequential edges for [[noreturn]] functions ONLY
         # ═══════════════════════════════════════════════════════════
-        # After adding all function call edges and function_return edges, we need to clean up
-        # redundant next_line edges from call sites. These edges would create incorrect parallel
-        # execution paths: call -> function AND call -> next (wrong)
-        # Correct flow is: call -> function -> return -> next
+        # FIX: Do NOT remove next_line edges for normal function calls!
+        # The sequential edge is NOT redundant - it represents the program structure.
+        # Correct flow is: call → function → return → call_site → next (via sequential edge)
+        # This matches Java CFG semantics where both call/return edges AND sequential edges exist.
+        #
+        # We ONLY remove next_line edges for [[noreturn]] functions (like std::exit, std::terminate)
+        # because these functions never return to the caller.
         edges_to_remove = []
 
-        # Remove next_line edges for regular function calls that resolved to known functions
+        # Remove next_line edges ONLY for [[noreturn]] functions
         for (func_name, signature), call_list in self.records["function_calls"].items():
             # Find matching function definition
             for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                 if fn_name == func_name and self.signatures_match(signature, fn_sig):
-                    # This call resolved to a known function
                     # Check if the function has [[noreturn]] attribute
                     has_noreturn = False
                     if fn_id in self.records.get("attributed_functions", {}):
                         attributes = self.records["attributed_functions"][fn_id]
                         has_noreturn = "noreturn" in attributes
 
-                    for call_id, parent_id in call_list:
-                        # Check if this is an indirect lambda invocation (already handled above)
-                        # If so, don't remove the next_line edge
-                        parent_key = index_to_key.get(parent_id)
-                        if parent_key:
-                            parent_node = self.node_list.get(parent_key)
-                            if parent_node:
-                                containing_func = self.get_containing_function(parent_node)
-                                if containing_func:
-                                    containing_func_key = (containing_func.start_point, containing_func.end_point, containing_func.type)
-                                    if containing_func_key in self.node_list:
-                                        containing_func_id = self.get_index(containing_func)
-                                        param_key = (containing_func_id, func_name)
-                                        if param_key in self.records["function_parameter_to_lambda"]:
-                                            # This is an indirect lambda invocation, keep next_line edge
-                                            # (it will be removed later when we add lambda_invocation edge)
-                                            continue
-
-                        # For regular function calls or [[noreturn]] functions, remove next_line edge
-                        if has_noreturn or fn_id:
+                    # ONLY remove next_line edge for [[noreturn]] functions
+                    if has_noreturn:
+                        for call_id, parent_id in call_list:
                             for edge in self.CFG_edge_list:
                                 if edge[0] == parent_id and edge[2] == "next_line":
                                     edges_to_remove.append(edge)
                                     break
 
-        # NOTE: We do NOT remove next_line edges for indirect lambda invocations
-        # Because the control flow is:
-        #   call_site -> lambda_body (invocation)
-        #   lambda_exit -> call_site (return to complete call)
-        #   call_site -> next_statement (continue execution via next_line edge)
-        # The next_line edge is essential for continuing execution after the lambda returns
-
-        # Remove marked edges
+        # Remove marked edges (only for [[noreturn]] functions)
         for edge in edges_to_remove:
             if edge in self.CFG_edge_list:
                 self.CFG_edge_list.remove(edge)
