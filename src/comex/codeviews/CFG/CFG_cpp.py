@@ -50,6 +50,9 @@ class CFGGraph_cpp(CFGGraph):
             "attributed_functions": {},            # function_id → [attributes]
             "function_pointer_assignments": {},    # pointer_var → [function_names]
             "indirect_calls": {},                  # (pointer_var, sig) → [(call_id, parent_id)]
+            "lambda_variables": {},                # lambda_var_name → lambda_node_key
+            "lambda_arguments": {},                # (call_id, arg_index) → lambda_var_name
+            "function_parameter_to_lambda": {},    # (function_id, param_name) → lambda_var_name
         }
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
@@ -1250,6 +1253,9 @@ class CFGGraph_cpp(CFGGraph):
                     args_node = root_node.child_by_field_name("arguments")
                     signature = self.get_call_signature(args_node)
 
+                    # Track lambda arguments for indirect invocation handling
+                    self.track_lambda_arguments(root_node, call_index)
+
                     # Track indirect calls separately
                     if is_indirect_call and pointer_var:
                         key = (pointer_var, signature)
@@ -2154,6 +2160,9 @@ class CFGGraph_cpp(CFGGraph):
                 if fn_name == func_name and self.signatures_match(signature, fn_sig):
                     # Found matching function with matching signature (overload resolution)
                     for call_id, parent_id in call_list:
+                        # Map function parameters to lambda arguments (if any lambdas are passed)
+                        self.map_function_parameters_to_lambdas(fn_id, call_id)
+
                         # Add call edge: caller -> function
                         self.add_edge(parent_id, fn_id, f"function_call|{call_id}")
 
@@ -3045,30 +3054,219 @@ class CFGGraph_cpp(CFGGraph):
                                                             self.add_edge(return_id, return_target, "indirect_return")
 
         # ═══════════════════════════════════════════════════════════
-        # CLEANUP: Remove sequential edges after [[noreturn]] function calls
+        # INDIRECT LAMBDA INVOCATIONS: Handle calls to function parameters that are lambdas
         # ═══════════════════════════════════════════════════════════
-        # After adding all function call edges, remove next_line edges from statements
-        # that call [[noreturn]] functions, since those calls never return
+        # Example:
+        #   void myFunction(function<void()> func) { func(); }
+        #   myFunction(message);  // message is a lambda
+        # When func() is called inside myFunction, it should invoke the lambda body
+        for (func_name, signature), call_list in self.records["function_calls"].items():
+            # Check if any of these calls are actually indirect lambda invocations
+            for call_id, parent_id in call_list:
+                # Find the containing function for this call
+                parent_key = index_to_key.get(parent_id)
+                if not parent_key:
+                    continue
+                parent_node = self.node_list.get(parent_key)
+                if not parent_node:
+                    continue
+
+                containing_func = self.get_containing_function(parent_node)
+                if not containing_func:
+                    continue
+
+                containing_func_key = (containing_func.start_point, containing_func.end_point, containing_func.type)
+                if containing_func_key not in self.node_list:
+                    continue
+
+                containing_func_id = self.get_index(containing_func)
+
+                # Check if func_name is a parameter of containing_func that maps to a lambda
+                param_key = (containing_func_id, func_name)
+                if param_key in self.records["function_parameter_to_lambda"]:
+                    # This is an indirect lambda invocation!
+                    lambda_var = self.records["function_parameter_to_lambda"][param_key]
+                    lambda_key = self.records["lambda_variables"].get(lambda_var)
+
+                    if lambda_key:
+                        lambda_node = self.node_list.get(lambda_key)
+                        if lambda_node:
+                            # Get the first statement in the lambda body
+                            lambda_body_first_id = self.get_lambda_body_first_stmt(lambda_node, self.node_list)
+
+                            if lambda_body_first_id:
+                                # Create invocation edge from call site to lambda body
+                                self.add_edge(parent_id, lambda_body_first_id, "lambda_invocation")
+
+                                # Create return edges from lambda exit points to statement after call
+                                lambda_id = self.index[lambda_key]
+                                self.add_lambda_return_edges(lambda_node, lambda_id, parent_id, self.node_list)
+
+        # ═══════════════════════════════════════════════════════════
+        # CLEANUP: Remove redundant sequential edges for resolved function calls
+        # ═══════════════════════════════════════════════════════════
+        # After adding all function call edges and function_return edges, we need to clean up
+        # redundant next_line edges from call sites. These edges would create incorrect parallel
+        # execution paths: call -> function AND call -> next (wrong)
+        # Correct flow is: call -> function -> return -> next
         edges_to_remove = []
+
+        # Remove next_line edges for regular function calls that resolved to known functions
         for (func_name, signature), call_list in self.records["function_calls"].items():
             # Find matching function definition
             for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                 if fn_name == func_name and self.signatures_match(signature, fn_sig):
+                    # This call resolved to a known function
                     # Check if the function has [[noreturn]] attribute
+                    has_noreturn = False
                     if fn_id in self.records.get("attributed_functions", {}):
                         attributes = self.records["attributed_functions"][fn_id]
-                        if "noreturn" in attributes:
-                            # This is a [[noreturn]] function - remove next_line edges from its call sites
-                            for call_id, parent_id in call_list:
-                                # Find and mark for removal any next_line edge from parent_id
-                                for edge in self.CFG_edge_list:
-                                    if edge[0] == parent_id and edge[2] == "next_line":
-                                        edges_to_remove.append(edge)
+                        has_noreturn = "noreturn" in attributes
+
+                    for call_id, parent_id in call_list:
+                        # Check if this is an indirect lambda invocation (already handled above)
+                        # If so, don't remove the next_line edge
+                        parent_key = index_to_key.get(parent_id)
+                        if parent_key:
+                            parent_node = self.node_list.get(parent_key)
+                            if parent_node:
+                                containing_func = self.get_containing_function(parent_node)
+                                if containing_func:
+                                    containing_func_key = (containing_func.start_point, containing_func.end_point, containing_func.type)
+                                    if containing_func_key in self.node_list:
+                                        containing_func_id = self.get_index(containing_func)
+                                        param_key = (containing_func_id, func_name)
+                                        if param_key in self.records["function_parameter_to_lambda"]:
+                                            # This is an indirect lambda invocation, keep next_line edge
+                                            # (it will be removed later when we add lambda_invocation edge)
+                                            continue
+
+                        # For regular function calls or [[noreturn]] functions, remove next_line edge
+                        if has_noreturn or fn_id:
+                            for edge in self.CFG_edge_list:
+                                if edge[0] == parent_id and edge[2] == "next_line":
+                                    edges_to_remove.append(edge)
+                                    break
+
+        # NOTE: We do NOT remove next_line edges for indirect lambda invocations
+        # Because the control flow is:
+        #   call_site -> lambda_body (invocation)
+        #   lambda_exit -> call_site (return to complete call)
+        #   call_site -> next_statement (continue execution via next_line edge)
+        # The next_line edge is essential for continuing execution after the lambda returns
 
         # Remove marked edges
         for edge in edges_to_remove:
             if edge in self.CFG_edge_list:
                 self.CFG_edge_list.remove(edge)
+
+    def track_lambda_variables(self, node_list):
+        """
+        Early pass to identify and track lambda variables.
+        This must be called before function_list() so that lambda arguments can be tracked.
+
+        Populates self.records["lambda_variables"]: lambda_var_name -> lambda_node_key
+        """
+        for lambda_key, statement_node in self.records["lambda_map"].items():
+            # Extract the variable name this lambda is assigned to
+            var_name = self.extract_lambda_variable_name(statement_node, self.node_list.get(lambda_key))
+
+            if var_name:
+                # Store lambda variable mapping
+                self.records["lambda_variables"][var_name] = lambda_key
+
+    def track_lambda_arguments(self, call_expression_node, call_index):
+        """
+        Track when lambda variables are passed as function arguments.
+        This enables connecting indirect lambda invocations to lambda bodies.
+
+        Example:
+            auto f = []() { ... };
+            myFunction(f);  // Track that 'f' is passed to myFunction
+
+        Args:
+            call_expression_node: The call_expression AST node
+            call_index: The index of this call expression
+        """
+        args_node = call_expression_node.child_by_field_name("arguments")
+        if not args_node:
+            return
+
+        # Extract argument identifiers
+        arg_index = 0
+        for child in args_node.named_children:
+            if child.type == "identifier":
+                arg_name = child.text.decode('utf-8')
+                # Check if this identifier is a lambda variable
+                if arg_name in self.records["lambda_variables"]:
+                    # Record this lambda argument
+                    key = (call_index, arg_index)
+                    self.records["lambda_arguments"][key] = arg_name
+                arg_index += 1
+            elif child.type == "call_expression":
+                # Skip nested calls
+                arg_index += 1
+            else:
+                # Other expressions (literals, binary expressions, etc.)
+                arg_index += 1
+
+    def map_function_parameters_to_lambdas(self, fn_id, call_id):
+        """
+        Map function parameters to lambda variables when lambdas are passed as arguments.
+
+        Example:
+            void myFunction(function<void()> func) { ... }  // fn_id = function definition
+            myFunction(message);  // call_id = function call, message is a lambda
+
+        This creates a mapping: (fn_id, "func") -> "message"
+
+        Args:
+            fn_id: The function definition node ID
+            call_id: The function call node ID
+        """
+        # Find the function definition node
+        index_to_key = {v: k for k, v in self.index.items()}
+        fn_key = index_to_key.get(fn_id)
+        if not fn_key:
+            return
+
+        fn_node = self.node_list.get(fn_key)
+        if not fn_node or fn_node.type != "function_definition":
+            return
+
+        # Extract parameter names from function definition
+        declarator = fn_node.child_by_field_name("declarator")
+        if not declarator:
+            return
+
+        parameters = declarator.child_by_field_name("parameters")
+        if not parameters:
+            return
+
+        # Get parameter names in order
+        param_names = []
+        for param in parameters.named_children:
+            if param.type == "parameter_declaration":
+                # Extract parameter name
+                declarator_child = param.child_by_field_name("declarator")
+                if declarator_child:
+                    if declarator_child.type == "identifier":
+                        param_names.append(declarator_child.text.decode('utf-8'))
+                    elif declarator_child.type == "reference_declarator":
+                        # Handle reference parameters: function<void()>& func
+                        for child in declarator_child.named_children:
+                            if child.type == "identifier":
+                                param_names.append(child.text.decode('utf-8'))
+                                break
+
+        # Match parameters with lambda arguments
+        for arg_index, param_name in enumerate(param_names):
+            key = (call_id, arg_index)
+            if key in self.records["lambda_arguments"]:
+                lambda_var = self.records["lambda_arguments"][key]
+                # Create mapping: (function_id, param_name) -> lambda_var
+                param_key = (fn_id, param_name)
+                self.records["function_parameter_to_lambda"][param_key] = lambda_var
 
     def extract_lambda_variable_name(self, statement_node, lambda_node):
         """
@@ -3301,6 +3499,11 @@ class CFGGraph_cpp(CFGGraph):
                 var_name = self.extract_lambda_variable_name(statement_node, lambda_node)
 
                 if var_name:
+                    # lambda_variables should already be populated in STEP 3.6
+                    # But we'll ensure it's set here as well for safety
+                    if var_name not in self.records["lambda_variables"]:
+                        self.records["lambda_variables"][var_name] = lambda_key
+
                     # Find all call sites for this variable
                     call_sites = self.find_lambda_call_sites(var_name, statement_node)
 
@@ -3357,6 +3560,12 @@ class CFGGraph_cpp(CFGGraph):
         # ═══════════════════════════════════════════════════════════
         for key, node in node_list.items():
             if node.type in self.statement_types["non_control_statement"]:
+                # Skip lambda_expression nodes - they don't have sequential flow
+                # Lambda expressions are only executed when invoked, not when defined
+                # The lambda body will be connected via lambda_invocation edges
+                if node.type == "lambda_expression":
+                    continue
+
                 # Skip if last in control block (will be handled later)
                 if self.is_last_in_control_block(node):
                     continue
@@ -3451,16 +3660,10 @@ class CFGGraph_cpp(CFGGraph):
                         # Next node is at global scope - skip edge
                         continue
 
-                    # FIX #5: Skip next_line edge for statements containing function calls
-                    # When a statement contains a function call, control transfers TO the function,
-                    # and then returns FROM the function to the next statement via function_return edge.
-                    # Creating a direct next_line edge would incorrectly show parallel execution paths.
-                    # Example: call(); next_stmt; should be: call -> function -> return -> next_stmt
-                    # NOT: call -> function AND call -> next_stmt (parallel)
-                    if self.contains_function_call(node):
-                        # Skip creating next_line edge - function_return edge will handle flow
-                        continue
-
+                    # NOTE: We always create next_line edges here, even for function calls
+                    # Later, in add_function_call_edges, we'll remove redundant next_line edges
+                    # for calls that resolve to known functions with function_return edges.
+                    # This ensures unresolved calls (like lambda parameters) still have sequential flow.
                     current_index = self.get_index(node)
                     self.add_edge(current_index, next_index, "next_line")
 
@@ -3474,6 +3677,12 @@ class CFGGraph_cpp(CFGGraph):
         # STEP 3.5: Track namespace aliases
         # ═══════════════════════════════════════════════════════════
         self.track_namespace_aliases(self.root_node)
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 3.6: Track lambda variables
+        # ═══════════════════════════════════════════════════════════
+        # Must be done before STEP 4 (function_list) so that lambda arguments can be tracked
+        self.track_lambda_variables(node_list)
 
         # ═══════════════════════════════════════════════════════════
         # STEP 4: Build function/method call map
@@ -4113,17 +4322,10 @@ class CFGGraph_cpp(CFGGraph):
                     # Edge from parent statement to lambda expression (definition-time evaluation)
                     self.add_edge(parent_id, current_index, "lambda_definition")
 
-                    # Edge from lambda expression to next statement
-                    # This replaces the direct parent -> next edge that was created in STEP 2
-                    next_index, next_node = self.get_next_index(parent, node_list)
-                    if next_index != 2 and next_node is not None:
-                        self.add_edge(current_index, next_index, "next_line")
-
-                        # Remove the direct edge from parent to next (it's now parent -> lambda -> next)
-                        self.CFG_edge_list = [
-                            edge for edge in self.CFG_edge_list
-                            if not (edge[0] == parent_id and edge[1] == next_index and edge[2] == 'next_line')
-                        ]
+                    # NOTE: We do NOT create next_line edges from lambda expressions
+                    # Lambda expressions are only executed when invoked, not when defined
+                    # Sequential flow continues directly from the parent declaration to the next statement
+                    # The lambda BODY is connected via lambda_invocation edges (created in add_lambda_edges)
 
         # ═══════════════════════════════════════════════════════════
         # STEP 6.5: Connect dangling paths to implicit returns
