@@ -370,7 +370,7 @@ def is_template_specialization(node):
 
 
 def get_signature(node):
-    """Extract function signature (parameter types)"""
+    """Extract function signature (parameter types) including reference qualifiers"""
     signature = []
     parameter_list = node.child_by_field_name('parameters')
     if parameter_list is None:
@@ -378,11 +378,32 @@ def get_signature(node):
 
     parameters = list(filter(lambda x: x.type == 'parameter_declaration' or x.type == 'optional_parameter_declaration', parameter_list.children))
     for parameter in parameters:
-        # Get the type from parameter
+        # Get the base type from parameter
+        base_type = None
         for child in parameter.children:
             if child.type in ['primitive_type', 'type_identifier', 'template_type', 'qualified_identifier', 'sized_type_specifier']:
-                signature.append(child.text.decode('utf-8'))
+                base_type = child.text.decode('utf-8')
                 break
+
+        if base_type:
+            # Check for reference/pointer declarator
+            declarator = parameter.child_by_field_name('declarator')
+            if declarator:
+                if declarator.type == 'reference_declarator':
+                    # Check if it's rvalue reference (&&) or lvalue reference (&)
+                    declarator_text = declarator.text.decode('utf-8')
+                    if declarator_text.startswith('&&'):
+                        signature.append(base_type + '&&')
+                    else:
+                        signature.append(base_type + '&')
+                elif declarator.type == 'pointer_declarator':
+                    signature.append(base_type + '*')
+                else:
+                    # Other declarator types (array, etc.)
+                    signature.append(base_type)
+            else:
+                # No declarator, just base type
+                signature.append(base_type)
     return tuple(signature)
 
 

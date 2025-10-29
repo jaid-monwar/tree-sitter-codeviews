@@ -372,12 +372,12 @@ class CFGGraph_cpp(CFGGraph):
                             if gc.type in ["identifier", "field_identifier"]:
                                 fn_name = gc.text.decode('utf-8')
                             elif gc.type == "parameter_list":
-                                # Extract parameter types
+                                # Extract parameter types with reference qualifiers
                                 for param in gc.named_children:
                                     if param.type == "parameter_declaration":
-                                        param_type_node = param.child_by_field_name("type")
-                                        if param_type_node:
-                                            fn_sig.append(param_type_node.text.decode('utf-8'))
+                                        param_type = self.extract_parameter_type(param)
+                                        if param_type:
+                                            fn_sig.append(param_type)
                             elif gc.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
                                 # Recurse
                                 extract_from_declarator(gc)
@@ -394,6 +394,51 @@ class CFGGraph_cpp(CFGGraph):
                 if key not in self.records["function_list"]:
                     # Add it
                     self.records["function_list"][key] = fn_id
+
+    def extract_parameter_type(self, param_node):
+        """
+        Extract the full parameter type from a parameter_declaration node,
+        including reference qualifiers (&, &&) and pointer qualifiers (*).
+
+        For example:
+        - int x → "int"
+        - int& x → "int&"
+        - int&& x → "int&&"
+        - const int& x → "const int&"
+        - int* x → "int*"
+        """
+        if param_node is None or param_node.type != "parameter_declaration":
+            return None
+
+        # Get base type
+        param_type_node = param_node.child_by_field_name("type")
+        if not param_type_node:
+            return None
+
+        base_type = param_type_node.text.decode('utf-8')
+
+        # Check declarator for reference/pointer qualifiers
+        param_declarator = param_node.child_by_field_name("declarator")
+        if param_declarator:
+            # Handle reference_declarator (& or &&)
+            if param_declarator.type == "reference_declarator":
+                # Check if it's rvalue reference (&&) or lvalue reference (&)
+                declarator_text = param_declarator.text.decode('utf-8')
+                if declarator_text.startswith("&&"):
+                    return base_type + "&&"
+                else:
+                    return base_type + "&"
+            # Handle pointer_declarator (*)
+            elif param_declarator.type == "pointer_declarator":
+                return base_type + "*"
+            # Handle nested declarators (e.g., int*& - reference to pointer)
+            # For simplicity, use the full declarator text minus the identifier
+            # This is a simplified approach; a full implementation would recursively parse
+            else:
+                # Fallback: just return base type
+                return base_type
+
+        return base_type
 
     def get_base_classes(self, class_node):
         """
@@ -1720,15 +1765,63 @@ class CFGGraph_cpp(CFGGraph):
 
     def get_argument_type(self, arg_node):
         """
-        Infer the type of an argument expression for C++.
-        Simplified implementation - returns "unknown" for complex cases.
+        Infer the type of an argument expression for C++ with value category detection.
+        Returns type with appropriate reference qualifier (&, &&, or none).
+
+        Value categories:
+        - Lvalues (identifiers, dereferencing) → append '&'
+        - Rvalues (literals, temporaries) → no qualifier (prvalues) or '&&' (xvalues)
+        - std::move() → append '&&'
+        - std::forward<T>() → preserve T's reference type
         """
         if arg_node is None:
             return "unknown"
 
         node_type = arg_node.type
 
-        # Identifiers - would need symbol table lookup
+        # Handle std::move() and std::forward() - these are call_expressions
+        if node_type == "call_expression":
+            function_node = arg_node.child_by_field_name("function")
+
+            # Check for std::move
+            if function_node:
+                func_text = function_node.text.decode('utf-8')
+
+                # std::move(expr) → converts to rvalue reference
+                if func_text in ["std::move", "move"]:
+                    # Get the argument to std::move
+                    args_node = arg_node.child_by_field_name("arguments")
+                    if args_node and len(args_node.named_children) > 0:
+                        inner_arg = args_node.named_children[0]
+                        base_type = self.get_argument_type(inner_arg)
+                        # Remove any existing reference qualifiers
+                        base_type = base_type.rstrip('&').rstrip()
+                        return base_type + "&&"
+
+                # std::forward<T>(expr) → preserves reference category of T
+                elif func_text in ["std::forward", "forward"] or "forward" in func_text:
+                    # Try to extract template argument T from template_function node
+                    if function_node.type == "template_function":
+                        # Structure: template_function -> identifier + template_argument_list
+                        for child in function_node.named_children:
+                            if child.type == "template_argument_list":
+                                # Get first template argument
+                                if len(child.named_children) > 0:
+                                    template_arg = child.named_children[0]
+                                    return template_arg.text.decode('utf-8')
+
+                    # Fallback: preserve the argument's type
+                    args_node = arg_node.child_by_field_name("arguments")
+                    if args_node and len(args_node.named_children) > 0:
+                        inner_arg = args_node.named_children[0]
+                        return self.get_argument_type(inner_arg)
+
+                # Other function calls - check return type
+                # For now, return value (no reference qualifier)
+                # TODO: Look up function return type from function_list
+                return "unknown"
+
+        # Identifiers - lvalues (unless declared as rvalue reference)
         if node_type == "identifier":
             arg_index_key = (arg_node.start_point, arg_node.end_point, arg_node.type)
             if arg_index_key in self.index:
@@ -1736,10 +1829,23 @@ class CFGGraph_cpp(CFGGraph):
                 if arg_index in self.declaration_map:
                     decl_index = self.declaration_map[arg_index]
                     if decl_index in self.symbol_table["data_type"]:
-                        return self.symbol_table["data_type"][decl_index]
+                        data_type = self.symbol_table["data_type"][decl_index]
+
+                        # If the variable is already declared as an rvalue reference (int&&),
+                        # it's an lvalue (has a name), so treat it as lvalue reference
+                        # "int&&" variable named 'x' → when used, it's an lvalue → "int&"
+                        if data_type.endswith("&&"):
+                            base_type = data_type[:-2].rstrip()
+                            return base_type + "&"
+                        # If already a reference type, keep it
+                        elif data_type.endswith("&"):
+                            return data_type
+                        # Otherwise, it's a regular variable → lvalue
+                        else:
+                            return data_type + "&"
             return "unknown"
 
-        # Literals
+        # Literals - always rvalues (prvalues, no reference)
         elif node_type == "number_literal":
             text = arg_node.text.decode('utf-8').lower()
             if '.' in text or 'e' in text:
@@ -1758,6 +1864,35 @@ class CFGGraph_cpp(CFGGraph):
 
         elif node_type == "nullptr":
             return "nullptr_t"
+
+        # Pointer dereference (*ptr) - lvalue
+        elif node_type == "pointer_expression":
+            # Get what's being dereferenced
+            for child in arg_node.named_children:
+                base_type = self.get_argument_type(child)
+                # Remove pointer qualifier, add lvalue reference
+                if base_type.endswith("*"):
+                    return base_type[:-1].rstrip() + "&"
+                else:
+                    return base_type.rstrip('&').rstrip() + "&"
+
+        # Array subscript (arr[i]) - lvalue
+        elif node_type == "subscript_expression":
+            # Get the array type
+            argument = arg_node.child_by_field_name("argument")
+            if argument:
+                base_type = self.get_argument_type(argument)
+                # Remove reference qualifiers and add lvalue reference
+                return base_type.rstrip('&').rstrip() + "&"
+
+        # Member access (obj.member) - depends on member, but typically lvalue
+        elif node_type == "field_expression":
+            # For simplicity, treat as lvalue
+            return "unknown&"
+
+        # Temporary object construction (MyVector(25)) - rvalue
+        # This is a call_expression but not to a known function
+        # Already handled above in call_expression with "unknown" return
 
         return "unknown"
 
@@ -1899,8 +2034,8 @@ class CFGGraph_cpp(CFGGraph):
         for (func_name, signature), call_list in self.records["function_calls"].items():
             # Find matching function definition
             for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                if fn_name == func_name:
-                    # Found matching function
+                if fn_name == func_name and signature == fn_sig:
+                    # Found matching function with matching signature (overload resolution)
                     for call_id, parent_id in call_list:
                         # Add call edge: caller -> function
                         self.add_edge(parent_id, fn_id, f"function_call|{call_id}")
@@ -1961,34 +2096,11 @@ class CFGGraph_cpp(CFGGraph):
                                 # For all functions: return to next statement after call completes
                                 return_target = None
 
-                                if is_implicit_return:
-                                    # Implicit return = void function or constructor
-                                    # Return to the CALL SITE (parent_id), which already has edges to the next statement
-                                    return_target = parent_id
-                                else:
-                                    # Explicit return = may return a value
-                                    # Check function's return type
-                                    fn_key = None
-                                    for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
-                                        if fn_id_check == fn_id:
-                                            fn_key = ((class_name_check, fn_name_check), fn_sig_check)
-                                            break
-
-                                    is_void_return = False
-                                    if fn_key and fn_key in self.records["return_type"]:
-                                        ret_type = self.records["return_type"][fn_key]
-                                        is_void_return = ret_type == "void"
-
-                                    if is_void_return:
-                                        # Void function with explicit return
-                                        # Return to NEXT statement
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
-                                    else:
-                                        # Non-void function (returns a value)
-                                        # Return to CALL SITE to complete the expression
-                                        # The call site then naturally flows to the next statement via next_line edge
-                                        return_target = parent_id
+                                # FIXED: Always return to the NEXT statement after the call site
+                                # The call site is already executed when the function is called
+                                # After the function returns, execution continues with the next statement
+                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                return_target = next_index if next_index != 2 else None
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
@@ -2027,10 +2139,10 @@ class CFGGraph_cpp(CFGGraph):
                 if object_name and object_name in self.template_instantiations:
                     template_instantiation = self.template_instantiations[object_name]
 
-                # Find matching function(s)
+                # Find matching function(s) with signature matching for overload resolution
                 matching_functions = []
                 for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                    if fn_name == method_name:
+                    if fn_name == method_name and signature == fn_sig:
                         matching_functions.append((fn_id, class_name))
 
                 # Determine target function(s) and whether it's a virtual call
@@ -2147,8 +2259,8 @@ class CFGGraph_cpp(CFGGraph):
             # Find matching static method in function_list
             # Static methods are stored with class name and function name
             for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                if fn_class_name == class_name and fn_name == method_name:
-                    # Found matching static method
+                if fn_class_name == class_name and fn_name == method_name and signature == fn_sig:
+                    # Found matching static method with matching signature (overload resolution)
                     for call_id, parent_id in call_list:
                         # Add call edge: caller -> static method
                         self.add_edge(parent_id, fn_id, f"static_call|{call_id}")
@@ -2172,35 +2284,9 @@ class CFGGraph_cpp(CFGGraph):
                                 # For all methods: return to next statement after call completes
                                 return_target = None
 
-                                if is_implicit_return:
-                                    # Implicit return = void function
-                                    # Return to NEXT statement (no value to evaluate)
-                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                    return_target = next_index if next_index != 2 else None
-                                else:
-                                    # Explicit return = may return a value
-                                    # Check method's return type
-                                    fn_key = None
-                                    for ((class_name_check, fn_name_check), fn_sig_check), fn_id_check in self.records["function_list"].items():
-                                        if fn_id_check == fn_id:
-                                            fn_key = ((class_name_check, fn_name_check), fn_sig_check)
-                                            break
-
-                                    is_void_return = False
-                                    if fn_key and fn_key in self.records["return_type"]:
-                                        ret_type = self.records["return_type"][fn_key]
-                                        is_void_return = ret_type == "void"
-
-                                    if is_void_return:
-                                        # Void function with explicit return
-                                        # Return to NEXT statement
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
-                                    else:
-                                        # Non-void function (returns a value)
-                                        # Return to CALL SITE to complete the expression
-                                        # The call site then naturally flows to the next statement via next_line edge
-                                        return_target = parent_id
+                                # FIXED: Always return to the NEXT statement after the call site
+                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                return_target = next_index if next_index != 2 else None
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
@@ -2328,10 +2414,9 @@ class CFGGraph_cpp(CFGGraph):
                                 continue
 
                             # Determine return target
-                            # For operators that return values, return to call site
-                            # Assignment operator returns a reference (for chaining), so return to call site
-                            # The call site then naturally flows to the next statement via next_line edge
-                            return_target = parent_id
+                            # FIXED: Return to next statement after operator call
+                            next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                            return_target = next_index if next_index != 2 else None
 
                             if parent_id != fn_id and return_target:
                                 # Get return node from index
@@ -2393,7 +2478,9 @@ class CFGGraph_cpp(CFGGraph):
                                     continue
 
                                 # Allow implicit numeric conversions
-                                numeric_types = ['int', 'double', 'float', 'long', 'short', 'char']
+                                numeric_types = ['int', 'double', 'float', 'long', 'short', 'char',
+                                                 'size_t', 'uint', 'int8', 'int16', 'int32', 'int64',
+                                                 'uint8', 'uint16', 'uint32', 'uint64', 'ptrdiff']
                                 fn_is_numeric = any(nt in fn_param_simple for nt in numeric_types)
                                 call_is_numeric = any(nt in call_param_simple for nt in numeric_types)
 
@@ -2457,15 +2544,9 @@ class CFGGraph_cpp(CFGGraph):
                                             else:
                                                 return_target = None
                                     else:
-                                        # Check if this is a constructor call in a return statement
-                                        if parent_node.type == "return_statement":
-                                            # Constructor in return statement: return to the return statement itself
-                                            return_target = parent_id
-                                        else:
-                                            # Regular constructor call from declaration
-                                            # Return should go back to the call site (the declaration statement)
-                                            # The declaration then naturally flows to the next statement via next_line edge
-                                            return_target = parent_id
+                                        # FIXED: Always return to next statement after constructor call
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        return_target = next_index if next_index != 2 else None
 
                                     if is_implicit_return:
                                         # FIX #2: For implicit returns, connect from last statement of constructor body
@@ -3179,11 +3260,10 @@ class CFGGraph_cpp(CFGGraph):
             # CLASS / STRUCT DEFINITION
             # ─────────────────────────────────────────────────────────
             elif node.type in ["class_specifier", "struct_specifier"]:
-                # Edge to first member/method
-                first_line = self.edge_first_line(node, node_list)
-                if first_line:
-                    first_index, first_node = first_line
-                    self.add_edge(current_index, first_index, "class_next")
+                # Classes/structs are compile-time constructs, not runtime execution nodes
+                # Their member functions are separate nodes with their own control flow
+                # Class declarations should not have sequential control flow edges in the CFG
+                pass
 
             # ─────────────────────────────────────────────────────────
             # NAMESPACE DEFINITION
