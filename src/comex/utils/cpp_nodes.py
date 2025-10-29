@@ -41,11 +41,13 @@ statement_types = {
         "static_assert_declaration", # Static assertions
         # "using_declaration",      # Excluded: compile-time only (duplicate, already commented above)
         "namespace_alias_definition", # Namespace aliases
-        # Preprocessor directives excluded - they are compile-time only, not runtime:
-        # "preproc_include",        # Excluded: preprocessor directive
-        # "preproc_def",            # Excluded: preprocessor directive
-        # "preproc_ifdef",          # Excluded: preprocessor directive
-        # "preproc_if",             # Excluded: preprocessor directive
+        # Preprocessor directives - INCLUDED for macro extraction and conditional evaluation:
+        "preproc_include",        # Include directives (won't be added to CFG, just processed)
+        "preproc_def",            # Macro definitions (extracted for condition evaluation)
+        "preproc_ifdef",          # Conditional compilation
+        "preproc_if",             # Conditional compilation
+        "preproc_elif",           # Conditional compilation continuation
+        "preproc_else",           # Conditional compilation alternative
     ],
     "non_control_statement": [
         "declaration",
@@ -528,12 +530,63 @@ def get_class_name(node, index):
     return None
 
 
-def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, records={}):
+def evaluate_preprocessor_condition(condition_text, macro_definitions):
+    """
+    Evaluate a preprocessor condition based on defined macros.
+    Returns True if the condition is satisfied, False otherwise, None if cannot evaluate.
+
+    Supports:
+    - #ifdef MACRO
+    - #ifndef MACRO
+    - #if MACRO == VALUE
+    - #if defined(MACRO)
+    - Simple comparisons and logic
+    """
+    import re
+
+    # Handle #ifdef and #ifndef (already processed, just check for identifier)
+    if not any(op in condition_text for op in ['==', '!=', '>', '<', '&&', '||', 'defined']):
+        # Simple identifier check for #ifdef
+        identifier = condition_text.strip()
+        return identifier in macro_definitions
+
+    # Handle #if defined(MACRO)
+    defined_pattern = r'defined\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)'
+    condition_text = re.sub(defined_pattern,
+                           lambda m: '1' if m.group(1) in macro_definitions else '0',
+                           condition_text)
+
+    # Replace macro names with their values
+    for macro, value in macro_definitions.items():
+        # Use word boundaries to avoid partial replacements
+        condition_text = re.sub(r'\b' + macro + r'\b', str(value), condition_text)
+
+    # Try to evaluate the expression
+    try:
+        # Safe evaluation of simple expressions
+        # Only allow basic operators and numbers
+        if re.match(r'^[\d\s+\-*/<>=!&|()]+$', condition_text):
+            result = eval(condition_text)
+            return bool(result)
+    except:
+        pass
+
+    return None  # Cannot evaluate
+
+
+def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, records={}, macro_definitions=None):
     """
     Returns statement level nodes recursively from the concrete syntax tree passed to it.
     Uses records to maintain required supplementary information.
     node_list maintains an intermediate representation and graph_node_list returns the final list.
+
+    Args:
+        macro_definitions: Dictionary of defined macros {name: value} for preprocessor evaluation
     """
+    import os  # For debug logging
+
+    if macro_definitions is None:
+        macro_definitions = {}
 
     if root_node.type == "catch_clause":
         node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
@@ -554,6 +607,23 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
             label = "catch (...)"
         type_label = "catch"
         graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
+
+    elif root_node.type in ["preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
+                            "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else"]:
+        # Handle preprocessor directives specially - they should NOT be added to graph_node_list
+        # Only process them for macro extraction and conditional evaluation
+        # The actual traversal logic is at the end of this function
+
+        if root_node.type == "preproc_def":
+            # Extract macro definitions for use in condition evaluation
+            text = root_node.text.decode("UTF-8")
+            parts = text.split(None, 2)  # Split into #define, name, value
+            if len(parts) >= 2:
+                macro_name = parts[1]
+                macro_value = parts[2].strip() if len(parts) > 2 else "1"
+                macro_definitions[macro_name] = macro_value
+                if os.environ.get('DEBUG_PREPROC'):
+                    print(f"[DEFINE] {macro_name} = {macro_value}")
 
     elif root_node.type in statement_types["node_list_type"]:
         # Skip function declarations (forward declarations without bodies)
@@ -971,25 +1041,6 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     label = label[:77] + "..."
                 type_label = "using"
 
-            elif root_node.type == "preproc_include":
-                # #include <iostream> or #include "header.h"
-                label = root_node.text.decode("UTF-8")
-                type_label = "include"
-
-            elif root_node.type == "preproc_def":
-                # #define MAX_SIZE 100
-                label = root_node.text.decode("UTF-8")
-                if len(label) > 80:
-                    label = label[:77] + "..."
-                type_label = "define"
-
-            elif root_node.type in ["preproc_ifdef", "preproc_if"]:
-                # #ifdef DEBUG or #if defined(FEATURE)
-                label = root_node.text.decode("UTF-8").split('\n')[0]  # Just first line
-                if len(label) > 80:
-                    label = label[:77] + "..."
-                type_label = "preprocessor"
-
             elif root_node.type == "attributed_statement":
                 # [[fallthrough]]; or [[maybe_unused]] int x;
                 # Extract attribute names for label
@@ -1015,7 +1066,16 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     label = label[:77] + "..."
                 type_label = "new"
 
-            if root_node.type != "function_definition":
+            # Exclude preprocessor directives and function_definition from graph_node_list
+            # Preprocessor directives are compile-time only, not runtime control flow
+            # function_definition is added separately with special handling
+            excluded_from_graph = {
+                "function_definition",
+                "preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
+                "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else"
+            }
+
+            if root_node.type not in excluded_from_graph:
                 graph_node_list.append(
                     (
                         index[(root_node.start_point, root_node.end_point, root_node.type)],
@@ -1025,13 +1085,136 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     )
                 )
 
-    for child in root_node.children:
-        root_node, node_list, graph_node_list, records = get_nodes(
-            root_node=child,
-            node_list=node_list,
-            graph_node_list=graph_node_list,
-            index=index,
-            records=records,
-        )
+    # Handle preprocessor directives specially
+    # For conditional directives (#ifdef, #ifndef, #if/#elif/#else), evaluate the condition
+    # and only traverse into the active branch
+    if root_node.type in ["preproc_ifdef", "preproc_if", "preproc_elif"]:
+        # Extract the condition
+        condition = None
+        is_ifndef = False
+
+        if root_node.type == "preproc_ifdef":
+            # #ifdef MACRO or #ifndef MACRO - check if MACRO is defined
+            # Determine if it's #ifdef or #ifndef by checking the directive token
+            for child in root_node.children:
+                if child.type == "#ifndef":
+                    is_ifndef = True
+                elif child.type == "identifier":
+                    condition = child.text.decode("UTF-8")
+                    break
+        elif root_node.type == "preproc_if" or root_node.type == "preproc_elif":
+            # #if MACRO == VALUE or #elif MACRO == VALUE
+            # The condition is a named child (usually binary_expression, identifier, etc.)
+            found_directive = False
+            for child in root_node.children:
+                if child.type in ["#if", "#elif"]:
+                    found_directive = True
+                elif found_directive and child.is_named and child.type not in ["preproc_elif", "preproc_else", "declaration", "expression_statement"]:
+                    # This is the condition expression
+                    condition = child.text.decode("UTF-8")
+                    break
+
+        # Evaluate the condition
+        condition_met = False
+        if condition:
+            result = evaluate_preprocessor_condition(condition, macro_definitions)
+            if result is not None:
+                # For #ifndef, invert the result
+                condition_met = (not result) if is_ifndef else result
+                # DEBUG
+                if os.environ.get('DEBUG_PREPROC'):
+                    print(f"[PREPROC] {root_node.type} condition='{condition}' is_ifndef={is_ifndef} macros={macro_definitions} result={result} condition_met={condition_met}")
+            else:
+                # Cannot evaluate - include the branch to be safe
+                condition_met = True
+                if os.environ.get('DEBUG_PREPROC'):
+                    print(f"[PREPROC] {root_node.type} condition='{condition}' macros={macro_definitions} CANNOT_EVALUATE, including by default")
+
+        # Find which children to process based on condition
+        # For #ifdef/#if, process content if condition is True
+        # For #elif, process its content directly if condition is True
+        if root_node.type == "preproc_elif":
+            # For elif, process children directly if condition is met
+            if condition_met:
+                for child in root_node.children:
+                    if child.is_named and child.type not in ["preproc_else", "preproc_elif"]:
+                        root_node, node_list, graph_node_list, records = get_nodes(
+                            root_node=child,
+                            node_list=node_list,
+                            graph_node_list=graph_node_list,
+                            index=index,
+                            records=records,
+                            macro_definitions=macro_definitions,
+                        )
+        elif root_node.type == "preproc_ifdef" or root_node.type == "preproc_if":
+            # Process children, but skip #elif and #else branches if condition was met
+            found_elif_or_else = False
+            for child in root_node.children:
+                # Skip directive keywords themselves
+                if not child.is_named:
+                    continue
+
+                # If we found #elif or #else and our condition was met, skip their content
+                if child.type in ["preproc_elif", "preproc_else"]:
+                    if condition_met:
+                        # Our condition was true, skip alternative branches
+                        continue
+                    found_elif_or_else = True
+
+                # If this is an elif, evaluate its condition
+                if child.type == "preproc_elif":
+                    # Let the elif handle its own recursion
+                    root_node, node_list, graph_node_list, records = get_nodes(
+                        root_node=child,
+                        node_list=node_list,
+                        graph_node_list=graph_node_list,
+                        index=index,
+                        records=records,
+                        macro_definitions=macro_definitions,
+                    )
+                elif child.type == "preproc_else":
+                    # Process else content only if no previous condition was met
+                    if not condition_met:
+                        for else_child in child.children:
+                            if else_child.is_named:
+                                root_node, node_list, graph_node_list, records = get_nodes(
+                                    root_node=else_child,
+                                    node_list=node_list,
+                                    graph_node_list=graph_node_list,
+                                    index=index,
+                                    records=records,
+                                    macro_definitions=macro_definitions,
+                                )
+                elif condition_met:
+                    # Process this child if condition is met
+                    root_node, node_list, graph_node_list, records = get_nodes(
+                        root_node=child,
+                        node_list=node_list,
+                        graph_node_list=graph_node_list,
+                        index=index,
+                        records=records,
+                        macro_definitions=macro_definitions,
+                    )
+
+    elif root_node.type == "preproc_else":
+        # Don't process else independently - it's handled by parent #if
+        pass
+
+    elif root_node.type in ["preproc_include", "preproc_def", "preproc_function_def", "preproc_call"]:
+        # These are non-conditional preprocessor directives
+        # Don't traverse into their children (already handled above for #define)
+        pass
+
+    else:
+        # Normal node - process all children
+        for child in root_node.children:
+            root_node, node_list, graph_node_list, records = get_nodes(
+                root_node=child,
+                node_list=node_list,
+                graph_node_list=graph_node_list,
+                index=index,
+                records=records,
+                macro_definitions=macro_definitions,
+            )
 
     return root_node, node_list, graph_node_list, records

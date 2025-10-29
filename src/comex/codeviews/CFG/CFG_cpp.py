@@ -765,6 +765,12 @@ class CFGGraph_cpp(CFGGraph):
             if result:
                 return result
 
+        # Skip preprocessor directive nodes - they are compile-time only
+        if next_node.type in ["preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
+                              "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else"]:
+            # Skip this preprocessor node and continue to the next one
+            return self.get_next_index(next_node, node_list)
+
         # Check if next_node is in node_list
         if (next_node.start_point, next_node.end_point, next_node.type) in node_list:
             return (self.get_index(next_node), next_node)
