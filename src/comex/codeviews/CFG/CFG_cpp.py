@@ -3512,6 +3512,7 @@ class CFGGraph_cpp(CFGGraph):
 
                 # Edge to first line in function body
                 first_line = self.edge_first_line(node, node_list)
+                has_statements = first_line is not None
                 if first_line:
                     first_index, first_node = first_line
                     self.add_edge(current_index, first_index, "first_next_line")
@@ -3568,17 +3569,22 @@ class CFGGraph_cpp(CFGGraph):
                     has_noreturn = "noreturn" in attributes if attributes else False
 
                     if not has_noreturn:
-                        last_stmt = self.get_last_statement_in_function_body(node, node_list)
-                        if last_stmt:
-                            last_stmt_id, last_stmt_node = last_stmt
-                            # Only connect if the last statement is not a jump statement
-                            # AND not a compound control flow statement (if/while/for/switch/try)
-                            # Compound control statements already manage their own exit paths
-                            compound_control_stmts = ["if_statement", "while_statement", "for_statement",
-                                                      "for_range_loop", "do_statement", "switch_statement",
-                                                      "try_statement"]
-                            if not self.is_jump_statement(last_stmt_node) and last_stmt_node.type not in compound_control_stmts:
-                                self.add_edge(last_stmt_id, implicit_return_id, "implicit_return")
+                        # FIX: Handle empty function bodies
+                        # For empty functions, connect function entry directly to implicit return
+                        if not has_statements:
+                            self.add_edge(current_index, implicit_return_id, "implicit_return")
+                        else:
+                            last_stmt = self.get_last_statement_in_function_body(node, node_list)
+                            if last_stmt:
+                                last_stmt_id, last_stmt_node = last_stmt
+                                # Only connect if the last statement is not a jump statement
+                                # AND not a compound control flow statement (if/while/for/switch/try)
+                                # Compound control statements already manage their own exit paths
+                                compound_control_stmts = ["if_statement", "while_statement", "for_statement",
+                                                          "for_range_loop", "do_statement", "switch_statement",
+                                                          "try_statement"]
+                                if not self.is_jump_statement(last_stmt_node) and last_stmt_node.type not in compound_control_stmts:
+                                    self.add_edge(last_stmt_id, implicit_return_id, "implicit_return")
 
             # ─────────────────────────────────────────────────────────
             # CLASS / STRUCT DEFINITION
@@ -4210,6 +4216,26 @@ class CFGGraph_cpp(CFGGraph):
         # STEP 8: Add lambda invocation edges
         # ═══════════════════════════════════════════════════════════
         self.add_lambda_edges()
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 8.5: Connect start node to entry point if no main function
+        # ═══════════════════════════════════════════════════════════
+        # FIX: For programs/test cases without main(), connect start to first function
+        # This ensures the CFG has a clear entry point for visualization and analysis
+        if "main_function" not in self.records:
+            # Find the first function definition at global scope
+            first_function_id = None
+            for key, node in node_list.items():
+                if node.type == "function_definition":
+                    # Check if this is at global scope (not a local lambda or nested function)
+                    parent = node.parent
+                    if parent and parent.type == "translation_unit":
+                        first_function_id = self.get_index(node)
+                        break
+
+            # Connect start to first function if found
+            if first_function_id:
+                self.add_edge(1, first_function_id, "program_entry")
 
         # ═══════════════════════════════════════════════════════════
         # STEP 9: Return results

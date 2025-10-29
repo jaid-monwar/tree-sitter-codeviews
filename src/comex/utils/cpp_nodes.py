@@ -626,9 +626,43 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     print(f"[DEFINE] {macro_name} = {macro_value}")
 
     elif root_node.type in statement_types["node_list_type"]:
+        # FIX: Skip field_declaration nodes (class/struct member declarations)
+        # These are compile-time constructs and should not appear in CFG
+        # Note: This includes static member declarations and member function declarations
+        if root_node.type == "field_declaration":
+            pass  # Skip this node, but will recurse through children below
+
+        # FIX: Skip struct/class specifiers at global/namespace scope
+        # These are type definitions, not executable code
+        # Still recurse through children to find member function DEFINITIONS (not declarations)
+        elif root_node.type in ["struct_specifier", "class_specifier"]:
+            # Check if this is at global/namespace scope or nested inside another class
+            parent = root_node.parent
+            should_skip = False
+
+            # Check for global scope or namespace scope
+            if parent and parent.type in ["translation_unit", "declaration_list"]:
+                # Could be namespace's declaration_list or global scope
+                if parent.type == "declaration_list":
+                    grandparent = parent.parent if parent else None
+                    # If grandparent is namespace or translation_unit, skip
+                    if grandparent and grandparent.type in ["namespace_definition", "translation_unit"]:
+                        should_skip = True
+                else:
+                    # Direct child of translation_unit - global scope
+                    should_skip = True
+
+            # Check for nested class/struct inside another class
+            elif parent and parent.type == "field_declaration_list":
+                should_skip = True
+
+            if should_skip:
+                pass  # Skip this node, will recurse through children to find function definitions
+            # else: fall through to normal processing for local struct definitions in functions
+
         # Skip function declarations (forward declarations without bodies)
         # These are compile-time constructs and should not appear in CFG
-        if is_function_declaration(root_node):
+        elif is_function_declaration(root_node):
             pass  # Skip this node
         # Skip template_declaration nodes (compile-time constructs)
         # The actual function/class definition inside the template will be processed separately
@@ -1069,10 +1103,15 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
             # Exclude preprocessor directives and function_definition from graph_node_list
             # Preprocessor directives are compile-time only, not runtime control flow
             # function_definition is added separately with special handling
+            # Compile-time directives should also be excluded from CFG
             excluded_from_graph = {
                 "function_definition",
                 "preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
-                "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else"
+                "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else",
+                # Compile-time name resolution directives (not runtime code):
+                "using_declaration",          # using namespace std; or using std::cout;
+                "alias_declaration",           # using my_type = int;
+                "namespace_alias_definition",  # namespace alias = original_namespace;
             }
 
             if root_node.type not in excluded_from_graph:
