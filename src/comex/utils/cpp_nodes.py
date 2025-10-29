@@ -20,7 +20,7 @@ statement_types = {
         "class_specifier",
         "struct_specifier",
         "namespace_definition",
-        # "using_declaration",      # Excluded: compile-time only
+        "using_declaration",          # Included for program comprehension (compile-time name resolution)
         "alias_declaration",
         "template_declaration",
         "field_declaration",
@@ -50,7 +50,7 @@ statement_types = {
         "declaration",
         "expression_statement",
         "field_declaration",
-        # "using_declaration",        # Excluded: compile-time only
+        "using_declaration",          # Included for program comprehension
         "alias_declaration",
         "access_specifier",
         "enum_specifier",
@@ -928,6 +928,13 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 if len(label) > 80:
                     label = label[:77] + "..."
                 type_label = "namespace_alias"
+
+            elif root_node.type == "using_declaration":
+                # using std::cout; or using namespace std;
+                label = root_node.text.decode("UTF-8")
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                type_label = "using"
 
             elif root_node.type == "preproc_include":
                 # #include <iostream> or #include "header.h"

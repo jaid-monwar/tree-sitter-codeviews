@@ -26,6 +26,7 @@ class CFGGraph_cpp(CFGGraph):
             "union_list": {},                      # union_name → node_id
             "typedef_list": {},                    # typedef_name → node_id
             "namespace_list": {},                  # namespace_name → node_id
+            "namespace_aliases": {},               # alias_name → actual_namespace
             "template_list": {},                   # template_name → node_id
             "extends": {},                         # class_name → [base_classes]
             "function_calls": {},                  # sig → [(call_id, parent_id)]
@@ -891,6 +892,20 @@ class CFGGraph_cpp(CFGGraph):
                         # and everything before is the class/namespace
                         func_name = parts[-1]
                         qualified_scope = "::".join(parts[:-1])
+
+                        # Resolve namespace aliases
+                        # Check if the first part of the qualified scope is an alias
+                        scope_parts = qualified_scope.split("::")
+                        if scope_parts[0] in self.records.get("namespace_aliases", {}):
+                            # Replace the alias with the actual namespace
+                            actual_namespace = self.records["namespace_aliases"][scope_parts[0]]
+                            # Rebuild the qualified scope
+                            if len(scope_parts) > 1:
+                                # e.g., "OI::Inner" becomes "Outer::Inner::Inner"
+                                qualified_scope = actual_namespace + "::" + "::".join(scope_parts[1:])
+                            else:
+                                # e.g., "OI" becomes "Outer::Inner"
+                                qualified_scope = actual_namespace
                     else:
                         func_name = full_name
                         qualified_scope = None
@@ -1551,6 +1566,40 @@ class CFGGraph_cpp(CFGGraph):
         # Add start node
         self.CFG_node_list.append((1, 0, "start_node", "start"))
         # Exit node (ID=2) is implicit
+
+    def track_namespace_aliases(self, root_node):
+        """
+        Track namespace alias definitions to resolve qualified identifiers.
+        Handles:
+        - namespace OI = Outer::Inner;
+        - namespace short = very::long::namespace::path;
+        """
+        if root_node.type == "namespace_alias_definition":
+            # Get the alias name (left side)
+            alias_name = None
+            for child in root_node.children:
+                if child.type == "namespace_identifier":
+                    alias_name = child.text.decode('utf-8')
+                    break
+
+            # Get the actual namespace (right side - nested_namespace_specifier)
+            actual_namespace = None
+            for child in root_node.children:
+                if child.type == "nested_namespace_specifier":
+                    actual_namespace = child.text.decode('utf-8')
+                    break
+                elif child.type == "namespace_identifier" and alias_name != child.text.decode('utf-8'):
+                    # Simple alias (not nested)
+                    actual_namespace = child.text.decode('utf-8')
+                    break
+
+            # Store the mapping
+            if alias_name and actual_namespace:
+                self.records["namespace_aliases"][alias_name] = actual_namespace
+
+        # Recursively process children
+        for child in root_node.children:
+            self.track_namespace_aliases(child)
 
     def track_function_pointer_assignments(self, root_node):
         """
@@ -2584,6 +2633,11 @@ class CFGGraph_cpp(CFGGraph):
         # ═══════════════════════════════════════════════════════════
         self.get_basic_blocks(self.CFG_node_list, self.CFG_edge_list)
         self.CFG_node_list = self.append_block_index(self.CFG_node_list, self.records)
+
+        # ═══════════════════════════════════════════════════════════
+        # STEP 3.5: Track namespace aliases
+        # ═══════════════════════════════════════════════════════════
+        self.track_namespace_aliases(self.root_node)
 
         # ═══════════════════════════════════════════════════════════
         # STEP 4: Build function/method call map
