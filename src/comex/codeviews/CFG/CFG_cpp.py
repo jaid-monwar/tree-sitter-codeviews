@@ -651,6 +651,14 @@ class CFGGraph_cpp(CFGGraph):
                     next_node = current_node.next_named_sibling
                     continue
 
+            # Check if parent is a lambda expression - end of lambda
+            # Lambda returns should be handled by add_lambda_edges(), not by sequential flow
+            if parent.type == "lambda_expression":
+                # Signal that we've reached a lambda boundary
+                # Return a special marker (None, parent) to indicate lambda exit
+                # This prevents automatic sequential edges from being created
+                return (2, parent)
+
             # Check if parent is a function definition - end of function
             if parent.type == "function_definition":
                 # Check if this function has an implicit return node
@@ -2732,9 +2740,184 @@ class CFGGraph_cpp(CFGGraph):
                                                         if parent_func != return_func or parent_func is None:
                                                             self.add_edge(return_id, return_target, "indirect_return")
 
+    def extract_lambda_variable_name(self, statement_node, lambda_node):
+        """
+        Extract the variable name that a lambda is assigned to.
+        Example: auto f = [...]() { }; => returns "f"
+
+        AST structure:
+        declaration  (this is statement_node)
+          placeholder_type_specifier (auto)
+          init_declarator
+            identifier (variable_name)
+            lambda_expression
+        """
+        # statement_node is the declaration itself
+        if statement_node.type == "declaration":
+            # Find init_declarator children
+            for decl_child in statement_node.named_children:
+                if decl_child.type == "init_declarator":
+                    # The first child is usually the identifier
+                    for init_child in decl_child.named_children:
+                        if init_child.type == "identifier":
+                            return init_child.text.decode('utf-8')
+        return None
+
+    def find_lambda_call_sites(self, var_name, definition_node):
+        """
+        Find all call sites for a lambda variable within the same function.
+        Returns list of statement nodes that call the lambda.
+        """
+        call_sites = []
+
+        # Get the containing function
+        containing_function = self.get_containing_function(definition_node)
+        if not containing_function:
+            return call_sites
+
+        # Search for call_expressions with identifier matching var_name
+        def search_for_calls(node):
+            # Check if this is a statement node that contains a call
+            if node.type in self.statement_types["non_control_statement"]:
+                # Check if it contains a call to our variable
+                for child in node.named_children:
+                    if self.is_lambda_call(child, var_name):
+                        # This statement calls the lambda variable
+                        if node != definition_node:  # Don't include the definition itself
+                            call_sites.append(node)
+                        break
+
+            # Recursively search children
+            for child in node.named_children:
+                search_for_calls(child)
+
+        search_for_calls(containing_function)
+        return call_sites
+
+    def is_lambda_call(self, node, var_name):
+        """
+        Check if a node is a call_expression calling the specified variable.
+        Example: var_name() or var_name(args)
+        """
+        if node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            if func and func.type == "identifier":
+                if func.text.decode('utf-8') == var_name:
+                    return True
+        # Recursively check children
+        for child in node.named_children:
+            if self.is_lambda_call(child, var_name):
+                return True
+        return False
+
+    def get_lambda_body_first_stmt(self, lambda_node, node_list):
+        """
+        Get the first statement in a lambda's body.
+        Returns the node ID of the first statement, or None if not found.
+        """
+        body = lambda_node.child_by_field_name("body")
+        if body and body.type == "compound_statement":
+            children = list(body.named_children)
+            if children:
+                first_stmt = children[0]
+                first_stmt_key = (first_stmt.start_point, first_stmt.end_point, first_stmt.type)
+                if first_stmt_key in node_list:
+                    return self.get_index(first_stmt)
+        return None
+
+    def add_lambda_return_edges(self, lambda_node, lambda_id, call_site_id, node_list):
+        """
+        Add return edges from lambda exit points to the statement after the call site.
+        Also removes the automatic next_line edge from call site to prevent bypassing lambda execution.
+
+        Args:
+            lambda_node: The lambda_expression node
+            lambda_id: The node ID of the lambda_expression
+            call_site_id: The node ID of the statement that calls the lambda
+            node_list: The node list dictionary
+        """
+        # Find all exit points in the lambda body
+        exit_points = []
+
+        # Get lambda body
+        body = lambda_node.child_by_field_name("body")
+        if not body or body.type != "compound_statement":
+            return
+
+        # Find all statements in lambda body that can exit
+        def find_exit_points(node, in_lambda_body=False):
+            node_key = (node.start_point, node.end_point, node.type)
+
+            # Only consider nodes that are in our node_list
+            if node_key in node_list:
+                in_lambda_body = True
+
+                # Explicit returns are exit points
+                if node.type == "return":
+                    exit_points.append(node)
+                    return  # Don't search deeper in return statements
+
+                # Check if this is the last statement in the lambda body
+                # (implicit return for void lambdas)
+                parent = node.parent
+                if parent == body:
+                    # This is a direct child of the lambda body
+                    siblings = list(body.named_children)
+                    if siblings and siblings[-1] == node:
+                        # This is the last statement - it's an exit point if not a return
+                        if node.type != "return":
+                            exit_points.append(node)
+
+            # Recursively search children (but not into nested functions/lambdas)
+            if node.type not in ["function_definition", "lambda_expression"] or node == lambda_node:
+                for child in node.named_children:
+                    find_exit_points(child, in_lambda_body)
+
+        find_exit_points(body)
+
+        # Get the statement after the call site
+        call_site_node = None
+        for key, node in node_list.items():
+            if self.index.get(key) == call_site_id:
+                call_site_node = node
+                break
+
+        if not call_site_node:
+            return
+
+        next_index, next_node = self.get_next_index(call_site_node, node_list)
+
+        # CRITICAL FIX: Lambda returns should go back to the call site, not directly to next statement
+        # This is because the call site needs to complete the assignment/expression evaluation
+        # after the lambda returns.
+        #
+        # Control flow:
+        #   call_site -> lambda_body (invocation)
+        #   lambda_exit -> call_site (return to complete assignment)
+        #   call_site -> next_statement (continue execution)
+        #
+        # We do NOT remove the next_line edge from call_site because it represents
+        # the continuation after the lambda returns and completes.
+
+        # Create return edges from each exit point back to the call site
+        for exit_node in exit_points:
+            exit_key = (exit_node.start_point, exit_node.end_point, exit_node.type)
+            if exit_key in node_list:
+                exit_id = self.get_index(exit_node)
+                # Return to the call site to complete the assignment/expression
+                self.add_edge(exit_id, call_site_id, "lambda_return")
+
     def add_lambda_edges(self):
         """
         Add edges for lambda invocations and returns.
+
+        This function handles two cases:
+        1. Immediately-invoked lambdas: [...]() { body }();
+        2. Stored lambdas: auto f = [...]() { body }; ... f();
+
+        For each lambda:
+        - Creates invocation edges from definition (for case 1) or call sites (for case 2)
+        - Creates return edges from lambda exit points back to statements after calls
         """
         for lambda_key, statement_node in self.records["lambda_map"].items():
             # Get lambda node
@@ -2750,11 +2933,58 @@ class CFGGraph_cpp(CFGGraph):
             stmt_id = self.get_index(statement_node)
             lambda_id = self.index[lambda_key]
 
-            # Add invocation edge
-            self.add_edge(stmt_id, lambda_id, "lambda_invocation")
+            # Check if this is an immediately-invoked lambda or a stored lambda
+            # By examining if the statement contains a call_expression that directly wraps the lambda
+            is_immediately_invoked = False
+            if statement_node.type == "expression_statement":
+                # Check if statement contains: [...]() { body }();
+                for child in statement_node.named_children:
+                    if child.type == "call_expression":
+                        # Check if the function being called is the lambda itself
+                        func_child = child.child_by_field_name("function")
+                        if func_child and func_child.type == "lambda_expression":
+                            if (func_child.start_point, func_child.end_point, func_child.type) == lambda_key:
+                                is_immediately_invoked = True
+                                break
 
-            # Find return points in lambda and add return edges
-            # (Would need to track lambda return statements separately)
+            # Get the first statement in the lambda body
+            # Invocation edges should point directly to the body, not to the lambda definition
+            lambda_body_first_id = self.get_lambda_body_first_stmt(lambda_node, self.node_list)
+            if lambda_body_first_id is None:
+                # Empty lambda body, skip
+                continue
+
+            if is_immediately_invoked:
+                # Case 1: Immediately-invoked lambda
+                # Create invocation edge from statement directly to lambda BODY
+                self.add_edge(stmt_id, lambda_body_first_id, "lambda_invocation")
+
+                # Find exit points in lambda and create return edges back to next statement
+                self.add_lambda_return_edges(lambda_node, lambda_id, stmt_id, self.node_list)
+            else:
+                # Case 2: Stored lambda
+                # Don't create invocation edge from definition
+                # The invocation happens at call sites, not at definition
+                # We still need to track lambda body but edges will be created from calls
+
+                # Find the variable name this lambda is assigned to
+                var_name = self.extract_lambda_variable_name(statement_node, lambda_node)
+
+                if var_name:
+                    # Find all call sites for this variable
+                    call_sites = self.find_lambda_call_sites(var_name, statement_node)
+
+                    for call_site_node in call_sites:
+                        call_site_key = (call_site_node.start_point, call_site_node.end_point, call_site_node.type)
+                        if call_site_key in self.node_list:
+                            call_site_id = self.get_index(call_site_node)
+
+                            # Create invocation edge from call site directly to lambda BODY
+                            # NOT to the lambda definition node
+                            self.add_edge(call_site_id, lambda_body_first_id, "lambda_invocation")
+
+                            # Create return edges from lambda exit points to statement after call
+                            self.add_lambda_return_edges(lambda_node, lambda_id, call_site_id, self.node_list)
 
     def CFG_cpp(self):
         """
@@ -3448,15 +3678,37 @@ class CFGGraph_cpp(CFGGraph):
             # LAMBDA EXPRESSION
             # ─────────────────────────────────────────────────────────
             elif node.type == "lambda_expression":
-                # Edge to first statement in lambda body
-                body = node.child_by_field_name("body")
-                if body:
-                    if body.type == "compound_statement":
-                        children = list(body.named_children)
-                        if children:
-                            first_stmt = children[0]
-                            if (first_stmt.start_point, first_stmt.end_point, first_stmt.type) in node_list:
-                                self.add_edge(current_index, self.get_index(first_stmt), "lambda_next")
+                # Lambda creation happens at definition time and is part of sequential execution
+                # This includes capturing variables and creating the function object
+                #
+                # Flow at definition time:
+                #   declaration_statement -> lambda_expression -> next_statement
+                #
+                # The lambda BODY is NOT executed at definition time
+                # Body execution edges are created in add_lambda_edges()
+
+                # Find the parent statement that contains this lambda
+                parent = node.parent
+                while parent and parent.type not in self.statement_types["node_list_type"]:
+                    parent = parent.parent
+
+                if parent and (parent.start_point, parent.end_point, parent.type) in node_list:
+                    parent_id = self.get_index(parent)
+
+                    # Edge from parent statement to lambda expression (definition-time evaluation)
+                    self.add_edge(parent_id, current_index, "lambda_definition")
+
+                    # Edge from lambda expression to next statement
+                    # This replaces the direct parent -> next edge that was created in STEP 2
+                    next_index, next_node = self.get_next_index(parent, node_list)
+                    if next_index != 2 and next_node is not None:
+                        self.add_edge(current_index, next_index, "next_line")
+
+                        # Remove the direct edge from parent to next (it's now parent -> lambda -> next)
+                        self.CFG_edge_list = [
+                            edge for edge in self.CFG_edge_list
+                            if not (edge[0] == parent_id and edge[1] == next_index and edge[2] == 'next_line')
+                        ]
 
         # ═══════════════════════════════════════════════════════════
         # STEP 6.5: Connect dangling paths to implicit returns
