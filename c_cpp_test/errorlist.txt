@@ -1,8 +1,18 @@
-1. Can't detect function call inside another function call.
-2. Can't detect function call in index = duplicateNumber().
-   "test" and "static void test" shouldn't be two different nodes.
-   there is no recursion here, but the cfg shows recursion.
-   do_while loop is wrong. the arrow from while to do should be pos_next. the arrow from do to tortoise should be next_line.
+1. Same problem that occured for C. No arrow to duplicateNumber. do-while loop is wrong, pos_next and neg_next
+   should be with the while statement, not the do statement. There is no loop_update in while loop.
+   test() and static void test() should not be two different nodes. There is a node "182", which is nonsensical.
 
+2. Same problem that occured for C. Can't detect call to average() from inside printf()
 
-Can't detect function calls unless it's standalone.
+3. Shows destructor calls, but does not show constructor calls. Shows nonsensical nodes.
+
+4. There is a nonsensical node with a implicit_return edge after the constructor. This should not exist.
+
+5. There shouldn't be an edge from if(node > 100) to printf("if done\n")
+
+6. Can't handle namespaces at all.
+
+7. There is a nonsensical node after return from lambda. Also, 12_ shouldn't be split into two nodes.
+   It should be one lambda definition.
+
+8. Can't handle inner classes at all.
