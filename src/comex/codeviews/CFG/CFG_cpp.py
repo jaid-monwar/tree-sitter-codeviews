@@ -2450,6 +2450,76 @@ class CFGGraph_cpp(CFGGraph):
         self.CFG_node_list.append((1, 0, "start_node", "start"))
         # Exit node (ID=2) is implicit
 
+    def handle_static_initialization_phase(self, node_list):
+        """
+        Handle static/global initialization phase in C++.
+
+        In C++, static and global variables are initialized before main() starts.
+        This function creates the proper control flow:
+        - start_node -> first_static_init -> ... -> last_static_init -> main()
+
+        Static initializations that need to be connected:
+        1. Static member variable definitions with initializers
+           Example: int MyClass::staticVar = 42;
+        2. Global variable definitions with initializers
+           Example: int globalVar = 10;
+
+        Function definitions are NOT included (they're not executed, just defined).
+        """
+        # Collect all global-scope declarations with initializers
+        static_inits = []
+
+        for key, node in node_list.items():
+            # Only process declarations
+            if node.type != "declaration":
+                continue
+
+            # Check if this is a global-scope declaration
+            parent = node.parent
+            if not parent or parent.type != "translation_unit":
+                continue
+
+            # Check if it has an initializer (init_declarator indicates initialization)
+            has_initializer = False
+            for child in node.named_children:
+                if child.type == "init_declarator":
+                    has_initializer = True
+                    break
+
+            # If it has an initializer, it's a static initialization
+            if has_initializer:
+                node_index = self.get_index(node)
+                # Store with line number for ordering
+                line_num = node.start_point[0]
+                static_inits.append((line_num, node_index, node))
+
+        # Sort by line number (static initialization order follows declaration order)
+        static_inits.sort(key=lambda x: x[0])
+
+        # Get main function index
+        main_index = self.records.get("main_function", None)
+
+        # Create control flow edges
+        if static_inits:
+            # start_node -> first_static_init
+            first_line, first_index, first_node = static_inits[0]
+            self.add_edge(1, first_index, "static_init_start")
+
+            # Connect static inits sequentially
+            for i in range(len(static_inits) - 1):
+                current_line, current_index, current_node = static_inits[i]
+                next_line, next_index, next_node = static_inits[i + 1]
+                self.add_edge(current_index, next_index, "static_init_next")
+
+            # last_static_init -> main (if main exists)
+            if main_index:
+                last_line, last_index, last_node = static_inits[-1]
+                self.add_edge(last_index, main_index, "static_init_to_main")
+        else:
+            # No static inits, connect start directly to main
+            if main_index:
+                self.add_edge(1, main_index, "next")
+
     def track_namespace_aliases(self, root_node):
         """
         Track namespace alias definitions to resolve qualified identifiers.
@@ -4166,6 +4236,13 @@ class CFGGraph_cpp(CFGGraph):
         self.add_dummy_nodes()
 
         # ═══════════════════════════════════════════════════════════
+        # STEP 5.5: Handle static initialization phase
+        # ═══════════════════════════════════════════════════════════
+        # In C++, static/global variable initializations happen before main()
+        # We need to connect: start_node -> static_inits -> main()
+        self.handle_static_initialization_phase(node_list)
+
+        # ═══════════════════════════════════════════════════════════
         # STEP 6: Add control flow edges for each statement type
         # ═══════════════════════════════════════════════════════════
         for key, node in node_list.items():
@@ -4176,9 +4253,9 @@ class CFGGraph_cpp(CFGGraph):
             # ─────────────────────────────────────────────────────────
             if node.type == "function_definition":
                 # Check if this is main function
+                # NOTE: Edge from start->main or last_static_init->main is handled in STEP 5.5
                 if "main_function" in self.records and self.records["main_function"] == current_index:
-                    # start -> main
-                    self.add_edge(1, current_index, "next")
+                    pass  # Connection already handled in handle_static_initialization_phase()
 
                 # Extract and store function attributes (e.g., [[noreturn]], [[nodiscard]])
                 attributes = self.extract_attributes_from_node(node)
