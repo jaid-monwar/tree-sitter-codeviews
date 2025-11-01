@@ -19,7 +19,7 @@ statement_types = {
         "function_definition",
         "class_specifier",
         "struct_specifier",
-        "namespace_definition",
+        # "namespace_definition",   # EXCLUDED: Namespaces are compile-time constructs, not runtime execution nodes
         "using_declaration",          # Included for program comprehension (compile-time name resolution)
         "alias_declaration",
         "template_declaration",

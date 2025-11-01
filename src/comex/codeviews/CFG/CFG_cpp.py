@@ -2933,19 +2933,24 @@ class CFGGraph_cpp(CFGGraph):
                                         continue
 
                                 # Determine return target based on method return type
-                                # For all methods: return to next statement after call completes
+                                # For all methods: return to the CALL SITE first
+                                # The sequential edge from call site to next statement will handle continuation
                                 return_target = None
 
-                                # FIXED: Always return to the NEXT statement after the call site
-                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                return_target = next_index if next_index != 2 else None
+                                # FIXED: Return to the call site (parent_id), NOT to the next statement
+                                # This creates the correct flow: call → function → return → call_site → next
+                                return_target = parent_id
 
                                 if parent_id != fn_id and return_target:
                                     # Get return node from index
                                     return_key = index_to_key.get(return_id)
 
-                                    if is_implicit_return or not return_key:
-                                        # For implicit returns, connect from last statement of method body
+                                    if is_implicit_return:
+                                        # For implicit returns, use the implicit return node itself
+                                        # The implicit return node is the convergence point for all exit paths
+                                        self.add_edge(return_id, return_target, "static_return")
+                                    elif not return_key:
+                                        # For other synthetic returns (not implicit), try to find last statement
                                         # Find the method node
                                         fn_key = index_to_key.get(fn_id)
                                         fn_node = self.node_list.get(fn_key) if fn_key else None
