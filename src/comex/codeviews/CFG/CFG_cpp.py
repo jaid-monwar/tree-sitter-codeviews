@@ -2113,6 +2113,14 @@ class CFGGraph_cpp(CFGGraph):
                 if base_call_type == func_type_no_const:
                     continue
 
+            # Pointer type matching: T* matches const T*, const T* matches T*, etc.
+            # This handles array decay and const correctness for pointers
+            if '*' in call_type_clean or '*' in func_type_clean:
+                call_type_no_const = call_type_clean.replace('const', '').strip()
+                func_type_no_const = func_type_clean.replace('const', '').strip()
+                if call_type_no_const == func_type_no_const:
+                    continue
+
             # No match found
             return False
 
@@ -2176,7 +2184,7 @@ class CFGGraph_cpp(CFGGraph):
                 # TODO: Look up function return type from function_list
                 return "unknown"
 
-        # Identifiers - lvalues (unless declared as rvalue reference)
+        # Identifiers - lvalues (unless declared as rvalue reference or array)
         if node_type == "identifier":
             arg_index_key = (arg_node.start_point, arg_node.end_point, arg_node.type)
             if arg_index_key in self.index:
@@ -2185,6 +2193,62 @@ class CFGGraph_cpp(CFGGraph):
                     decl_index = self.declaration_map[arg_index]
                     if decl_index in self.symbol_table["data_type"]:
                         data_type = self.symbol_table["data_type"][decl_index]
+
+                        # Check if this identifier is an array (array-to-pointer decay)
+                        # When an array is passed as a function argument, it decays to a pointer
+                        # Find the declaration node to check for array declarator
+                        decl_node_key = None
+                        for key, idx in self.index.items():
+                            if idx == decl_index:
+                                decl_node_key = key
+                                break
+
+                        is_array = False
+                        if decl_node_key and decl_node_key in self.node_list:
+                            decl_node = self.node_list[decl_node_key]
+                            # Check if the declarator has array_declarator type
+                            # or if parent has array_declarator child
+                            parent = decl_node.parent
+                            if parent:
+                                # Look for array_declarator in the declaration
+                                for child in parent.children:
+                                    if child.type == "array_declarator":
+                                        is_array = True
+                                        break
+                                    # Also check for init_declarator with array_declarator
+                                    if child.type == "init_declarator":
+                                        for subchild in child.children:
+                                            if subchild.type == "array_declarator":
+                                                is_array = True
+                                                break
+
+                        # If not found in node_list, check if decl_node itself is an array_declarator
+                        # or search the AST for the declaration
+                        if not is_array:
+                            # Get the variable name to search for its declaration
+                            var_name = arg_node.text.decode('utf-8')
+                            # Search for the declaration in the entire AST
+                            def find_array_declaration(node, var_name):
+                                """Recursively search for array declaration of var_name"""
+                                if node.type == "array_declarator":
+                                    # Check if this array_declarator contains an identifier with var_name
+                                    for child in node.children:
+                                        if child.type == "identifier" and child.text.decode('utf-8') == var_name:
+                                            return True
+                                        # Recursively search in children
+                                        if find_array_declaration(child, var_name):
+                                            return True
+                                for child in node.children:
+                                    if find_array_declaration(child, var_name):
+                                        return True
+                                return False
+
+                            if self.root_node and find_array_declaration(self.root_node, var_name):
+                                is_array = True
+
+                        # Array-to-pointer decay: uint32_t arr[] → uint32_t*
+                        if is_array:
+                            return data_type + "*"
 
                         # If the variable is already declared as an rvalue reference (int&&),
                         # it's an lvalue (has a name), so treat it as lvalue reference
@@ -3960,11 +4024,10 @@ class CFGGraph_cpp(CFGGraph):
                                 func_name = child.text.decode('utf-8')
                                 break
 
-                    # FIX #2: DON'T add implicit return node to CFG node list
-                    # These are synthetic nodes that don't correspond to actual code
-                    # They're kept only for internal tracking in implicit_return_map
-                    # implicit_return_label = f"implicit_return_{func_name}"
-                    # self.CFG_node_list.append((implicit_return_id, 0, "implicit_return", implicit_return_label))
+                    # Add implicit return node to CFG node list with proper label
+                    # These are synthetic nodes representing the implicit return point for void/constructor functions
+                    implicit_return_label = f"implicit_return_{func_name}"
+                    self.CFG_node_list.append((implicit_return_id, 0, implicit_return_label, "implicit_return"))
 
                     # Store mapping: function_id -> implicit_return_id (for internal use only)
                     self.records["implicit_return_map"][current_index] = implicit_return_id
@@ -4178,8 +4241,8 @@ class CFGGraph_cpp(CFGGraph):
                 if next_index != 2:
                     self.add_edge(current_index, next_index, "neg_next")
 
-                # Self-loop for loop update
-                self.add_edge(current_index, current_index, "loop_update")
+                # Note: While loops do NOT have loop_update edges
+                # (loop_update is only for for-loops with explicit update expressions)
 
             # ─────────────────────────────────────────────────────────
             # FOR LOOP (C-style)
@@ -4251,9 +4314,40 @@ class CFGGraph_cpp(CFGGraph):
             # DO-WHILE LOOP
             # ─────────────────────────────────────────────────────────
             elif node.type == "do_statement":
-                # Edge to first statement in loop body (always executes once)
+                # Do-while loop structure:
+                # 1. Body always executes once (unconditional entry)
+                # 2. After body, condition is checked at the do statement
+                # 3. If condition true (pos_next), loop back to body
+                # 4. If condition false (neg_next), exit loop
+
+                # Edge to first statement in loop body (unconditional - body always executes once)
                 body = node.child_by_field_name("body")
                 if body:
+                    if body.type == "compound_statement":
+                        children = list(body.named_children)
+                        if children:
+                            first_stmt = children[0]
+                            if (first_stmt.start_point, first_stmt.end_point, first_stmt.type) in node_list:
+                                # First entry is unconditional (not pos_next)
+                                self.add_edge(current_index, self.get_index(first_stmt), "first_next_line")
+                    else:
+                        if (body.start_point, body.end_point, body.type) in node_list:
+                            self.add_edge(current_index, self.get_index(body), "first_next_line")
+
+                    # Back edge from last statement to do node for condition check
+                    # After the condition check:
+                    #   - pos_next goes back to first statement (loop again)
+                    #   - neg_next exits the loop
+                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
+                    # try_statement manages its own exit paths through try block and catch clauses
+                    last_line, _ = self.get_block_last_line(node, "body")
+                    if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
+                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
+                            # Back to do statement for condition evaluation
+                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
+
+                    # After condition check at do statement:
+                    # pos_next: condition true → loop back to first statement in body
                     if body.type == "compound_statement":
                         children = list(body.named_children)
                         if children:
@@ -4264,15 +4358,7 @@ class CFGGraph_cpp(CFGGraph):
                         if (body.start_point, body.end_point, body.type) in node_list:
                             self.add_edge(current_index, self.get_index(body), "pos_next")
 
-                    # Back edge from last statement to do node (condition check)
-                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
-                    # try_statement manages its own exit paths through try block and catch clauses
-                    last_line, _ = self.get_block_last_line(node, "body")
-                    if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
-                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
-
-                # Edge to next statement after loop (condition false)
+                # neg_next: condition false → exit loop to next statement
                 next_index, next_node = self.get_next_index(node, node_list)
                 if next_index != 2:
                     self.add_edge(current_index, next_index, "neg_next")
