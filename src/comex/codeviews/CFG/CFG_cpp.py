@@ -3085,7 +3085,66 @@ class CFGGraph_cpp(CFGGraph):
                             self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
 
                         # Add return edges: constructor return points -> next statement after declaration
-                        # Need to create return edges for EACH call site
+                        # For constructors: always create return edges from last statement (no implicit return node)
+                        # Constructors don't have explicit return statements, so we create edges directly
+                        # from the last statement in the constructor body back to the call site
+
+                        # Get the constructor function node
+                        fn_key = index_to_key.get(fn_id)
+                        fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                        if fn_node:
+                            # Iterate through each call site to create return edges
+                            for call_id, parent_id in call_list:
+                                # Get the call site node to find the next statement
+                                parent_key = index_to_key.get(parent_id)
+                                if not parent_key:
+                                    continue
+                                parent_node = self.node_list.get(parent_key)
+                                if not parent_node:
+                                    continue
+
+                                # Check if parent is a constructor (base class constructor call from initializer list)
+                                is_base_constructor_call = False
+                                if parent_node.type == "function_definition":
+                                    # Check if parent has field_initializer_list (it's a constructor with initializers)
+                                    for pchild in parent_node.children:
+                                        if pchild.type == "field_initializer_list":
+                                            is_base_constructor_call = True
+                                            break
+
+                                if is_base_constructor_call:
+                                    # This is a base class constructor call from an initializer list
+                                    # Return should go to the first statement in the derived constructor body
+                                    first_line = self.edge_first_line(parent_node, self.node_list)
+                                    if first_line:
+                                        return_target = first_line[0]
+                                    else:
+                                        # No body statements - this shouldn't happen for derived constructors
+                                        return_target = None
+                                else:
+                                    # Regular constructor call: return to next statement after call
+                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                    return_target = next_index if next_index != 2 else None
+
+                                if return_target and parent_id != fn_id:
+                                    # Get last statement in constructor body
+                                    last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
+                                    if last_stmt:
+                                        last_stmt_id, _ = last_stmt
+                                        if is_base_constructor_call:
+                                            self.add_edge(last_stmt_id, return_target, "base_constructor_return")
+                                        else:
+                                            self.add_edge(last_stmt_id, return_target, "constructor_return")
+                                    else:
+                                        # Empty constructor body: connect from constructor entry
+                                        if is_base_constructor_call:
+                                            self.add_edge(fn_id, return_target, "base_constructor_return")
+                                        else:
+                                            self.add_edge(fn_id, return_target, "constructor_return")
+
+                        # Legacy code path: handle any remaining constructors with explicit return statements
+                        # (This shouldn't normally happen for constructors but kept for compatibility)
                         if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
                             for return_id in self.records["return_statement_map"][fn_id]:
                                 # Check if this is a synthetic implicit return node
@@ -4049,20 +4108,31 @@ class CFGGraph_cpp(CFGGraph):
                     first_index, first_node = first_line
                     self.add_edge(current_index, first_index, "first_next_line")
 
-                # For VOID functions and CONSTRUCTORS, create an explicit implicit return node
+                # For VOID functions ONLY, create an explicit implicit return node
                 # This node serves as a collection point for all execution paths that reach the function end
+                # NOTE: Constructors and destructors should NOT have implicit return nodes because:
+                # - They have their own return semantics (constructor_return, destructor_return edges)
+                # - Implicit return nodes are only needed for void functions that can fall through
                 return_type_node = node.child_by_field_name("type")
                 is_void = False
-                is_constructor = False
+                is_constructor_or_destructor = False
 
                 if return_type_node:
                     return_type_text = return_type_node.text.decode('utf-8')
                     is_void = return_type_text == "void"
                 else:
                     # No return type = constructor or destructor
-                    is_constructor = True
+                    # Detect by checking declarator children for destructor_name or identifier (constructor)
+                    declarator = node.child_by_field_name("declarator")
+                    if declarator:
+                        for child in declarator.named_children:
+                            if child.type in ["destructor_name", "identifier"]:
+                                # identifier = constructor, destructor_name = destructor
+                                is_constructor_or_destructor = True
+                                break
 
-                if is_void or is_constructor:
+                # Only create implicit return for void functions, NOT for constructors/destructors
+                if is_void and not is_constructor_or_destructor:
                     # Create implicit return node for internal tracking only
                     # FIX #2: Don't add to CFG_node_list - keep only for internal bookkeeping
                     implicit_return_id = self.get_new_synthetic_index()
