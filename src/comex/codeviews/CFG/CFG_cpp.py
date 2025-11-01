@@ -1389,6 +1389,38 @@ class CFGGraph_cpp(CFGGraph):
             for pend_src, pend_dest, pend_label, pend_class in self._pending_destructor_returns:
                 self.add_edge(pend_src, pend_dest, pend_label)
 
+    def extract_inheritance_info(self, root_node):
+        """
+        Extract inheritance relationships from class definitions.
+        Populates self.records["extends"] with class_name -> [base_classes] mapping.
+        Should be called early in CFG construction before constructor/destructor processing.
+        """
+        def extract_from_node(node):
+            if node.type in ["class_specifier", "struct_specifier"]:
+                # Get class name
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    class_name = name_node.text.decode('utf-8')
+
+                    # Get base class list
+                    base_classes = []
+                    for child in node.children:
+                        if child.type == "base_class_clause":
+                            # Get the base class name from base_class_clause children
+                            for subchild in child.children:
+                                if subchild.type in ["type_identifier", "qualified_identifier"]:
+                                    base_name = subchild.text.decode('utf-8')
+                                    base_classes.append(base_name)
+
+                    if base_classes:
+                        self.records["extends"][class_name] = base_classes
+
+            # Recursively process children
+            for child in node.children:
+                extract_from_node(child)
+
+        extract_from_node(root_node)
+
     def function_list(self, root_node, node_list):
         """
         Build a map of all function/method calls in the program.
@@ -3173,6 +3205,7 @@ class CFGGraph_cpp(CFGGraph):
         for (class_name, signature), call_list in self.records["constructor_calls"].items():
             # Find matching constructor in function_list
             # Constructors are stored with the class name as the function name
+            found_constructor = False
             for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                 # Match by class name and function name
                 if fn_class_name == class_name and fn_name == class_name:
@@ -3228,6 +3261,7 @@ class CFGGraph_cpp(CFGGraph):
 
                     if sig_match:
                         # Found matching constructor with correct signature
+                        found_constructor = True
                         for call_id, parent_id in call_list:
                             # Add call edge: declaration -> constructor
                             self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
@@ -3372,6 +3406,77 @@ class CFGGraph_cpp(CFGGraph):
                                         elif is_base_constructor_call and return_target:
                                             # Special case: base constructor returning to derived constructor body
                                             self.add_edge(return_id, return_target, "base_constructor_return")
+
+            # Handle implicit default constructors (when no explicit constructor is defined)
+            if not found_constructor and signature == ():
+                # This is an implicit default constructor call
+                # Create a synthetic constructor node for visualization and analysis
+                synthetic_constructor_id = self.get_new_synthetic_index()
+                synthetic_label = f"implicit_default_constructor_{class_name}"
+
+                # Add synthetic constructor node to CFG
+                self.CFG_node_list.append((synthetic_constructor_id, 0, synthetic_label, "synthetic_constructor"))
+
+                # Register in function_list for consistency
+                key = ((class_name, class_name), ())
+                self.records["function_list"][key] = synthetic_constructor_id
+
+                # Check if this class has base classes for implicit base constructor call
+                # Extract inheritance on-the-fly if needed
+                base_classes = []
+                if "extends" in self.records and class_name in self.records["extends"]:
+                    base_classes = self.records["extends"][class_name]
+                    if not isinstance(base_classes, list):
+                        base_classes = [base_classes]
+
+                # For each call site, create edges
+                for call_id, parent_id in call_list:
+                    # Add call edge: declaration -> synthetic constructor
+                    self.add_edge(parent_id, synthetic_constructor_id, f"constructor_call|{call_id}")
+
+                    # If class has base classes, add edges to base class constructors
+                    if base_classes:
+                        for base_class in base_classes:
+                            # Look for base class constructor (or create synthetic one)
+                            base_constructor_key = ((base_class, base_class), ())
+                            if base_constructor_key in self.records["function_list"]:
+                                base_constructor_id = self.records["function_list"][base_constructor_key]
+                                self.add_edge(synthetic_constructor_id, base_constructor_id, "base_constructor_call")
+
+                                # Return from base constructor to next statement after derived constructor
+                                parent_key = index_to_key.get(parent_id)
+                                if parent_key:
+                                    parent_node = self.node_list.get(parent_key)
+                                    if parent_node:
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        if next_index and next_index != 2:
+                                            self.add_edge(base_constructor_id, next_index, "constructor_return")
+                            else:
+                                # Base class also has implicit constructor - create synthetic node
+                                base_synthetic_id = self.get_new_synthetic_index()
+                                base_synthetic_label = f"implicit_default_constructor_{base_class}"
+                                self.CFG_node_list.append((base_synthetic_id, 0, base_synthetic_label, "synthetic_constructor"))
+                                self.records["function_list"][base_constructor_key] = base_synthetic_id
+
+                                self.add_edge(synthetic_constructor_id, base_synthetic_id, "base_constructor_call")
+
+                                # Return from base constructor to next statement after derived constructor
+                                parent_key = index_to_key.get(parent_id)
+                                if parent_key:
+                                    parent_node = self.node_list.get(parent_key)
+                                    if parent_node:
+                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                        if next_index and next_index != 2:
+                                            self.add_edge(base_synthetic_id, next_index, "constructor_return")
+                    else:
+                        # No base classes - just return to next statement
+                        parent_key = index_to_key.get(parent_id)
+                        if parent_key:
+                            parent_node = self.node_list.get(parent_key)
+                            if parent_node:
+                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
+                                if next_index and next_index != 2:
+                                    self.add_edge(synthetic_constructor_id, next_index, "constructor_return")
 
         # Process destructor calls
         if self.records.get("destructor_calls"):
@@ -4215,6 +4320,12 @@ class CFGGraph_cpp(CFGGraph):
         self.track_namespace_aliases(self.root_node)
 
         # ═══════════════════════════════════════════════════════════
+        # STEP 3.5.5: Extract class inheritance relationships
+        # ═══════════════════════════════════════════════════════════
+        # Must be done before STEP 4 (function_list) for constructor/destructor chaining
+        self.extract_inheritance_info(self.root_node)
+
+        # ═══════════════════════════════════════════════════════════
         # STEP 3.6: Track lambda variables
         # ═══════════════════════════════════════════════════════════
         # Must be done before STEP 4 (function_list) so that lambda arguments can be tracked
@@ -4269,14 +4380,17 @@ class CFGGraph_cpp(CFGGraph):
                     first_index, first_node = first_line
                     self.add_edge(current_index, first_index, "first_next_line")
 
-                # For VOID functions ONLY, create an explicit implicit return node
+                # For VOID functions and DESTRUCTORS, create an explicit implicit return node
                 # This node serves as a collection point for all execution paths that reach the function end
-                # NOTE: Constructors and destructors should NOT have implicit return nodes because:
-                # - They have their own return semantics (constructor_return, destructor_return edges)
-                # - Implicit return nodes are only needed for void functions that can fall through
+                # NOTE:
+                # - Constructors should NOT have implicit return nodes (they have constructor_return edges)
+                # - Destructors NEED implicit return nodes for base class destructor chaining
+                # - Pure virtual destructor declarations (= 0) should NOT get implicit returns (no body)
                 return_type_node = node.child_by_field_name("type")
                 is_void = False
-                is_constructor_or_destructor = False
+                is_constructor = False
+                is_destructor = False
+                is_pure_virtual = False
 
                 if return_type_node:
                     return_type_text = return_type_node.text.decode('utf-8')
@@ -4284,16 +4398,44 @@ class CFGGraph_cpp(CFGGraph):
                 else:
                     # No return type = constructor or destructor
                     # Detect by checking declarator children for destructor_name or identifier (constructor)
+                    # For out-of-class definitions, check qualified_identifier (e.g., Base::~Base)
                     declarator = node.child_by_field_name("declarator")
                     if declarator:
                         for child in declarator.named_children:
-                            if child.type in ["destructor_name", "identifier"]:
-                                # identifier = constructor, destructor_name = destructor
-                                is_constructor_or_destructor = True
+                            if child.type == "destructor_name":
+                                is_destructor = True
+                                break
+                            elif child.type == "qualified_identifier":
+                                # Check if qualified identifier contains destructor (e.g., Base::~Base)
+                                qualified_text = child.text.decode('utf-8')
+                                if '~' in qualified_text:
+                                    is_destructor = True
+                                    break
+                            elif child.type == "identifier":
+                                # identifier = constructor
+                                is_constructor = True
                                 break
 
-                # Only create implicit return for void functions, NOT for constructors/destructors
-                if is_void and not is_constructor_or_destructor:
+                # Check for pure virtual clause (e.g., virtual ~Base() = 0;)
+                # Pure virtual destructors with bodies (out-of-class definitions) are NOT pure virtual
+                has_body = node.child_by_field_name("body") is not None
+                for child in node.children:
+                    if child.type == "pure_virtual_clause":
+                        is_pure_virtual = True
+                        break
+
+                # Create implicit return for:
+                # - Void functions
+                # - Destructors with bodies (exclude pure virtual declarations without bodies)
+                # Do NOT create for:
+                # - Constructors (they have their own return semantics)
+                # - Pure virtual destructor declarations (virtual ~Base() = 0;)
+                should_create_implicit_return = (
+                    (is_void and not is_constructor and not is_destructor) or  # Regular void functions
+                    (is_destructor and has_body and not is_pure_virtual)       # Destructors with bodies
+                )
+
+                if should_create_implicit_return:
                     # Create implicit return node for internal tracking only
                     # FIX #2: Don't add to CFG_node_list - keep only for internal bookkeeping
                     implicit_return_id = self.get_new_synthetic_index()
