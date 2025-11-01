@@ -1078,9 +1078,11 @@ class CFGGraph_cpp(CFGGraph):
                             if fn_id in self.records.get("implicit_return_map", {}):
                                 next_after_scope_id = self.records["implicit_return_map"][fn_id]
                             elif is_return_at_scope_exit:
-                                # For non-void functions, use the return statement as the target
-                                # Destructors will be inserted BEFORE the return statement
-                                next_after_scope_id = last_stmt_id
+                                # For non-void functions with return statement:
+                                # Destructors are called FROM the return statement
+                                # After destructors complete, the function exits (no further edges needed)
+                                # Set next_after_scope_id to None to indicate no return edge from last destructor
+                                next_after_scope_id = None
                         break
                     parent = parent.parent
 
@@ -1089,7 +1091,9 @@ class CFGGraph_cpp(CFGGraph):
             objects_reversed = list(reversed(objects_sorted))
 
             # Build chain: prev_stmt -> ~objN -> ~objN-1 -> ... -> ~obj1 -> return_stmt (or next_after_scope)
-            if next_after_scope_id and next_after_scope_id != 2:
+            # Note: next_after_scope_id can be None when return statement is at scope exit
+            # In this case, we still add destructors but don't add final return edge
+            if next_after_scope_id != 2:
                 # Create destructor call list for each object
                 destructor_ids = []
                 for var_name, class_name, decl_id, order in objects_reversed:
@@ -1110,30 +1114,24 @@ class CFGGraph_cpp(CFGGraph):
                 # but we create multiple edges from the implicit return node
                 # Using MultiDiGraph, we can have multiple edges between same nodes
                 if destructor_ids:
-                    # Special handling when last statement is a return statement
-                    # We need to insert destructors BEFORE the return statement
-                    if is_return_at_scope_exit:
-                        # Find the statement before the return statement
-                        # We'll redirect the edge: prev_stmt -> destructors -> return_stmt
-                        prev_stmt_id = None
-                        for src, dest, label in list(self.CFG_edge_list):
-                            if dest == last_stmt_id and label in ["next_line", "first_next_line"]:
-                                prev_stmt_id = src
-                                # Remove the direct edge to return statement
-                                self.CFG_edge_list.remove((src, dest, label))
-                                break
+                    # C++ Semantics: Destructors are called as part of scope exit
+                    #
+                    # When a return statement is present:
+                    #   return_stmt → first_destructor → ... → last_destructor → function_exit
+                    #
+                    # When no return statement (void function or implicit return):
+                    #   last_stmt → first_destructor → ... → last_destructor → function_exit
+                    #
+                    # The return value is computed before destructors run, but control flow
+                    # shows destructors execute as part of the return statement's execution.
 
-                        if prev_stmt_id:
-                            # Edge from previous statement to first destructor call
-                            first_var_name, first_class_name, first_dest_id = destructor_ids[0]
-                            self.add_edge(prev_stmt_id, first_dest_id, "scope_exit_destructor")
-                        else:
-                            # No previous statement found, connect from return to destructors
-                            # This shouldn't happen in normal code, but handle it gracefully
-                            first_var_name, first_class_name, first_dest_id = destructor_ids[0]
-                            self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
+                    if is_return_at_scope_exit:
+                        # Destructors are called FROM the return statement (not before it)
+                        # Edge: return_stmt -> first_destructor
+                        first_var_name, first_class_name, first_dest_id = destructor_ids[0]
+                        self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
                     else:
-                        # Normal case: destructors after last statement
+                        # Normal case: destructors after last statement (void function or implicit return)
                         first_var_name, first_class_name, first_dest_id = destructor_ids[0]
                         self.add_edge(last_stmt_id, first_dest_id, "scope_exit_destructor")
 
@@ -1171,9 +1169,12 @@ class CFGGraph_cpp(CFGGraph):
                             # self.add_edge(implicit_return_id, next_after_scope_id, edge_label)
                             # Actually, we need to mark this edge to be added conditionally
                             # Store it for now
-                            if not hasattr(self, '_pending_destructor_returns'):
-                                self._pending_destructor_returns = []
-                            self._pending_destructor_returns.append((implicit_return_id, next_after_scope_id, edge_label, class_name))
+                            # Note: next_after_scope_id can be None when return statement exits scope
+                            # In that case, don't add a return edge (destructors just end)
+                            if next_after_scope_id is not None:
+                                if not hasattr(self, '_pending_destructor_returns'):
+                                    self._pending_destructor_returns = []
+                                self._pending_destructor_returns.append((implicit_return_id, next_after_scope_id, edge_label, class_name))
 
     def chain_base_class_destructors(self):
         """
@@ -1556,11 +1557,25 @@ class CFGGraph_cpp(CFGGraph):
                             has_init_declarator = True
 
                             # Extract variable name from declarator
+                            # Also check if it's a pointer declarator (which doesn't call constructors)
                             declarator = child.child_by_field_name("declarator")
+                            is_pointer_declarator = False
                             if declarator:
                                 if declarator.type == "identifier":
                                     var_name = declarator.text.decode('utf-8')
+                                elif declarator.type == "pointer_declarator":
+                                    is_pointer_declarator = True
+                                    # Extract variable name from pointer declarator if needed for other purposes
+                                    for subchild in declarator.children:
+                                        if subchild.type == "identifier":
+                                            var_name = subchild.text.decode('utf-8')
+                                            break
                                 # Handle other declarator types if needed
+
+                            # Skip constructor call tracking for pointer declarations
+                            # Example: Base *ptr = nullptr; should NOT call Base constructor
+                            if is_pointer_declarator:
+                                continue
 
                             # Check for different constructor patterns
                             args_node = None
@@ -1626,18 +1641,28 @@ class CFGGraph_cpp(CFGGraph):
 
                     # If no init_declarator, it's a plain declaration (default constructor)
                     # Example: ResourceHolder obj1;
+                    # BUT: Skip pointer declarations like "Base *ptr;" which don't call constructors
                     if not has_init_declarator:
-                        # Extract variable name from plain declarator
+                        # Check if it's a pointer declaration (which doesn't call constructor)
+                        is_pointer_declaration = False
                         for child in root_node.children:
-                            if child.type == "identifier":
-                                var_name = child.text.decode('utf-8')
+                            if child.type == "pointer_declarator":
+                                is_pointer_declaration = True
                                 break
 
-                        signature = tuple()  # Empty signature for default constructor
-                        key = (class_name, signature)
-                        if key not in self.records["constructor_calls"]:
-                            self.records["constructor_calls"][key] = []
-                        self.records["constructor_calls"][key].append((call_index, parent_index))
+                        # Only register constructor call if it's NOT a pointer declaration
+                        if not is_pointer_declaration:
+                            # Extract variable name from plain declarator
+                            for child in root_node.children:
+                                if child.type == "identifier":
+                                    var_name = child.text.decode('utf-8')
+                                    break
+
+                            signature = tuple()  # Empty signature for default constructor
+                            key = (class_name, signature)
+                            if key not in self.records["constructor_calls"]:
+                                self.records["constructor_calls"][key] = []
+                            self.records["constructor_calls"][key].append((call_index, parent_index))
 
                     # Add object to scope tracking for RAII
                     if var_name and scope_node:
@@ -4052,6 +4077,14 @@ class CFGGraph_cpp(CFGGraph):
                                 func_name = child.text.decode('utf-8')
                                 break
                             elif child.type == "field_identifier":
+                                func_name = child.text.decode('utf-8')
+                                break
+                            elif child.type == "destructor_name":
+                                # For destructors like ~Base(), ~Derived()
+                                func_name = child.text.decode('utf-8')
+                                break
+                            elif child.type == "qualified_identifier":
+                                # For qualified names like Base::~Base()
                                 func_name = child.text.decode('utf-8')
                                 break
 
