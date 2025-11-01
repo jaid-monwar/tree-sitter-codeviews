@@ -4,11 +4,12 @@
 
 2. Same problem that occured for C. Can't detect call to average() from inside printf()
 
-3. Shows destructor calls, but does not show constructor calls. Shows nonsensical nodes.
+3. Shows destructor calls correctly, but does not show constructor calls. Shows nonsensical nodes.
 
 4. There is a nonsensical node with a implicit_return edge after the constructor. This should not exist.
 
-5. There shouldn't be an edge from if(node > 100) to printf("if done\n")
+5. There shouldn't be an edge from if(node > 100) to std::cout << "if done\n";
+
 
 6. Can't handle namespaces at all.
 
