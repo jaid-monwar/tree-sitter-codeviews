@@ -497,6 +497,79 @@ class CFGGraph_cpp(CFGGraph):
 
         return node.type in jump_types
 
+    def statement_invokes_lambda(self, node):
+        """
+        Check if a statement invokes a lambda (either stored or immediately invoked).
+        Returns True if the statement has a lambda invocation, False otherwise.
+
+        This is used to determine if we should skip creating implicit_return edges
+        from this statement, since the lambda's return edges will handle the flow.
+        """
+        if node is None:
+            return False
+
+        # Check if this node has any outgoing lambda_invocation edges
+        # We need to check this AFTER lambda edges are created, but this method
+        # is called during function processing (before lambda edges).
+        # Solution: Check if this statement calls a lambda variable or contains
+        # an immediately-invoked lambda.
+
+        # Check for immediately-invoked lambda: [...]() { }();
+        def contains_immediate_lambda_call(n):
+            if n.type == "call_expression":
+                func = n.child_by_field_name("function")
+                if func and func.type == "lambda_expression":
+                    return True
+            for child in n.named_children:
+                if contains_immediate_lambda_call(child):
+                    return True
+            return False
+
+        if contains_immediate_lambda_call(node):
+            return True
+
+        # Check for stored lambda calls: if this statement calls a variable
+        # that is a known lambda variable or a function-type parameter
+        def contains_lambda_var_call(n):
+            if n.type == "call_expression":
+                func = n.child_by_field_name("function")
+                if func and func.type == "identifier":
+                    var_name = func.text.decode('utf-8')
+                    # Check if this variable is a lambda
+                    if var_name in self.records.get("lambda_variables", {}):
+                        return True
+                    # Check if this is a function parameter (could be a lambda passed as param)
+                    # Look for this identifier in the containing function's parameter list
+                    containing_func = self.get_containing_function(node)
+                    if containing_func:
+                        declarator = containing_func.child_by_field_name("declarator")
+                        if declarator:
+                            parameters = declarator.child_by_field_name("parameters")
+                            if parameters:
+                                for param in parameters.named_children:
+                                    if param.type == "parameter_declaration":
+                                        # Check if parameter name matches
+                                        param_decl = param.child_by_field_name("declarator")
+                                        if param_decl:
+                                            param_name = None
+                                            if param_decl.type == "identifier":
+                                                param_name = param_decl.text.decode('utf-8')
+                                            elif param_decl.type == "reference_declarator":
+                                                for child in param_decl.named_children:
+                                                    if child.type == "identifier":
+                                                        param_name = child.text.decode('utf-8')
+                                                        break
+                                            if param_name == var_name:
+                                                # This is a function parameter being called
+                                                # It could be a lambda (function<> type or function pointer)
+                                                return True
+            for child in n.named_children:
+                if contains_lambda_var_call(child):
+                    return True
+            return False
+
+        return contains_lambda_var_call(node)
+
     def extract_thrown_type(self, throw_node):
         """
         Extract the type of the expression being thrown.
@@ -4198,7 +4271,14 @@ class CFGGraph_cpp(CFGGraph):
                                 compound_control_stmts = ["if_statement", "while_statement", "for_statement",
                                                           "for_range_loop", "do_statement", "switch_statement",
                                                           "try_statement"]
-                                if not self.is_jump_statement(last_stmt_node) and last_stmt_node.type not in compound_control_stmts:
+
+                                # ALSO skip if the statement invokes a lambda - the lambda's return edge
+                                # will handle the connection to implicit_return
+                                invokes_lambda = self.statement_invokes_lambda(last_stmt_node)
+
+                                if (not self.is_jump_statement(last_stmt_node)
+                                    and last_stmt_node.type not in compound_control_stmts
+                                    and not invokes_lambda):
                                     self.add_edge(last_stmt_id, implicit_return_id, "implicit_return")
 
             # ─────────────────────────────────────────────────────────
