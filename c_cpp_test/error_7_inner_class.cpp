@@ -1,3 +1,4 @@
+#include <iostream>
 struct enclose
 {
     struct inner
@@ -8,7 +9,9 @@ struct enclose
 };
  
 int enclose::inner::x = 1;       // definition
-void enclose::inner::f(int i) {} // definition
+void enclose::inner::f(int i) {
+    std::cout << "Hello World " << i;
+} // definition
 
 int main()
 {
