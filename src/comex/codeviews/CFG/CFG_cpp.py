@@ -3797,25 +3797,31 @@ class CFGGraph_cpp(CFGGraph):
 
         next_index, next_node = self.get_next_index(call_site_node, node_list)
 
-        # CRITICAL FIX: Lambda returns should go back to the call site, not directly to next statement
-        # This is because the call site needs to complete the assignment/expression evaluation
-        # after the lambda returns.
-        #
+        # Lambda returns should go to the next statement after the call site
         # Control flow:
         #   call_site -> lambda_body (invocation)
-        #   lambda_exit -> call_site (return to complete assignment)
-        #   call_site -> next_statement (continue execution)
+        #   lambda_body_exit -> next_statement_after_call_site (return)
         #
-        # We do NOT remove the next_line edge from call_site because it represents
-        # the continuation after the lambda returns and completes.
+        # For stored lambdas passed as function parameters (e.g., func(lambda_var)),
+        # the call site is the function call statement, and we should return to the
+        # statement after it, not back to the call itself.
 
-        # Create return edges from each exit point back to the call site
+        # Create return edges from each exit point to next statement
         for exit_node in exit_points:
             exit_key = (exit_node.start_point, exit_node.end_point, exit_node.type)
             if exit_key in node_list:
                 exit_id = self.get_index(exit_node)
-                # Return to the call site to complete the assignment/expression
-                self.add_edge(exit_id, call_site_id, "lambda_return")
+                if next_index and next_index not in [0, 1, 2]:
+                    # Return to next statement after call site
+                    self.add_edge(exit_id, next_index, "lambda_return")
+                elif next_index == 2:
+                    # Reached function boundary - connect to implicit return if it exists
+                    func = self.get_containing_function(call_site_node)
+                    if func:
+                        func_index = self.get_index(func)
+                        if func_index in self.records["implicit_return_map"]:
+                            implicit_return_id = self.records["implicit_return_map"][func_index]
+                            self.add_edge(exit_id, implicit_return_id, "lambda_return")
 
     def add_lambda_edges(self):
         """
@@ -4727,30 +4733,11 @@ class CFGGraph_cpp(CFGGraph):
             # LAMBDA EXPRESSION
             # ─────────────────────────────────────────────────────────
             elif node.type == "lambda_expression":
-                # Lambda creation happens at definition time and is part of sequential execution
-                # This includes capturing variables and creating the function object
-                #
-                # Flow at definition time:
-                #   declaration_statement -> lambda_expression -> next_statement
-                #
-                # The lambda BODY is NOT executed at definition time
-                # Body execution edges are created in add_lambda_edges()
-
-                # Find the parent statement that contains this lambda
-                parent = node.parent
-                while parent and parent.type not in self.statement_types["node_list_type"]:
-                    parent = parent.parent
-
-                if parent and (parent.start_point, parent.end_point, parent.type) in node_list:
-                    parent_id = self.get_index(parent)
-
-                    # Edge from parent statement to lambda expression (definition-time evaluation)
-                    self.add_edge(parent_id, current_index, "lambda_definition")
-
-                    # NOTE: We do NOT create next_line edges from lambda expressions
-                    # Lambda expressions are only executed when invoked, not when defined
-                    # Sequential flow continues directly from the parent declaration to the next statement
-                    # The lambda BODY is connected via lambda_invocation edges (created in add_lambda_edges)
+                # Lambda expressions are no longer added as separate CFG nodes (fixed in cpp_nodes.py)
+                # They are tracked in node_list for internal use but not in graph_node_list
+                # All lambda edges (invocation, return) are now created in add_lambda_edges() (STEP 8)
+                # which properly distinguishes between immediately-invoked and stored lambdas
+                pass
 
         # ═══════════════════════════════════════════════════════════
         # STEP 6.5: Connect dangling paths to implicit returns

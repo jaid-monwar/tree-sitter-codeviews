@@ -683,6 +683,39 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         # Skip statements that are children of attributed_statement (the attributed_statement itself will be processed)
         elif root_node.parent and root_node.parent.type == "attributed_statement":
             pass  # Skip inner statements - the attributed_statement wrapper is the CFG node
+        # Skip lambda_expression nodes when they are nested inside another statement
+        # The parent statement (e.g., declaration) already handles the lambda and strips its body
+        # Lambda nodes are kept in node_list for CFG edge creation but NOT added to graph_node_list (final CFG output)
+        elif root_node.type == "lambda_expression":
+            # Check if lambda is nested inside another statement type
+            parent = root_node.parent
+            # Walk up to find the first statement-level parent
+            while parent and parent.type not in statement_types["node_list_type"]:
+                parent = parent.parent
+
+            # If the parent is a statement (declaration, expression_statement, etc.) and it's not the lambda itself,
+            # then skip this lambda as a CFG node - it's already represented by the parent
+            if parent and parent.type != "lambda_expression":
+                # This lambda is nested in a statement
+                # Add to node_list for internal tracking (CFG edge creation needs it)
+                # but DO NOT add to graph_node_list (we don't want it as a separate CFG node)
+                node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
+                # NO graph_node_list.append() - this prevents it from appearing in final CFG
+            else:
+                # This is a standalone lambda (immediately invoked at statement level)
+                # Add to both node_list and graph_node_list
+                node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
+                label = root_node.text.decode("UTF-8")
+                type_label = "expression_statement"
+                try:
+                    if "{" in label:
+                        label = label.split("{")[0] + label.split("}")[-1]
+                    else:
+                        label = root_node.text.decode('utf-8')
+                except:
+                    pass
+                graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)],
+                                       root_node.start_point[0], label, type_label))
         elif (
             root_node.type in statement_types["inner_node_type"]
             and root_node.parent is not None
@@ -718,16 +751,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     records["lambda_map"][lambda_node] = root_node
                 label = raw_label + label
 
-            elif root_node.type == "lambda_expression":
-                try:
-                    if "{" in label:
-                        label = label.split("{")[0] + label.split("}")[-1]
-                    else:
-                        label = root_node.text.decode('utf-8')
-                except:
-                    pass
+            # Note: lambda_expression nodes are now handled earlier (lines 689-715)
+            # to prevent them from being added as separate nodes when nested in statements
 
-            elif root_node.type == "function_definition":
+            if root_node.type == "function_definition":
                 label = ""
                 declarator = root_node.child_by_field_name("declarator")
 
