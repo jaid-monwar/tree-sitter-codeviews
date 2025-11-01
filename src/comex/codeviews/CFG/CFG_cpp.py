@@ -53,6 +53,7 @@ class CFGGraph_cpp(CFGGraph):
             "lambda_variables": {},                # lambda_var_name → lambda_node_key
             "lambda_arguments": {},                # (call_id, arg_index) → lambda_var_name
             "function_parameter_to_lambda": {},    # (function_id, param_name) → lambda_var_name
+            "variadic_functions": {},              # ((class, function), sig) → True (marks functions with ... parameters)
         }
         self.index_counter = max(self.index.values())
         self.CFG_node_indices = []
@@ -367,20 +368,28 @@ class CFGGraph_cpp(CFGGraph):
                         break
 
                 if declarator:
+                    # Track if this function has variadic parameters
+                    is_variadic = False
+
                     # Recursively search for identifier/field_identifier and parameter_list
                     def extract_from_declarator(decl_node):
-                        nonlocal fn_name, fn_sig
+                        nonlocal fn_name, fn_sig, is_variadic
                         for gc in decl_node.children:
                             # Methods use field_identifier, standalone functions use identifier
                             if gc.type in ["identifier", "field_identifier"]:
                                 fn_name = gc.text.decode('utf-8')
                             elif gc.type == "parameter_list":
                                 # Extract parameter types with reference qualifiers
-                                for param in gc.named_children:
+                                # Use gc.children (not named_children) to include '...' which is not a named node
+                                for param in gc.children:
                                     if param.type == "parameter_declaration":
                                         param_type = self.extract_parameter_type(param)
                                         if param_type:
                                             fn_sig.append(param_type)
+                                    elif param.type == "...":
+                                        # Variadic parameter detected
+                                        is_variadic = True
+                                        fn_sig.append("...")
                             elif gc.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
                                 # Recurse
                                 extract_from_declarator(gc)
@@ -397,6 +406,10 @@ class CFGGraph_cpp(CFGGraph):
                 if key not in self.records["function_list"]:
                     # Add it
                     self.records["function_list"][key] = fn_id
+
+                    # Mark as variadic if it has ... parameters
+                    if is_variadic:
+                        self.records["variadic_functions"][key] = True
 
     def extract_parameter_type(self, param_node):
         """
@@ -2066,6 +2079,7 @@ class CFGGraph_cpp(CFGGraph):
         - Lvalue to value: 'int&' matches 'int' (lvalue can bind to value parameter)
         - Const reference to value: 'const int&' matches 'int'
         - 'unknown' matches any type (for cases where we can't infer the type)
+        - Variadic functions: If func_sig ends with '...', call_sig can have any number of extra arguments
 
         Args:
             call_sig: Tuple of argument types from the call site
@@ -2074,12 +2088,29 @@ class CFGGraph_cpp(CFGGraph):
         Returns:
             bool: True if signatures are compatible, False otherwise
         """
-        # Different number of parameters
-        if len(call_sig) != len(func_sig):
-            return False
+        # Check if function has variadic parameters
+        is_variadic = len(func_sig) > 0 and func_sig[-1] == "..."
+
+        if is_variadic:
+            # For variadic functions, call must have at least as many args as fixed params
+            # func_sig is like ('int', '...') and call_sig is like ('int', 'int', 'int', 'int', 'int')
+            fixed_param_count = len(func_sig) - 1  # Subtract 1 for the '...'
+
+            if len(call_sig) < fixed_param_count:
+                # Not enough arguments for fixed parameters
+                return False
+
+            # Check only the fixed parameters (all except the last '...')
+            params_to_check = zip(call_sig[:fixed_param_count], func_sig[:fixed_param_count])
+        else:
+            # Non-variadic function - must have exact number of parameters
+            if len(call_sig) != len(func_sig):
+                return False
+
+            params_to_check = zip(call_sig, func_sig)
 
         # Check each parameter
-        for call_type, func_type in zip(call_sig, func_sig):
+        for call_type, func_type in params_to_check:
             # Exact match
             if call_type == func_type:
                 continue

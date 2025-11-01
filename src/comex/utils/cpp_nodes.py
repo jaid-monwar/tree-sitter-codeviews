@@ -374,40 +374,46 @@ def is_template_specialization(node):
 
 
 def get_signature(node):
-    """Extract function signature (parameter types) including reference qualifiers"""
+    """Extract function signature (parameter types) including reference qualifiers and variadic parameters"""
     signature = []
     parameter_list = node.child_by_field_name('parameters')
     if parameter_list is None:
         return tuple(signature)
 
-    parameters = list(filter(lambda x: x.type == 'parameter_declaration' or x.type == 'optional_parameter_declaration', parameter_list.children))
-    for parameter in parameters:
-        # Get the base type from parameter
-        base_type = None
-        for child in parameter.children:
-            if child.type in ['primitive_type', 'type_identifier', 'template_type', 'qualified_identifier', 'sized_type_specifier']:
-                base_type = child.text.decode('utf-8')
-                break
+    # Include both parameter_declaration nodes and variadic '...' nodes
+    # Use parameter_list.children (not filtered) to catch '...' which is not a parameter_declaration
+    for param in parameter_list.children:
+        if param.type in ['parameter_declaration', 'optional_parameter_declaration']:
+            # Get the base type from parameter
+            base_type = None
+            for child in param.children:
+                if child.type in ['primitive_type', 'type_identifier', 'template_type', 'qualified_identifier', 'sized_type_specifier']:
+                    base_type = child.text.decode('utf-8')
+                    break
 
-        if base_type:
-            # Check for reference/pointer declarator
-            declarator = parameter.child_by_field_name('declarator')
-            if declarator:
-                if declarator.type == 'reference_declarator':
-                    # Check if it's rvalue reference (&&) or lvalue reference (&)
-                    declarator_text = declarator.text.decode('utf-8')
-                    if declarator_text.startswith('&&'):
-                        signature.append(base_type + '&&')
+            if base_type:
+                # Check for reference/pointer declarator
+                declarator = param.child_by_field_name('declarator')
+                if declarator:
+                    if declarator.type == 'reference_declarator':
+                        # Check if it's rvalue reference (&&) or lvalue reference (&)
+                        declarator_text = declarator.text.decode('utf-8')
+                        if declarator_text.startswith('&&'):
+                            signature.append(base_type + '&&')
+                        else:
+                            signature.append(base_type + '&')
+                    elif declarator.type == 'pointer_declarator':
+                        signature.append(base_type + '*')
                     else:
-                        signature.append(base_type + '&')
-                elif declarator.type == 'pointer_declarator':
-                    signature.append(base_type + '*')
+                        # Other declarator types (array, etc.)
+                        signature.append(base_type)
                 else:
-                    # Other declarator types (array, etc.)
+                    # No declarator, just base type
                     signature.append(base_type)
-            else:
-                # No declarator, just base type
-                signature.append(base_type)
+        elif param.type == '...':
+            # Variadic parameter - add it to signature
+            signature.append('...')
+
     return tuple(signature)
 
 
@@ -823,7 +829,12 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                             records["main_class"] = class_index
 
                         for class_name in class_name_list:
-                            records["function_list"][((class_name, function_name), signature)] = function_index
+                            key = ((class_name, function_name), signature)
+                            records["function_list"][key] = function_index
+
+                            # Mark as variadic if signature ends with '...'
+                            if len(signature) > 0 and signature[-1] == '...':
+                                records["variadic_functions"][key] = True
 
                             # Get return type
                             return_type_node = root_node.child_by_field_name("type")
@@ -831,7 +842,7 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                                 return_type = return_type_node.text.decode("UTF-8")
                             else:
                                 return_type = "void"
-                            records["return_type"][((class_name, function_name), signature)] = return_type
+                            records["return_type"][key] = return_type
 
                             # Track C++ specific function features (high priority)
                             if is_virtual or is_pure_virtual:
