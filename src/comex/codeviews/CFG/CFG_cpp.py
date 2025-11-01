@@ -4299,8 +4299,8 @@ class CFGGraph_cpp(CFGGraph):
                                                 if func_index in self.records["implicit_return_map"]:
                                                     implicit_return_id = self.records["implicit_return_map"][func_index]
                                                     self.add_edge(self.get_index(last_stmt), implicit_return_id, "next_line")
-                        else:
-                            # Single statement after else
+                        elif else_body.type != "if_statement":
+                            # Single statement after else (but NOT an if_statement, which is handled separately)
                             if (else_body.start_point, else_body.end_point, else_body.type) in node_list:
                                 if not self.is_jump_statement(else_body):
                                     next_index, next_node = self.get_next_index(node, node_list)
@@ -4314,6 +4314,8 @@ class CFGGraph_cpp(CFGGraph):
                                             if func_index in self.records["implicit_return_map"]:
                                                 implicit_return_id = self.records["implicit_return_map"][func_index]
                                                 self.add_edge(self.get_index(else_body), implicit_return_id, "next_line")
+                        # If else_body is an if_statement (else-if), don't add an edge here
+                        # The nested if_statement will handle its own connections when processed
                     elif else_body.type == "compound_statement" or else_body.type != "if_statement":
                         # Direct compound_statement (not wrapped in else_clause)
                         last_line, _ = self.get_block_last_line(node, "alternative")
