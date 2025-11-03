@@ -4513,13 +4513,18 @@ class CFGGraph_cpp(CFGGraph):
                         break
 
                 # Create implicit return for:
-                # - Destructors with bodies (exclude pure virtual declarations without bodies)
+                # - Destructors with bodies (needed for base class destructor chaining)
                 # Do NOT create for:
-                # - Void functions (they don't need implicit returns)
+                # - Void functions (they should have direct function_return edges from last statement)
                 # - Constructors (they have their own return semantics)
                 # - Pure virtual destructor declarations (virtual ~Base() = 0;)
                 should_create_implicit_return = (
-                    is_destructor and has_body and not is_pure_virtual  # Only destructors with bodies
+                    is_destructor and has_body and not is_pure_virtual
+                )
+
+                # For void functions without explicit returns, add last statement to return_statement_map
+                should_add_last_stmt_as_return = (
+                    is_void and has_body and not is_pure_virtual
                 )
 
                 if should_create_implicit_return:
@@ -4591,6 +4596,21 @@ class CFGGraph_cpp(CFGGraph):
                                     and last_stmt_node.type not in compound_control_stmts
                                     and not invokes_lambda):
                                     self.add_edge(last_stmt_id, implicit_return_id, "implicit_return")
+
+                # For void functions without explicit returns, add last statement to return_statement_map
+                if should_add_last_stmt_as_return:
+                    # Check if function already has explicit return statements
+                    has_explicit_returns = current_index in self.records.get("return_statement_map", {})
+
+                    if not has_explicit_returns:
+                        # Find the last statement in the function body
+                        last_stmt = self.get_last_statement_in_function_body(node, node_list)
+                        if last_stmt:
+                            last_stmt_id, last_stmt_node = last_stmt
+                            # Add the last statement as a return point for this function
+                            if current_index not in self.records["return_statement_map"]:
+                                self.records["return_statement_map"][current_index] = []
+                            self.records["return_statement_map"][current_index].append(last_stmt_id)
 
             # ─────────────────────────────────────────────────────────
             # CLASS / STRUCT DEFINITION
