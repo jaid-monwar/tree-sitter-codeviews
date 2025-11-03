@@ -3611,7 +3611,8 @@ class CFGGraph_cpp(CFGGraph):
                             # Found a possible target
                             for call_id, parent_id in call_list:
                                 # Add call edge
-                                self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
+                                # Since we resolved the function pointer, treat it as a direct call
+                                self.add_edge(parent_id, fn_id, f"function_call|{call_id}")
 
                                 # Add return edges: return points -> next statement after caller
                                 if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
@@ -3619,7 +3620,7 @@ class CFGGraph_cpp(CFGGraph):
                                         # Check if this is a synthetic implicit return node
                                         is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
-                                        # Get the call site node to find the next statement
+                                        # Get the call site node
                                         parent_key = index_to_key.get(parent_id)
                                         if not parent_key:
                                             continue
@@ -3627,11 +3628,10 @@ class CFGGraph_cpp(CFGGraph):
                                         if not parent_node:
                                             continue
 
-                                        # Find the next statement after the call
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-
-                                        # Return should go to the next statement, not back to the call
-                                        return_target = next_index if next_index != 2 else None
+                                        # Return to the call site (parent_id), not to the next statement
+                                        # The sequential edge from call site to next statement will handle continuation
+                                        # This creates the correct flow: call → function → return → call_site → next
+                                        return_target = parent_id
 
                                         if is_implicit_return:
                                             # FIX #2: For implicit returns, connect from last statement of function body
@@ -3645,10 +3645,11 @@ class CFGGraph_cpp(CFGGraph):
                                                     last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
                                                     if last_stmt:
                                                         last_stmt_id, _ = last_stmt
-                                                        self.add_edge(last_stmt_id, return_target, "indirect_return")
+                                                        # Since we resolved the function pointer, treat it as a direct return
+                                                        self.add_edge(last_stmt_id, return_target, "function_return")
                                                     else:
                                                         # Fallback: empty function body
-                                                        self.add_edge(fn_id, return_target, "indirect_return")
+                                                        self.add_edge(fn_id, return_target, "function_return")
                                         else:
                                             # For regular return statements, check they're in different functions
                                             if parent_id != fn_id and return_target:
@@ -3661,7 +3662,8 @@ class CFGGraph_cpp(CFGGraph):
                                                         parent_func = self.get_containing_function(parent_node)
                                                         return_func = self.get_containing_function(return_node)
                                                         if parent_func != return_func or parent_func is None:
-                                                            self.add_edge(return_id, return_target, "indirect_return")
+                                                            # Since we resolved the function pointer, treat it as a direct return
+                                                            self.add_edge(return_id, return_target, "function_return")
 
         # Also check function_calls for indirect calls (identifiers that don't match any function)
         # These are calls like mathFunc(5, 3) where mathFunc is a function pointer variable
@@ -3683,7 +3685,8 @@ class CFGGraph_cpp(CFGGraph):
                         if fn_name == target_func:
                             for call_id, parent_id in call_list:
                                 # Add call edge
-                                self.add_edge(parent_id, fn_id, f"indirect_call|{call_id}")
+                                # Since we resolved the function pointer, treat it as a direct call
+                                self.add_edge(parent_id, fn_id, f"function_call|{call_id}")
 
                                 # Add return edges: return points -> next statement after caller
                                 if self.records.get("return_statement_map") and fn_id in self.records["return_statement_map"]:
@@ -3691,7 +3694,7 @@ class CFGGraph_cpp(CFGGraph):
                                         # Check if this is a synthetic implicit return node
                                         is_implicit_return = self.records.get("implicit_return_map") and return_id in self.records["implicit_return_map"].values()
 
-                                        # Get the call site node to find the next statement
+                                        # Get the call site node
                                         parent_key = index_to_key.get(parent_id)
                                         if not parent_key:
                                             continue
@@ -3699,11 +3702,10 @@ class CFGGraph_cpp(CFGGraph):
                                         if not parent_node:
                                             continue
 
-                                        # Find the next statement after the call
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-
-                                        # Return should go to the next statement, not back to the call
-                                        return_target = next_index if next_index != 2 else None
+                                        # Return to the call site (parent_id), not to the next statement
+                                        # The sequential edge from call site to next statement will handle continuation
+                                        # This creates the correct flow: call → function → return → call_site → next
+                                        return_target = parent_id
 
                                         if is_implicit_return:
                                             # FIX #2: For implicit returns, connect from last statement of function body
@@ -3717,10 +3719,11 @@ class CFGGraph_cpp(CFGGraph):
                                                     last_stmt = self.get_last_statement_in_function_body(fn_node, self.node_list)
                                                     if last_stmt:
                                                         last_stmt_id, _ = last_stmt
-                                                        self.add_edge(last_stmt_id, return_target, "indirect_return")
+                                                        # Since we resolved the function pointer, treat it as a direct return
+                                                        self.add_edge(last_stmt_id, return_target, "function_return")
                                                     else:
                                                         # Fallback: empty function body
-                                                        self.add_edge(fn_id, return_target, "indirect_return")
+                                                        self.add_edge(fn_id, return_target, "function_return")
                                         else:
                                             # For regular return statements, check they're in different functions
                                             if parent_id != fn_id and return_target:
@@ -3733,7 +3736,8 @@ class CFGGraph_cpp(CFGGraph):
                                                         parent_func = self.get_containing_function(parent_node)
                                                         return_func = self.get_containing_function(return_node)
                                                         if parent_func != return_func or parent_func is None:
-                                                            self.add_edge(return_id, return_target, "indirect_return")
+                                                            # Since we resolved the function pointer, treat it as a direct return
+                                                            self.add_edge(return_id, return_target, "function_return")
 
         # ═══════════════════════════════════════════════════════════
         # INDIRECT LAMBDA INVOCATIONS: Handle calls to function parameters that are lambdas
