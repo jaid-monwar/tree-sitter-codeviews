@@ -3329,9 +3329,10 @@ class CFGGraph_cpp(CFGGraph):
                                         # No body statements - this shouldn't happen for derived constructors
                                         return_target = None
                                 else:
-                                    # Regular constructor call: return to next statement after call
-                                    next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                    return_target = next_index if next_index != 2 else None
+                                    # Regular constructor call: return to call site (parent_id)
+                                    # The sequential edge from call site to next statement will handle continuation
+                                    # This creates the correct flow: call → constructor → return → call_site → next
+                                    return_target = parent_id
 
                                 if return_target and parent_id != fn_id:
                                     # Get last statement in constructor body
@@ -3388,9 +3389,9 @@ class CFGGraph_cpp(CFGGraph):
                                             else:
                                                 return_target = None
                                     else:
-                                        # FIXED: Always return to next statement after constructor call
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        return_target = next_index if next_index != 2 else None
+                                        # FIXED: Always return to call site (parent_id)
+                                        # The sequential edge from call site to next statement will handle continuation
+                                        return_target = parent_id
 
                                     if is_implicit_return:
                                         # FIX #2: For implicit returns, connect from last statement of constructor body
@@ -3820,68 +3821,15 @@ class CFGGraph_cpp(CFGGraph):
                 self.CFG_edge_list.remove(edge)
 
         # ═══════════════════════════════════════════════════════════
-        # CLEANUP: Remove redundant next_line edges for constructor calls
+        # NOTE: next_line edges from constructor call sites are now REQUIRED
         # ═══════════════════════════════════════════════════════════
-        # When a constructor is called, control flow goes to the constructor
-        # and returns via constructor_return edge. The next_line edge from the
-        # declaration to the next statement is redundant and incorrectly suggests
-        # the constructor can be bypassed.
-        edges_to_remove = []
-
-        for (class_name, signature), call_list in self.records["constructor_calls"].items():
-            # Find matching constructor in function_list
-            for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                # Match by class name and function name
-                if fn_class_name == class_name and fn_name == class_name:
-                    # Check signature match (simplified check - more detailed matching is done in constructor processing)
-                    sig_match = False
-
-                    # Exact match
-                    if fn_sig == signature:
-                        sig_match = True
-                    # Special case: copy constructor (const T&)
-                    elif signature == (f"const {class_name}&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
-                        sig_match = True
-                    # Special case: move constructor (T&&)
-                    elif signature == (f"{class_name}&&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
-                        sig_match = True
-                    # Handle default parameters: call can have fewer args than definition
-                    elif len(signature) <= len(fn_sig):
-                        sig_match = True  # Simplified check
-
-                    if sig_match:
-                        # Found matching constructor - remove next_line edges from call sites
-                        for call_id, parent_id in call_list:
-                            # Find and mark the next_line edge from this call site for removal
-                            for edge in self.CFG_edge_list:
-                                if edge[0] == parent_id and edge[2] == "next_line":
-                                    edges_to_remove.append(edge)
-                                    break
-                        break  # Found matching constructor, no need to check others
-
-        # Also handle synthetic constructors (constructors that weren't explicitly defined)
-        # These are created for classes without explicit constructors
-        for (class_name, signature), call_list in self.records["constructor_calls"].items():
-            # Check if this constructor was not found in function_list (synthetic)
-            found_in_function_list = False
-            for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
-                if fn_class_name == class_name and fn_name == class_name:
-                    found_in_function_list = True
-                    break
-
-            # If not found in function_list, it's a synthetic constructor
-            if not found_in_function_list:
-                for call_id, parent_id in call_list:
-                    # Remove next_line edges from synthetic constructor call sites
-                    for edge in self.CFG_edge_list:
-                        if edge[0] == parent_id and edge[2] == "next_line":
-                            edges_to_remove.append(edge)
-                            break
-
-        # Remove marked edges for constructor calls
-        for edge in edges_to_remove:
-            if edge in self.CFG_edge_list:
-                self.CFG_edge_list.remove(edge)
+        # With the fix where constructor_return goes back to the call site (not the next statement),
+        # the control flow is: call_site → constructor → call_site → next_statement
+        # The next_line edge from call_site to next_statement is necessary for proper flow continuation.
+        # This matches the behavior of regular function calls:
+        #   - function_return also returns to the call site
+        #   - next_line edge continues execution to the next statement
+        # Previous cleanup code that removed these edges has been removed.
 
     def track_lambda_variables(self, node_list):
         """
