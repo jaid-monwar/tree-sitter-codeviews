@@ -13,3 +13,9 @@ CLAUDE.md
 .coverage
 *.png
 *.dot
+*.json
+.vscode/
+.venv
+.pytest_cache/
+.idea/
+.claude/
