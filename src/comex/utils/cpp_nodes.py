@@ -614,6 +614,17 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         type_label = "catch"
         graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
 
+    # Special handling for do-while condition
+    elif (
+        root_node.type == "parenthesized_expression"
+        and root_node.parent is not None
+        and root_node.parent.type == "do_statement"
+    ):
+        label = "while" + root_node.text.decode("UTF-8")
+        type_label = "while"
+        node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
+        graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
+
     elif root_node.type in ["preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
                             "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else"]:
         # Handle preprocessor directives specially - they should NOT be added to graph_node_list

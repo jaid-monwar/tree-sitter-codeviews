@@ -4760,54 +4760,62 @@ class CFGGraph_cpp(CFGGraph):
             # DO-WHILE LOOP
             # ─────────────────────────────────────────────────────────
             elif node.type == "do_statement":
-                # Do-while loop structure:
-                # 1. Body always executes once (unconditional entry)
-                # 2. After body, condition is checked at the do statement
-                # 3. If condition true (pos_next), loop back to body
-                # 4. If condition false (neg_next), exit loop
+                # Do-while loop structure (following C implementation pattern):
+                # In a do-while loop, the body MUST execute at least once (unconditional),
+                # then the WHILE condition is checked, and if true, the body executes again.
+                #
+                # Correct control flow:
+                # 1. do statement → first statement in body (unconditional, using first_next_line)
+                # 2. last statement in body → while condition node (next_line)
+                # 3. while condition node:
+                #    - pos_next: loops back to first statement in body if true
+                #    - neg_next: exits to next statement if false
 
-                # Edge to first statement in loop body (unconditional - body always executes once)
+                # Unconditional edge to first statement in loop body
                 body = node.child_by_field_name("body")
+                first_stmt_index = None
                 if body:
                     if body.type == "compound_statement":
                         children = list(body.named_children)
                         if children:
                             first_stmt = children[0]
                             if (first_stmt.start_point, first_stmt.end_point, first_stmt.type) in node_list:
-                                # First entry is unconditional (not pos_next)
-                                self.add_edge(current_index, self.get_index(first_stmt), "first_next_line")
+                                first_stmt_index = self.get_index(first_stmt)
+                                # Use first_next_line for unconditional entry into the loop body
+                                self.add_edge(current_index, first_stmt_index, "first_next_line")
                     else:
                         if (body.start_point, body.end_point, body.type) in node_list:
-                            self.add_edge(current_index, self.get_index(body), "first_next_line")
+                            first_stmt_index = self.get_index(body)
+                            self.add_edge(current_index, first_stmt_index, "first_next_line")
 
-                    # Back edge from last statement to do node for condition check
-                    # After the condition check:
-                    #   - pos_next goes back to first statement (loop again)
-                    #   - neg_next exits the loop
-                    # BUT: Don't add edge if last statement is a jump statement OR try_statement
-                    # try_statement manages its own exit paths through try block and catch clauses
+                    # Edge from last statement in body to while condition
                     last_line, _ = self.get_block_last_line(node, "body")
                     if last_line and (last_line.start_point, last_line.end_point, last_line.type) in node_list:
-                        if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
-                            # Back to do statement for condition evaluation
-                            self.add_edge(self.get_index(last_line), current_index, "loop_control")
+                        # Find the while condition node
+                        condition = node.child_by_field_name("condition")
+                        if condition:
+                            cond_key = (condition.start_point, condition.end_point, condition.type)
+                            if cond_key in node_list:
+                                cond_index = self.get_index(condition)
+                                if not self.is_jump_statement(last_line) and last_line.type != "try_statement":
+                                    # Flow from last statement to while condition for evaluation
+                                    self.add_edge(self.get_index(last_line), cond_index, "next_line")
 
-                    # After condition check at do statement:
-                    # pos_next: condition true → loop back to first statement in body
-                    if body.type == "compound_statement":
-                        children = list(body.named_children)
-                        if children:
-                            first_stmt = children[0]
-                            if (first_stmt.start_point, first_stmt.end_point, first_stmt.type) in node_list:
-                                self.add_edge(current_index, self.get_index(first_stmt), "pos_next")
-                    else:
-                        if (body.start_point, body.end_point, body.type) in node_list:
-                            self.add_edge(current_index, self.get_index(body), "pos_next")
+                # Create edges from while condition node
+                condition = node.child_by_field_name("condition")
+                if condition:
+                    cond_key = (condition.start_point, condition.end_point, condition.type)
+                    if cond_key in node_list:
+                        cond_index = self.get_index(condition)
 
-                # neg_next: condition false → exit loop to next statement
-                next_index, next_node = self.get_next_index(node, node_list)
-                if next_index != 2:
-                    self.add_edge(current_index, next_index, "neg_next")
+                        # pos_next: condition true → loop back to first statement in body
+                        if first_stmt_index is not None:
+                            self.add_edge(cond_index, first_stmt_index, "pos_next")
+
+                        # neg_next: condition false → exit loop to next statement
+                        next_index, next_node = self.get_next_index(node, node_list)
+                        if next_index != 2:
+                            self.add_edge(cond_index, next_index, "neg_next")
 
             # ─────────────────────────────────────────────────────────
             # BREAK STATEMENT
