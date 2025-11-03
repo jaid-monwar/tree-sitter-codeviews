@@ -2922,9 +2922,10 @@ class CFGGraph_cpp(CFGGraph):
                         if not parent_node:
                             continue
 
-                        # Calculate the return target (next statement after the call)
-                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                        return_target = next_index if next_index != 2 else None
+                        # FIXED: Return to the call site (parent_id), NOT to the next statement
+                        # The sequential edge from call site to next statement will handle continuation
+                        # This creates the correct flow: call → method → return → call_site → next
+                        return_target = parent_id
 
                         if return_target and parent_id != fn_id:
                             # Add return edges from all return statements in this function
@@ -3196,10 +3197,10 @@ class CFGGraph_cpp(CFGGraph):
                             if not parent_node:
                                 continue
 
-                            # Determine return target
-                            # FIXED: Return to next statement after operator call
-                            next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                            return_target = next_index if next_index != 2 else None
+                            # FIXED: Return to the call site (parent_id), NOT to the next statement
+                            # The sequential edge from call site to next statement will handle continuation
+                            # This creates the correct flow: call → operator → return → call_site → next
+                            return_target = parent_id
 
                             if parent_id != fn_id and return_target:
                                 # Get return node from index
