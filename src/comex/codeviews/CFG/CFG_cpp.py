@@ -1629,7 +1629,31 @@ class CFGGraph_cpp(CFGGraph):
                             template_args.append(arg_text)
                         template_args = tuple(template_args)
 
-            if class_name:
+            # List of C types and STL types that should not have synthetic constructors
+            # These types either don't have constructors (C types) or have their own constructors
+            # defined in standard library headers (STL types)
+            c_types_no_constructors = {
+                # C standard library types
+                'va_list', 'FILE', 'size_t', 'ptrdiff_t', 'time_t', 'clock_t',
+                'jmp_buf', 'sig_atomic_t', 'wchar_t', 'mbstate_t', 'fpos_t',
+                'div_t', 'ldiv_t', 'lldiv_t', 'imaxdiv_t', 'tm',
+                # C++ STL containers and types
+                'vector', 'list', 'deque', 'queue', 'priority_queue', 'stack',
+                'set', 'multiset', 'map', 'multimap',
+                'unordered_set', 'unordered_multiset', 'unordered_map', 'unordered_multimap',
+                'string', 'wstring', 'u16string', 'u32string',
+                'pair', 'tuple', 'array', 'bitset',
+                'unique_ptr', 'shared_ptr', 'weak_ptr',
+                'optional', 'variant', 'any',
+                'function', 'reference_wrapper',
+                'istream', 'ostream', 'iostream', 'ifstream', 'ofstream', 'fstream',
+                'istringstream', 'ostringstream', 'stringstream',
+                'cin', 'cout', 'cerr', 'clog',
+                # Add more standard library types as needed
+            }
+
+            # Skip constructor generation for C types
+            if class_name and class_name not in c_types_no_constructors:
 
                 # Find the parent statement node
                 parent_stmt = root_node
