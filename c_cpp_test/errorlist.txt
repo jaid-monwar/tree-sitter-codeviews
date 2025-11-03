@@ -1,4 +1,4 @@
-Replace SCOPE with the :: symbol
+Replace SCOPE with the :: symbol (done)
 
 1. do-while loop is wrong, pos_next and neg_next should be with the while statement, not the do statement.
    There is no loop_update in while loop.

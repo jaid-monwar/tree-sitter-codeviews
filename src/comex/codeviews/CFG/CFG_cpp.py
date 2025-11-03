@@ -718,9 +718,9 @@ class CFGGraph_cpp(CFGGraph):
 
             # For classes, check inheritance
             if thrown_cat == 'class':
-                # Normalize scope operators (handle both :: and _SCOPE_)
-                thrown_normalized = thrown_str.replace('_SCOPE_', '::').replace(' ', '') if thrown_str else ''
-                catch_normalized = catch_str.replace('_SCOPE_', '::').replace(' ', '') if catch_str else ''
+                # Normalize by removing spaces for comparison
+                thrown_normalized = thrown_str.replace(' ', '') if thrown_str else ''
+                catch_normalized = catch_str.replace(' ', '') if catch_str else ''
 
                 # Check for exact match
                 if thrown_normalized == catch_normalized:
