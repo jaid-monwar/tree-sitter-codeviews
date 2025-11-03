@@ -3819,6 +3819,70 @@ class CFGGraph_cpp(CFGGraph):
             if edge in self.CFG_edge_list:
                 self.CFG_edge_list.remove(edge)
 
+        # ═══════════════════════════════════════════════════════════
+        # CLEANUP: Remove redundant next_line edges for constructor calls
+        # ═══════════════════════════════════════════════════════════
+        # When a constructor is called, control flow goes to the constructor
+        # and returns via constructor_return edge. The next_line edge from the
+        # declaration to the next statement is redundant and incorrectly suggests
+        # the constructor can be bypassed.
+        edges_to_remove = []
+
+        for (class_name, signature), call_list in self.records["constructor_calls"].items():
+            # Find matching constructor in function_list
+            for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                # Match by class name and function name
+                if fn_class_name == class_name and fn_name == class_name:
+                    # Check signature match (simplified check - more detailed matching is done in constructor processing)
+                    sig_match = False
+
+                    # Exact match
+                    if fn_sig == signature:
+                        sig_match = True
+                    # Special case: copy constructor (const T&)
+                    elif signature == (f"const {class_name}&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
+                        sig_match = True
+                    # Special case: move constructor (T&&)
+                    elif signature == (f"{class_name}&&",) and len(fn_sig) == 1 and class_name in fn_sig[0]:
+                        sig_match = True
+                    # Handle default parameters: call can have fewer args than definition
+                    elif len(signature) <= len(fn_sig):
+                        sig_match = True  # Simplified check
+
+                    if sig_match:
+                        # Found matching constructor - remove next_line edges from call sites
+                        for call_id, parent_id in call_list:
+                            # Find and mark the next_line edge from this call site for removal
+                            for edge in self.CFG_edge_list:
+                                if edge[0] == parent_id and edge[2] == "next_line":
+                                    edges_to_remove.append(edge)
+                                    break
+                        break  # Found matching constructor, no need to check others
+
+        # Also handle synthetic constructors (constructors that weren't explicitly defined)
+        # These are created for classes without explicit constructors
+        for (class_name, signature), call_list in self.records["constructor_calls"].items():
+            # Check if this constructor was not found in function_list (synthetic)
+            found_in_function_list = False
+            for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                if fn_class_name == class_name and fn_name == class_name:
+                    found_in_function_list = True
+                    break
+
+            # If not found in function_list, it's a synthetic constructor
+            if not found_in_function_list:
+                for call_id, parent_id in call_list:
+                    # Remove next_line edges from synthetic constructor call sites
+                    for edge in self.CFG_edge_list:
+                        if edge[0] == parent_id and edge[2] == "next_line":
+                            edges_to_remove.append(edge)
+                            break
+
+        # Remove marked edges for constructor calls
+        for edge in edges_to_remove:
+            if edge in self.CFG_edge_list:
+                self.CFG_edge_list.remove(edge)
+
     def track_lambda_variables(self, node_list):
         """
         Early pass to identify and track lambda variables.
@@ -4449,14 +4513,13 @@ class CFGGraph_cpp(CFGGraph):
                         break
 
                 # Create implicit return for:
-                # - Void functions
                 # - Destructors with bodies (exclude pure virtual declarations without bodies)
                 # Do NOT create for:
+                # - Void functions (they don't need implicit returns)
                 # - Constructors (they have their own return semantics)
                 # - Pure virtual destructor declarations (virtual ~Base() = 0;)
                 should_create_implicit_return = (
-                    (is_void and not is_constructor and not is_destructor) or  # Regular void functions
-                    (is_destructor and has_body and not is_pure_virtual)       # Destructors with bodies
+                    is_destructor and has_body and not is_pure_virtual  # Only destructors with bodies
                 )
 
                 if should_create_implicit_return:
