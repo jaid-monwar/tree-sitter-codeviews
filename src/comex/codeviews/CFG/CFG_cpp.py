@@ -3468,14 +3468,10 @@ class CFGGraph_cpp(CFGGraph):
                                 base_constructor_id = self.records["function_list"][base_constructor_key]
                                 self.add_edge(synthetic_constructor_id, base_constructor_id, "base_constructor_call")
 
-                                # Return from base constructor to next statement after derived constructor
-                                parent_key = index_to_key.get(parent_id)
-                                if parent_key:
-                                    parent_node = self.node_list.get(parent_key)
-                                    if parent_node:
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        if next_index and next_index != 2:
-                                            self.add_edge(base_constructor_id, next_index, "constructor_return")
+                                # Return from base constructor to call site
+                                # The next_line edge from call site will handle continuation to next statement
+                                if parent_id and parent_id != 2:
+                                    self.add_edge(base_constructor_id, parent_id, "constructor_return")
                             else:
                                 # Base class also has implicit constructor - create synthetic node
                                 base_synthetic_id = self.get_new_synthetic_index()
@@ -3485,23 +3481,15 @@ class CFGGraph_cpp(CFGGraph):
 
                                 self.add_edge(synthetic_constructor_id, base_synthetic_id, "base_constructor_call")
 
-                                # Return from base constructor to next statement after derived constructor
-                                parent_key = index_to_key.get(parent_id)
-                                if parent_key:
-                                    parent_node = self.node_list.get(parent_key)
-                                    if parent_node:
-                                        next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                        if next_index and next_index != 2:
-                                            self.add_edge(base_synthetic_id, next_index, "constructor_return")
+                                # Return from base constructor to call site
+                                # The next_line edge from call site will handle continuation to next statement
+                                if parent_id and parent_id != 2:
+                                    self.add_edge(base_synthetic_id, parent_id, "constructor_return")
                     else:
-                        # No base classes - just return to next statement
-                        parent_key = index_to_key.get(parent_id)
-                        if parent_key:
-                            parent_node = self.node_list.get(parent_key)
-                            if parent_node:
-                                next_index, next_node = self.get_next_index(parent_node, self.node_list)
-                                if next_index and next_index != 2:
-                                    self.add_edge(synthetic_constructor_id, next_index, "constructor_return")
+                        # No base classes - return to call site
+                        # The next_line edge from call site will handle continuation to next statement
+                        if parent_id and parent_id != 2:
+                            self.add_edge(synthetic_constructor_id, parent_id, "constructor_return")
 
         # Process destructor calls
         if self.records.get("destructor_calls"):
