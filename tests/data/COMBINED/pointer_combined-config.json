@@ -1,0 +1,19 @@
+{
+    "combined_views" : {
+        "AST" : {
+            "exists" : true,
+            "collapsed" : false,
+            "minimized" : false,
+            "blacklisted" : []
+        },
+        "CFG" : {
+            "exists" : true
+        },
+        "DFG" : {
+            "exists" : true,
+            "collapsed" : false,
+            "minimized" : false,
+            "statements": true
+        }
+    }
+}

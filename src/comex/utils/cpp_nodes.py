@@ -11,6 +11,7 @@ statement_types = {
         "break_statement",
         "continue_statement",
         "return_statement",
+        "goto_statement",
         "switch_statement",
         "case_statement",
         "throw_statement",
@@ -18,15 +19,15 @@ statement_types = {
         "function_definition",
         "class_specifier",
         "struct_specifier",
-        "namespace_definition",
-        "using_declaration",
+        # "namespace_definition",   # EXCLUDED: Namespaces are compile-time constructs, not runtime execution nodes
+        "using_declaration",          # Included for program comprehension (compile-time name resolution)
         "alias_declaration",
         "template_declaration",
         "field_declaration",
         "access_specifier",
         "constructor_or_destructor_definition",
         "operator_cast",
-        "delete_expression",
+        # "delete_expression",      # Excluded: delete is an expression, always wrapped in expression_statement
         "lambda_expression",
         # HIGH PRIORITY FEATURES ADDED:
         "enum_specifier",           # Enum types
@@ -34,21 +35,25 @@ statement_types = {
         "type_definition",          # Typedef declarations
         "friend_declaration",       # Friend declarations
         "catch_clause",             # Exception catch blocks
+        "attributed_statement",     # Statements with C++ attributes (e.g., [[fallthrough]];)
         # MEDIUM PRIORITY FEATURES ADDED:
-        "new_expression",           # Memory management - new
+        # "new_expression",         # Excluded: new is an expression, not a statement (appears within other statements)
         "static_assert_declaration", # Static assertions
-        "using_declaration",        # Namespace features
+        # "using_declaration",      # Excluded: compile-time only (duplicate, already commented above)
         "namespace_alias_definition", # Namespace aliases
-        "preproc_include",          # Preprocessor directives
-        "preproc_def",              # Preprocessor defines
-        "preproc_ifdef",            # Preprocessor conditionals
-        "preproc_if",
+        # Preprocessor directives - INCLUDED for macro extraction and conditional evaluation:
+        "preproc_include",        # Include directives (won't be added to CFG, just processed)
+        "preproc_def",            # Macro definitions (extracted for condition evaluation)
+        "preproc_ifdef",          # Conditional compilation
+        "preproc_if",             # Conditional compilation
+        "preproc_elif",           # Conditional compilation continuation
+        "preproc_else",           # Conditional compilation alternative
     ],
     "non_control_statement": [
         "declaration",
         "expression_statement",
         "field_declaration",
-        "using_declaration",
+        "using_declaration",          # Included for program comprehension
         "alias_declaration",
         "access_specifier",
         "enum_specifier",
@@ -57,10 +62,12 @@ statement_types = {
         "friend_declaration",
         "static_assert_declaration",
         "namespace_alias_definition",
-        "preproc_include",
-        "preproc_def",
-        "preproc_ifdef",
-        "preproc_if",
+        "attributed_statement",       # Statements with attributes like [[fallthrough]];
+        # Preprocessor directives excluded - they are compile-time only, not runtime:
+        # "preproc_include",          # Excluded: preprocessor directive
+        # "preproc_def",              # Excluded: preprocessor directive
+        # "preproc_ifdef",            # Excluded: preprocessor directive
+        # "preproc_if",               # Excluded: preprocessor directive
     ],
     "control_statement": [
         "if_statement",
@@ -71,6 +78,7 @@ statement_types = {
         "break_statement",
         "continue_statement",
         "return_statement",
+        "goto_statement",
         "switch_statement",
         "try_statement",
         "throw_statement",
@@ -172,6 +180,29 @@ def has_inner_definition(node):
         if has_inner_definition(child):
             return True
     return False
+
+
+def is_function_declaration(node):
+    """
+    Check if a declaration node is a function declaration (forward declaration).
+    Function declarations have a function_declarator child but NO compound_statement (body).
+    Returns True for function declarations (should be excluded from CFG).
+    Returns False for variable declarations (should be included in CFG).
+    """
+    if node.type != "declaration":
+        return False
+
+    has_function_declarator = False
+    has_body = False
+
+    for child in node.children:
+        if child.type == "function_declarator":
+            has_function_declarator = True
+        if child.type == "compound_statement":
+            has_body = True
+
+    # It's a function declaration if it has function_declarator but no body
+    return has_function_declarator and not has_body
 
 
 def find_function_definition(node):
@@ -343,19 +374,46 @@ def is_template_specialization(node):
 
 
 def get_signature(node):
-    """Extract function signature (parameter types)"""
+    """Extract function signature (parameter types) including reference qualifiers and variadic parameters"""
     signature = []
     parameter_list = node.child_by_field_name('parameters')
     if parameter_list is None:
         return tuple(signature)
 
-    parameters = list(filter(lambda x: x.type == 'parameter_declaration' or x.type == 'optional_parameter_declaration', parameter_list.children))
-    for parameter in parameters:
-        # Get the type from parameter
-        for child in parameter.children:
-            if child.type in ['primitive_type', 'type_identifier', 'template_type', 'qualified_identifier', 'sized_type_specifier']:
-                signature.append(child.text.decode('utf-8'))
-                break
+    # Include both parameter_declaration nodes and variadic '...' nodes
+    # Use parameter_list.children (not filtered) to catch '...' which is not a parameter_declaration
+    for param in parameter_list.children:
+        if param.type in ['parameter_declaration', 'optional_parameter_declaration']:
+            # Get the base type from parameter
+            base_type = None
+            for child in param.children:
+                if child.type in ['primitive_type', 'type_identifier', 'template_type', 'qualified_identifier', 'sized_type_specifier']:
+                    base_type = child.text.decode('utf-8')
+                    break
+
+            if base_type:
+                # Check for reference/pointer declarator
+                declarator = param.child_by_field_name('declarator')
+                if declarator:
+                    if declarator.type == 'reference_declarator':
+                        # Check if it's rvalue reference (&&) or lvalue reference (&)
+                        declarator_text = declarator.text.decode('utf-8')
+                        if declarator_text.startswith('&&'):
+                            signature.append(base_type + '&&')
+                        else:
+                            signature.append(base_type + '&')
+                    elif declarator.type == 'pointer_declarator':
+                        signature.append(base_type + '*')
+                    else:
+                        # Other declarator types (array, etc.)
+                        signature.append(base_type)
+                else:
+                    # No declarator, just base type
+                    signature.append(base_type)
+        elif param.type == '...':
+            # Variadic parameter - add it to signature
+            signature.append('...')
+
     return tuple(signature)
 
 
@@ -405,8 +463,45 @@ def check_lambda(node):
 
 
 def get_class_name(node, index):
-    """Returns the class name when a function definition or method is passed to it"""
+    """Returns the class name or namespace when a function definition or method is passed to it.
+
+    For namespaces, builds the fully qualified name (e.g., "Outer::Inner").
+    Returns tuple: (index, [name]) where name can be class, struct, or namespace.
+    """
     type_identifiers = ["type_identifier", "template_type", "qualified_identifier"]
+
+    # First, check if function is in a namespace by traversing up to build namespace path
+    namespace_parts = []
+    temp_node = node
+    while temp_node is not None:
+        if temp_node.type == "namespace_definition":
+            # Get namespace name (or mark as anonymous if unnamed)
+            namespace_name_node = temp_node.child_by_field_name("name")
+            if namespace_name_node:
+                namespace_name = namespace_name_node.text.decode("UTF-8")
+                # Prepend to build qualified name from outer to inner
+                namespace_parts.insert(0, namespace_name)
+            else:
+                # Anonymous namespace - don't include in qualified name
+                # Functions in anonymous namespaces have internal linkage
+                # They should be treated as global functions for CFG purposes
+                pass
+        temp_node = temp_node.parent
+
+    # If we found namespace(s), return the qualified namespace name
+    if namespace_parts:
+        # Build fully qualified namespace (e.g., "Outer::Inner")
+        qualified_namespace = "::".join(namespace_parts)
+        # Find the innermost namespace node for index
+        temp_node = node
+        while temp_node is not None:
+            if temp_node.type == "namespace_definition":
+                namespace_index = index.get((temp_node.start_point, temp_node.end_point, temp_node.type))
+                if namespace_index is not None:
+                    return namespace_index, [qualified_namespace]
+            temp_node = temp_node.parent
+
+    # Otherwise, check for class/struct as before
     while node is not None:
         if node.type == "field_declaration_list" and node.parent.type == "class_specifier":
             node = node.parent
@@ -441,26 +536,198 @@ def get_class_name(node, index):
     return None
 
 
-def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, records={}):
+def evaluate_preprocessor_condition(condition_text, macro_definitions):
+    """
+    Evaluate a preprocessor condition based on defined macros.
+    Returns True if the condition is satisfied, False otherwise, None if cannot evaluate.
+
+    Supports:
+    - #ifdef MACRO
+    - #ifndef MACRO
+    - #if MACRO == VALUE
+    - #if defined(MACRO)
+    - Simple comparisons and logic
+    """
+    import re
+
+    # Handle #ifdef and #ifndef (already processed, just check for identifier)
+    if not any(op in condition_text for op in ['==', '!=', '>', '<', '&&', '||', 'defined']):
+        # Simple identifier check for #ifdef
+        identifier = condition_text.strip()
+        return identifier in macro_definitions
+
+    # Handle #if defined(MACRO)
+    defined_pattern = r'defined\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)'
+    condition_text = re.sub(defined_pattern,
+                           lambda m: '1' if m.group(1) in macro_definitions else '0',
+                           condition_text)
+
+    # Replace macro names with their values
+    for macro, value in macro_definitions.items():
+        # Use word boundaries to avoid partial replacements
+        condition_text = re.sub(r'\b' + macro + r'\b', str(value), condition_text)
+
+    # Try to evaluate the expression
+    try:
+        # Safe evaluation of simple expressions
+        # Only allow basic operators and numbers
+        if re.match(r'^[\d\s+\-*/<>=!&|()]+$', condition_text):
+            result = eval(condition_text)
+            return bool(result)
+    except:
+        pass
+
+    return None  # Cannot evaluate
+
+
+def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, records={}, macro_definitions=None):
     """
     Returns statement level nodes recursively from the concrete syntax tree passed to it.
     Uses records to maintain required supplementary information.
     node_list maintains an intermediate representation and graph_node_list returns the final list.
+
+    Args:
+        macro_definitions: Dictionary of defined macros {name: value} for preprocessor evaluation
     """
+    import os  # For debug logging
+
+    if macro_definitions is None:
+        macro_definitions = {}
 
     if root_node.type == "catch_clause":
         node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
         # Get the parameter from catch clause
-        catch_parameter = list(filter(lambda child: child.type == "parameter_declaration", root_node.children))
+        catch_parameter = list(filter(lambda child: child.type == "parameter_list", root_node.children))
         if catch_parameter:
-            label = "catch (" + catch_parameter[0].text.decode("UTF-8") + ")"
+            param_text = catch_parameter[0].text.decode("UTF-8")
+            # Strip parentheses if present (they're included in parameter_list)
+            if param_text.startswith("(") and param_text.endswith(")"):
+                param_text = param_text[1:-1]
+
+            # Check for catch-all
+            if param_text.strip() == "...":
+                label = "catch (...)"
+            else:
+                label = "catch (" + param_text + ")"
         else:
             label = "catch (...)"
         type_label = "catch"
         graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
 
+    # Special handling for do-while condition
+    elif (
+        root_node.type == "parenthesized_expression"
+        and root_node.parent is not None
+        and root_node.parent.type == "do_statement"
+    ):
+        label = "while" + root_node.text.decode("UTF-8")
+        type_label = "while"
+        node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
+        graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
+
+    elif root_node.type in ["preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
+                            "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else"]:
+        # Handle preprocessor directives specially - they should NOT be added to graph_node_list
+        # Only process them for macro extraction and conditional evaluation
+        # The actual traversal logic is at the end of this function
+
+        if root_node.type == "preproc_def":
+            # Extract macro definitions for use in condition evaluation
+            text = root_node.text.decode("UTF-8")
+            parts = text.split(None, 2)  # Split into #define, name, value
+            if len(parts) >= 2:
+                macro_name = parts[1]
+                macro_value = parts[2].strip() if len(parts) > 2 else "1"
+                macro_definitions[macro_name] = macro_value
+                if os.environ.get('DEBUG_PREPROC'):
+                    print(f"[DEFINE] {macro_name} = {macro_value}")
+
     elif root_node.type in statement_types["node_list_type"]:
-        if (
+        # FIX: Skip field_declaration nodes (class/struct member declarations)
+        # These are compile-time constructs and should not appear in CFG
+        # Note: This includes static member declarations and member function declarations
+        if root_node.type == "field_declaration":
+            pass  # Skip this node, but will recurse through children below
+
+        # FIX: Skip struct/class specifiers at global/namespace scope
+        # These are type definitions, not executable code
+        # Still recurse through children to find member function DEFINITIONS (not declarations)
+        elif root_node.type in ["struct_specifier", "class_specifier"]:
+            # Check if this is at global/namespace scope or nested inside another class
+            parent = root_node.parent
+            should_skip = False
+
+            # Check for global scope or namespace scope
+            if parent and parent.type in ["translation_unit", "declaration_list"]:
+                # Could be namespace's declaration_list or global scope
+                if parent.type == "declaration_list":
+                    grandparent = parent.parent if parent else None
+                    # If grandparent is namespace or translation_unit, skip
+                    if grandparent and grandparent.type in ["namespace_definition", "translation_unit"]:
+                        should_skip = True
+                else:
+                    # Direct child of translation_unit - global scope
+                    should_skip = True
+
+            # Check for nested class/struct inside another class
+            elif parent and parent.type == "field_declaration_list":
+                should_skip = True
+
+            if should_skip:
+                pass  # Skip this node, will recurse through children to find function definitions
+            # else: fall through to normal processing for local struct definitions in functions
+
+        # Skip function declarations (forward declarations without bodies)
+        # These are compile-time constructs and should not appear in CFG
+        elif is_function_declaration(root_node):
+            pass  # Skip this node
+        # Skip template_declaration nodes (compile-time constructs)
+        # The actual function/class definition inside the template will be processed separately
+        elif root_node.type == "template_declaration":
+            pass  # Skip template wrapper, process its contents
+        # Skip access_specifiers (public:, private:, protected:)
+        # These are compile-time directives, not executable code
+        # 1. Inside base_class_clause (inheritance specifiers like "public" in "struct Foo : public Bar")
+        # 2. Inside class/struct bodies (access modifiers like "public:" in class definitions)
+        elif root_node.type == "access_specifier":
+            pass  # Skip all access specifiers - they're not executable code
+        # Skip statements that are children of attributed_statement (the attributed_statement itself will be processed)
+        elif root_node.parent and root_node.parent.type == "attributed_statement":
+            pass  # Skip inner statements - the attributed_statement wrapper is the CFG node
+        # Skip lambda_expression nodes when they are nested inside another statement
+        # The parent statement (e.g., declaration) already handles the lambda and strips its body
+        # Lambda nodes are kept in node_list for CFG edge creation but NOT added to graph_node_list (final CFG output)
+        elif root_node.type == "lambda_expression":
+            # Check if lambda is nested inside another statement type
+            parent = root_node.parent
+            # Walk up to find the first statement-level parent
+            while parent and parent.type not in statement_types["node_list_type"]:
+                parent = parent.parent
+
+            # If the parent is a statement (declaration, expression_statement, etc.) and it's not the lambda itself,
+            # then skip this lambda as a CFG node - it's already represented by the parent
+            if parent and parent.type != "lambda_expression":
+                # This lambda is nested in a statement
+                # Add to node_list for internal tracking (CFG edge creation needs it)
+                # but DO NOT add to graph_node_list (we don't want it as a separate CFG node)
+                node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
+                # NO graph_node_list.append() - this prevents it from appearing in final CFG
+            else:
+                # This is a standalone lambda (immediately invoked at statement level)
+                # Add to both node_list and graph_node_list
+                node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
+                label = root_node.text.decode("UTF-8")
+                type_label = "expression_statement"
+                try:
+                    if "{" in label:
+                        label = label.split("{")[0] + label.split("}")[-1]
+                    else:
+                        label = root_node.text.decode('utf-8')
+                except:
+                    pass
+                graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)],
+                                       root_node.start_point[0], label, type_label))
+        elif (
             root_node.type in statement_types["inner_node_type"]
             and root_node.parent is not None
             and root_node.parent.type in statement_types["outer_node_type"]
@@ -495,16 +762,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     records["lambda_map"][lambda_node] = root_node
                 label = raw_label + label
 
-            elif root_node.type == "lambda_expression":
-                try:
-                    if "{" in label:
-                        label = label.split("{")[0] + label.split("}")[-1]
-                    else:
-                        label = root_node.text.decode('utf-8')
-                except:
-                    pass
+            # Note: lambda_expression nodes are now handled earlier (lines 689-715)
+            # to prevent them from being added as separate nodes when nested in statements
 
-            elif root_node.type == "function_definition":
+            if root_node.type == "function_definition":
                 label = ""
                 declarator = root_node.child_by_field_name("declarator")
 
@@ -531,14 +792,42 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 function_name_node = None
                 if declarator:
                     if declarator.type == "function_declarator":
-                        function_name_node = declarator.child_by_field_name("declarator")
+                        # Check for operator overload first (operator_name node)
+                        operator_name_node = None
+                        for child in declarator.children:
+                            if child.type == "operator_name":
+                                operator_name_node = child
+                                break
+
+                        if operator_name_node:
+                            function_name_node = operator_name_node
+                        else:
+                            function_name_node = declarator.child_by_field_name("declarator")
                     elif declarator.type == "pointer_declarator" or declarator.type == "reference_declarator":
                         # Handle pointer/reference return types
+                        # Navigate through pointer/reference layers to find the function_declarator
                         nested = declarator
                         while nested and nested.type in ["pointer_declarator", "reference_declarator"]:
-                            nested = nested.children[0] if nested.children else None
+                            # Find the function_declarator child (skip * and & symbols)
+                            found_nested = None
+                            for child in nested.children:
+                                if child.type in ["function_declarator", "pointer_declarator", "reference_declarator"]:
+                                    found_nested = child
+                                    break
+                            nested = found_nested
+
                         if nested and nested.type == "function_declarator":
-                            function_name_node = nested.child_by_field_name("declarator")
+                            # Check for operator overload in nested declarator
+                            operator_name_node = None
+                            for child in nested.children:
+                                if child.type == "operator_name":
+                                    operator_name_node = child
+                                    break
+
+                            if operator_name_node:
+                                function_name_node = operator_name_node
+                            else:
+                                function_name_node = nested.child_by_field_name("declarator")
 
                 if function_name_node:
                     function_name = function_name_node.text.decode("UTF-8")
@@ -549,7 +838,26 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 type_label = root_node.type
 
                 try:
-                    signature = get_signature(declarator if declarator and declarator.type == "function_declarator" else root_node)
+                    # Find the function_declarator for signature extraction
+                    # It may be nested inside pointer_declarator or reference_declarator
+                    sig_node = declarator
+                    if declarator and declarator.type in ["pointer_declarator", "reference_declarator"]:
+                        # Navigate through pointer/reference layers to find function_declarator
+                        nested = declarator
+                        while nested and nested.type in ["pointer_declarator", "reference_declarator"]:
+                            found_nested = None
+                            for child in nested.children:
+                                if child.type == "function_declarator":
+                                    sig_node = child
+                                    break
+                                elif child.type in ["pointer_declarator", "reference_declarator"]:
+                                    found_nested = child
+                                    break
+                            if sig_node and sig_node.type == "function_declarator":
+                                break
+                            nested = found_nested
+
+                    signature = get_signature(sig_node if sig_node and sig_node.type == "function_declarator" else root_node)
                     class_info = get_class_name(root_node, index)
 
                     if class_info:
@@ -559,7 +867,12 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                             records["main_class"] = class_index
 
                         for class_name in class_name_list:
-                            records["function_list"][((class_name, function_name), signature)] = function_index
+                            key = ((class_name, function_name), signature)
+                            records["function_list"][key] = function_index
+
+                            # Mark as variadic if signature ends with '...'
+                            if len(signature) > 0 and signature[-1] == '...':
+                                records["variadic_functions"][key] = True
 
                             # Get return type
                             return_type_node = root_node.child_by_field_name("type")
@@ -567,7 +880,7 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                                 return_type = return_type_node.text.decode("UTF-8")
                             else:
                                 return_type = "void"
-                            records["return_type"][((class_name, function_name), signature)] = return_type
+                            records["return_type"][key] = return_type
 
                             # Track C++ specific function features (high priority)
                             if is_virtual or is_pure_virtual:
@@ -633,12 +946,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                                 records['extends'][class_name] = [parent_name]
 
             elif root_node.type == "namespace_definition":
-                namespace_name = None
-                for child in root_node.children:
-                    if child.type == "identifier":
-                        namespace_name = child.text.decode("UTF-8")
-                        break
-                if namespace_name:
+                # Use field-based access to get namespace name
+                namespace_name_node = root_node.child_by_field_name("name")
+                if namespace_name_node:
+                    namespace_name = namespace_name_node.text.decode("UTF-8")
                     label = f"namespace {namespace_name}"
                 else:
                     label = "anonymous namespace"
@@ -720,6 +1031,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 label_node = root_node.child_by_field_name("label")
                 if label_node:
                     label = label_node.text.decode("UTF-8") + ":"
+                    # Map label to the labeled_statement node itself
+                    # Goto statements will jump to this label node
+                    # The labeled_statement handler in CFG_cpp.py will then create
+                    # an edge from the label to the statement after it
                     records["label_statement_map"][label] = (
                         root_node.start_point,
                         root_node.end_point,
@@ -805,24 +1120,30 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     label = label[:77] + "..."
                 type_label = "namespace_alias"
 
-            elif root_node.type == "preproc_include":
-                # #include <iostream> or #include "header.h"
-                label = root_node.text.decode("UTF-8")
-                type_label = "include"
-
-            elif root_node.type == "preproc_def":
-                # #define MAX_SIZE 100
+            elif root_node.type == "using_declaration":
+                # using std::cout; or using namespace std;
                 label = root_node.text.decode("UTF-8")
                 if len(label) > 80:
                     label = label[:77] + "..."
-                type_label = "define"
+                type_label = "using"
 
-            elif root_node.type in ["preproc_ifdef", "preproc_if"]:
-                # #ifdef DEBUG or #if defined(FEATURE)
-                label = root_node.text.decode("UTF-8").split('\n')[0]  # Just first line
+            elif root_node.type == "attributed_statement":
+                # [[fallthrough]]; or [[maybe_unused]] int x;
+                # Extract attribute names for label
+                attributes = []
+                for child in root_node.children:
+                    if child.type == "attribute_declaration":
+                        for attr_child in child.named_children:
+                            if attr_child.type == "attribute":
+                                attr_text = attr_child.text.decode('utf-8')
+                                attr_name = attr_text.split('(')[0].strip()
+                                attributes.append(attr_name)
+
+                # Get the statement text (excluding the body if it's a compound statement)
+                label = root_node.text.decode("UTF-8")
                 if len(label) > 80:
                     label = label[:77] + "..."
-                type_label = "preprocessor"
+                type_label = "expression_statement"
 
             elif root_node.type == "new_expression":
                 # new int(5) or new MyClass()
@@ -831,7 +1152,21 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     label = label[:77] + "..."
                 type_label = "new"
 
-            if root_node.type != "function_definition":
+            # Exclude preprocessor directives and function_definition from graph_node_list
+            # Preprocessor directives are compile-time only, not runtime control flow
+            # function_definition is added separately with special handling
+            # Compile-time directives should also be excluded from CFG
+            excluded_from_graph = {
+                "function_definition",
+                "preproc_include", "preproc_def", "preproc_function_def", "preproc_call",
+                "preproc_if", "preproc_ifdef", "preproc_elif", "preproc_else",
+                # Compile-time name resolution directives (not runtime code):
+                "using_declaration",          # using namespace std; or using std::cout;
+                "alias_declaration",           # using my_type = int;
+                "namespace_alias_definition",  # namespace alias = original_namespace;
+            }
+
+            if root_node.type not in excluded_from_graph:
                 graph_node_list.append(
                     (
                         index[(root_node.start_point, root_node.end_point, root_node.type)],
@@ -841,13 +1176,136 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     )
                 )
 
-    for child in root_node.children:
-        root_node, node_list, graph_node_list, records = get_nodes(
-            root_node=child,
-            node_list=node_list,
-            graph_node_list=graph_node_list,
-            index=index,
-            records=records,
-        )
+    # Handle preprocessor directives specially
+    # For conditional directives (#ifdef, #ifndef, #if/#elif/#else), evaluate the condition
+    # and only traverse into the active branch
+    if root_node.type in ["preproc_ifdef", "preproc_if", "preproc_elif"]:
+        # Extract the condition
+        condition = None
+        is_ifndef = False
+
+        if root_node.type == "preproc_ifdef":
+            # #ifdef MACRO or #ifndef MACRO - check if MACRO is defined
+            # Determine if it's #ifdef or #ifndef by checking the directive token
+            for child in root_node.children:
+                if child.type == "#ifndef":
+                    is_ifndef = True
+                elif child.type == "identifier":
+                    condition = child.text.decode("UTF-8")
+                    break
+        elif root_node.type == "preproc_if" or root_node.type == "preproc_elif":
+            # #if MACRO == VALUE or #elif MACRO == VALUE
+            # The condition is a named child (usually binary_expression, identifier, etc.)
+            found_directive = False
+            for child in root_node.children:
+                if child.type in ["#if", "#elif"]:
+                    found_directive = True
+                elif found_directive and child.is_named and child.type not in ["preproc_elif", "preproc_else", "declaration", "expression_statement"]:
+                    # This is the condition expression
+                    condition = child.text.decode("UTF-8")
+                    break
+
+        # Evaluate the condition
+        condition_met = False
+        if condition:
+            result = evaluate_preprocessor_condition(condition, macro_definitions)
+            if result is not None:
+                # For #ifndef, invert the result
+                condition_met = (not result) if is_ifndef else result
+                # DEBUG
+                if os.environ.get('DEBUG_PREPROC'):
+                    print(f"[PREPROC] {root_node.type} condition='{condition}' is_ifndef={is_ifndef} macros={macro_definitions} result={result} condition_met={condition_met}")
+            else:
+                # Cannot evaluate - include the branch to be safe
+                condition_met = True
+                if os.environ.get('DEBUG_PREPROC'):
+                    print(f"[PREPROC] {root_node.type} condition='{condition}' macros={macro_definitions} CANNOT_EVALUATE, including by default")
+
+        # Find which children to process based on condition
+        # For #ifdef/#if, process content if condition is True
+        # For #elif, process its content directly if condition is True
+        if root_node.type == "preproc_elif":
+            # For elif, process children directly if condition is met
+            if condition_met:
+                for child in root_node.children:
+                    if child.is_named and child.type not in ["preproc_else", "preproc_elif"]:
+                        root_node, node_list, graph_node_list, records = get_nodes(
+                            root_node=child,
+                            node_list=node_list,
+                            graph_node_list=graph_node_list,
+                            index=index,
+                            records=records,
+                            macro_definitions=macro_definitions,
+                        )
+        elif root_node.type == "preproc_ifdef" or root_node.type == "preproc_if":
+            # Process children, but skip #elif and #else branches if condition was met
+            found_elif_or_else = False
+            for child in root_node.children:
+                # Skip directive keywords themselves
+                if not child.is_named:
+                    continue
+
+                # If we found #elif or #else and our condition was met, skip their content
+                if child.type in ["preproc_elif", "preproc_else"]:
+                    if condition_met:
+                        # Our condition was true, skip alternative branches
+                        continue
+                    found_elif_or_else = True
+
+                # If this is an elif, evaluate its condition
+                if child.type == "preproc_elif":
+                    # Let the elif handle its own recursion
+                    root_node, node_list, graph_node_list, records = get_nodes(
+                        root_node=child,
+                        node_list=node_list,
+                        graph_node_list=graph_node_list,
+                        index=index,
+                        records=records,
+                        macro_definitions=macro_definitions,
+                    )
+                elif child.type == "preproc_else":
+                    # Process else content only if no previous condition was met
+                    if not condition_met:
+                        for else_child in child.children:
+                            if else_child.is_named:
+                                root_node, node_list, graph_node_list, records = get_nodes(
+                                    root_node=else_child,
+                                    node_list=node_list,
+                                    graph_node_list=graph_node_list,
+                                    index=index,
+                                    records=records,
+                                    macro_definitions=macro_definitions,
+                                )
+                elif condition_met:
+                    # Process this child if condition is met
+                    root_node, node_list, graph_node_list, records = get_nodes(
+                        root_node=child,
+                        node_list=node_list,
+                        graph_node_list=graph_node_list,
+                        index=index,
+                        records=records,
+                        macro_definitions=macro_definitions,
+                    )
+
+    elif root_node.type == "preproc_else":
+        # Don't process else independently - it's handled by parent #if
+        pass
+
+    elif root_node.type in ["preproc_include", "preproc_def", "preproc_function_def", "preproc_call"]:
+        # These are non-conditional preprocessor directives
+        # Don't traverse into their children (already handled above for #define)
+        pass
+
+    else:
+        # Normal node - process all children
+        for child in root_node.children:
+            root_node, node_list, graph_node_list, records = get_nodes(
+                root_node=child,
+                node_list=node_list,
+                graph_node_list=graph_node_list,
+                index=index,
+                records=records,
+                macro_definitions=macro_definitions,
+            )
 
     return root_node, node_list, graph_node_list, records

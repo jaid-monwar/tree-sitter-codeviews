@@ -1,8 +1,0 @@
-1. Can't detect function call inside another function call.
-2. Can't detect function call in index = duplicateNumber().
-   "test" and "static void test" shouldn't be two different nodes.
-   there is no recursion here, but the cfg shows recursion.
-   do_while loop is wrong. the arrow from while to do should be pos_next. the arrow from do to tortoise should be next_line.
-
-
-Can't detect function calls unless it's standalone.
