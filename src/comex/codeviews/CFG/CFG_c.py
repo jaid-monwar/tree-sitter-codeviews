@@ -691,6 +691,9 @@ class CFGGraph_c(CFGGraph):
             records=self.records
         )
 
+        # Assign to instance variable for SDFG access
+        self.node_list = node_list
+
         # Filter out nodes that shouldn't be in CFG
         # 1. Preprocessor directives (compile-time only, not runtime control flow)
         # 2. Compound statements (redundant - individual statements already represented)
@@ -1168,9 +1171,12 @@ class CFGGraph_c(CFGGraph):
             # -------------------- LABELED STATEMENT --------------------
             elif node.type == "labeled_statement":
                 # Edge to the statement after the label
-                stmt = node.child_by_field_name("statement")
-                if stmt and (stmt.start_point, stmt.end_point, stmt.type) in node_list:
-                    self.add_edge(current_index, self.get_index(stmt), "next_line")
+                # Tree-sitter C grammar: labeled_statement has named_children [label_identifier, statement]
+                # The statement is the second named child, not a field named "statement"
+                if len(node.named_children) > 1:
+                    stmt = node.named_children[1]
+                    if stmt and (stmt.start_point, stmt.end_point, stmt.type) in node_list:
+                        self.add_edge(current_index, self.get_index(stmt), "next_line")
 
         # ============================================================
         # STEP 9: Add Function Call Edges

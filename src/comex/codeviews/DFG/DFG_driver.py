@@ -1,3 +1,4 @@
+import networkx as nx
 from ...tree_parser.parser_driver import ParserDriver
 from ...utils import postprocessor
 from ..SDFG.SDFG import DfgRda
@@ -17,6 +18,12 @@ class DFGDriver:
         self.root_node = self.parser.root_node
         self.src_code = self.parser.src_code
         self.properties = properties.get("DFG", {})
+
+        # Initialize graph to empty graph by default
+        self.graph = nx.MultiDiGraph()
+        self.rda_table = None
+        self.rda_result = None
+
         if self.properties.get("statements", False):
             result = DfgRda(
                 src_language=src_language,
