@@ -12,9 +12,15 @@ from ...utils.src_parser import traverse_tree
 # C-specific node type definitions
 assignment = ["assignment_expression"]
 def_statement = ["init_declarator"]
+declaration_statement = ["declaration"]  # For uninitialized declarations
 increment_statement = ["update_expression"]
 variable_type = ['identifier']
 function_calls = ["call_expression"]
+
+# Input functions that define their pointer arguments
+# These functions write to memory through pointer arguments
+input_functions = ["scanf", "gets", "fgets", "getline", "fscanf", "sscanf",
+                   "fread", "read", "recv", "recvfrom", "getchar", "fgetc"]
 
 # Helpers
 inner_types = ["declaration", "expression_statement"]
@@ -443,6 +449,40 @@ def build_rda_table(parser, CFG_results):
                     for var in vars_used:
                         add_entry(parser, rda_table, parent_id, used=var)
 
+        # 2a. Handle uninitialized declarations (int x;)
+        # These don't have init_declarator nodes, identifier is direct child
+        elif root_node.type in declaration_statement:
+            # Only process if this is a statement-level declaration in CFG
+            parent_id = get_index(root_node, index)
+            if parent_id is None or parent_id not in CFG_results.graph.nodes:
+                continue
+
+            # Skip if this declaration has init_declarator children
+            # (those are handled by case 2 above)
+            has_init_declarator = any(
+                child.type == "init_declarator" for child in root_node.named_children
+            )
+            if has_init_declarator:
+                continue
+
+            # Find identifier children (uninitialized variables)
+            for child in root_node.named_children:
+                if child.type == "identifier":
+                    # Check if this identifier is in the symbol table
+                    child_id = get_index(child, index)
+                    if child_id and child_id in parser.symbol_table["scope_map"]:
+                        # This is a variable declaration: int x;
+                        add_entry(parser, rda_table, parent_id,
+                                 defined=child, declaration=True)
+                elif child.type in ["pointer_declarator", "array_declarator"]:
+                    # Handle int *ptr; or int arr[10];
+                    var_identifier = extract_identifier_from_declarator(child)
+                    if var_identifier:
+                        var_id = get_index(var_identifier, index)
+                        if var_id and var_id in parser.symbol_table["scope_map"]:
+                            add_entry(parser, rda_table, parent_id,
+                                     defined=var_identifier, declaration=True)
+
         # 3. Handle assignments
         elif root_node.type in assignment:
             parent_statement = return_first_parent_of_types(
@@ -545,9 +585,55 @@ def build_rda_table(parser, CFG_results):
                 else:
                     continue  # Skip if not in CFG
 
-            # Get all identifiers used in the call (arguments, not function name)
+            # Check if this is an input function like scanf
+            function_name = None
+            if root_node.children and root_node.children[0].type == "identifier":
+                function_name = st(root_node.children[0])
+
+            is_input_function = function_name in input_functions
+
+            # Process arguments
             for child in root_node.children[1:]:  # Skip function name
-                if child.type in variable_type + ["field_expression"]:
+                # For input functions, pointer arguments are DEFINITIONs
+                if is_input_function and child.type == "argument_list":
+                    for arg in child.named_children:
+                        # scanf("%d", &number) - the &number is a definition
+                        if arg.type == "pointer_expression":
+                            # This is &var - it DEFINES var
+                            inner_arg = arg.child_by_field_name("argument")
+                            if inner_arg:
+                                # The variable being written to
+                                if inner_arg.type in variable_type:
+                                    add_entry(parser, rda_table, parent_id,
+                                             defined=inner_arg, declaration=False)
+                                elif inner_arg.type in ["field_expression", "subscript_expression"]:
+                                    # scanf(&s.field) or scanf(&arr[i])
+                                    add_entry(parser, rda_table, parent_id,
+                                             defined=inner_arg, declaration=False)
+                                    # Also USE the base variable for indexing
+                                    if inner_arg.type == "subscript_expression":
+                                        index_expr = inner_arg.child_by_field_name("index")
+                                        if index_expr:
+                                            vars_in_index = recursively_get_children_of_types(
+                                                index_expr, variable_type + ["field_expression"],
+                                                index=parser.index,
+                                                check_list=parser.symbol_table["scope_map"]
+                                            )
+                                            for var in vars_in_index:
+                                                add_entry(parser, rda_table, parent_id, used=var)
+                        # Regular arguments (format string, other values) are USEs
+                        elif arg.type in variable_type + ["field_expression"]:
+                            add_entry(parser, rda_table, parent_id, used=arg)
+                        else:
+                            identifiers_used = recursively_get_children_of_types(
+                                arg, variable_type + ["field_expression"],
+                                index=parser.index,
+                                check_list=parser.symbol_table["scope_map"]
+                            )
+                            for identifier in identifiers_used:
+                                add_entry(parser, rda_table, parent_id, used=identifier)
+                # For non-input functions, all arguments are USEs (existing behavior)
+                elif child.type in variable_type + ["field_expression"]:
                     add_entry(parser, rda_table, parent_id, used=child)
                 else:
                     identifiers_used = recursively_get_children_of_types(
