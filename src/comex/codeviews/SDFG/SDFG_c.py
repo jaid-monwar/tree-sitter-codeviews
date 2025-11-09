@@ -16,6 +16,8 @@ declaration_statement = ["declaration"]  # For uninitialized declarations
 increment_statement = ["update_expression"]
 variable_type = ['identifier']
 function_calls = ["call_expression"]
+literal_types = ["number_literal", "string_literal", "char_literal",
+                 "true", "false", "null"]
 
 # Input functions that define their pointer arguments
 # These functions write to memory through pointer arguments
@@ -214,6 +216,40 @@ class Identifier:
         return f"{{{','.join(result)}}}"
 
 
+class Literal:
+    """Represents a literal constant (number, string, etc.) as a data flow source"""
+
+    def __init__(self, parser, node, line=None):
+        self.core = st(node)
+        self.name = f"LITERAL_{st(node)}"  # Prefix to distinguish from variables
+        self.value = st(node)
+        self.line = line
+        self.declaration = True  # Literals are always "definitions"
+        self.satisfied = False
+        self.scope = [0]  # Literals have global scope
+        self.variable_scope = [0]
+
+        # Get real line number
+        if line is not None:
+            self.real_line_no = read_index(parser.index, line)[0][0]
+
+    def __eq__(self, other):
+        # Literals are equal if they're at the same line (different literal instances)
+        return (self.name == other.name and
+                self.line == other.line)
+
+    def __hash__(self):
+        return hash((self.name, self.line))
+
+    def __str__(self):
+        result = [f"Literal({self.value})"]
+        if self.line:
+            result += [str(self.real_line_no)]
+        else:
+            result += ["?"]
+        return f"{{{','.join(result)}}}"
+
+
 def extract_identifier_from_declarator(declarator_node):
     """Extract identifier from declarator (may be wrapped in pointer/array)"""
     if declarator_node.type == "identifier":
@@ -285,6 +321,13 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
     current_node = used or defined
     if core is None:
         core = current_node
+
+    # Handle literal constants
+    if current_node.type in literal_types:
+        if used:  # Literals are always USEs (data sources)
+            set_add(rda_table[statement_id]["use"],
+                   Literal(parser, current_node, statement_id))
+        return
 
     # Handle struct field access
     if current_node.type == "field_expression":
@@ -436,8 +479,8 @@ def build_rda_table(parser, CFG_results):
             # Extract initializer if present
             initializer = root_node.child_by_field_name("value")
             if initializer:
-                # If initializer is directly an identifier, field_expression, pointer_expression, subscript_expression, or unary_expression (for &x)
-                if initializer.type in variable_type + ["field_expression", "pointer_expression", "subscript_expression", "unary_expression"]:
+                # If initializer is directly an identifier, field_expression, pointer_expression, subscript_expression, literal, or unary_expression (for &x)
+                if initializer.type in variable_type + ["field_expression", "pointer_expression", "subscript_expression", "unary_expression"] + literal_types:
                     add_entry(parser, rda_table, parent_id, used=initializer)
                 else:
                     # Otherwise, recursively find identifiers AND field_expressions in the expression
@@ -448,6 +491,13 @@ def build_rda_table(parser, CFG_results):
                     )
                     for var in vars_used:
                         add_entry(parser, rda_table, parent_id, used=var)
+                    # Also find literals
+                    literals_used = recursively_get_children_of_types(
+                        initializer, literal_types,
+                        index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
 
         # 2a. Handle uninitialized declarations (int x;)
         # These don't have init_declarator nodes, identifier is direct child
@@ -519,8 +569,8 @@ def build_rda_table(parser, CFG_results):
             # Left side is always defined
             add_entry(parser, rda_table, parent_id, defined=left_node)
 
-            # Right side identifiers, field expressions, pointer expressions, subscript expressions, and unary expressions are used
-            if right_node.type in variable_type + ["field_expression", "pointer_expression", "subscript_expression", "unary_expression"]:
+            # Right side identifiers, field expressions, pointer expressions, subscript expressions, literals, and unary expressions are used
+            if right_node.type in variable_type + ["field_expression", "pointer_expression", "subscript_expression", "unary_expression"] + literal_types:
                 add_entry(parser, rda_table, parent_id, used=right_node)
             else:
                 vars_used = recursively_get_children_of_types(
@@ -530,6 +580,13 @@ def build_rda_table(parser, CFG_results):
                 )
                 for var in vars_used:
                     add_entry(parser, rda_table, parent_id, used=var)
+                # Also find literals
+                literals_used = recursively_get_children_of_types(
+                    right_node, literal_types,
+                    index=parser.index
+                )
+                for literal in literals_used:
+                    add_entry(parser, rda_table, parent_id, used=literal)
 
         # 4. Handle update expressions (i++, --i, etc.)
         elif root_node.type in increment_statement:
@@ -624,7 +681,11 @@ def build_rda_table(parser, CFG_results):
                         # Regular arguments (format string, other values) are USEs
                         elif arg.type in variable_type + ["field_expression"]:
                             add_entry(parser, rda_table, parent_id, used=arg)
+                        elif arg.type in literal_types:
+                            # Track literal constants
+                            add_entry(parser, rda_table, parent_id, used=arg)
                         else:
+                            # Find identifiers, field expressions, and literals
                             identifiers_used = recursively_get_children_of_types(
                                 arg, variable_type + ["field_expression"],
                                 index=parser.index,
@@ -632,10 +693,21 @@ def build_rda_table(parser, CFG_results):
                             )
                             for identifier in identifiers_used:
                                 add_entry(parser, rda_table, parent_id, used=identifier)
+                            # Also find literals
+                            literals_used = recursively_get_children_of_types(
+                                arg, literal_types,
+                                index=parser.index
+                            )
+                            for literal in literals_used:
+                                add_entry(parser, rda_table, parent_id, used=literal)
                 # For non-input functions, all arguments are USEs (existing behavior)
                 elif child.type in variable_type + ["field_expression"]:
                     add_entry(parser, rda_table, parent_id, used=child)
+                elif child.type in literal_types:
+                    # Track literal constants
+                    add_entry(parser, rda_table, parent_id, used=child)
                 else:
+                    # Find identifiers, field expressions, and literals
                     identifiers_used = recursively_get_children_of_types(
                         child, variable_type + ["field_expression"],
                         index=parser.index,
@@ -643,6 +715,13 @@ def build_rda_table(parser, CFG_results):
                     )
                     for identifier in identifiers_used:
                         add_entry(parser, rda_table, parent_id, used=identifier)
+                    # Also find literals
+                    literals_used = recursively_get_children_of_types(
+                        child, literal_types,
+                        index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
 
         # 6. Handle function definitions (parameters)
         elif root_node.type == "function_definition":
@@ -904,7 +983,15 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
         use_info = rda_table[node]["use"]
 
         for used in use_info:
-            # Find reaching definitions
+            # Special handling for literals - they are "defined" at the statement where they're used
+            if isinstance(used, Literal):
+                # Literals flow directly from the statement where they appear (which is 'node')
+                # This creates a self-edge showing the literal is defined and used in the same statement
+                # We mark it as satisfied and don't create an edge (self-edges would be confusing)
+                used.satisfied = True
+                continue
+
+            # Find reaching definitions for regular variables
             for available_def in rda_solution[node]["IN"]:
                 # Exact name match
                 if available_def.name == used.name:
