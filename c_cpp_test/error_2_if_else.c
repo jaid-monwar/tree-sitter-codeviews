@@ -22,6 +22,7 @@ int main() {
         case 31:
             node++;
         default:
+            node *= 3;
             printf("default\n");
     }
 

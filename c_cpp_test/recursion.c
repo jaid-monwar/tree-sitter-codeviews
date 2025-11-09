@@ -5,6 +5,7 @@ int fibonacci(int n) {
 }
 
 int main() {
-    int result = fibonacci(fibonacci(10));
+    int k = 10;
+    int result = fibonacci(fibonacci(k));
     printf("%d\n", result);
 }
