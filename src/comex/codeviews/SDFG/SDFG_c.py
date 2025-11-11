@@ -167,6 +167,13 @@ class Identifier:
                 self.scope = parser.symbol_table["scope_map"].get(decl_index, [0])
             else:
                 self.scope = [0]  # Global scope
+
+            # CRITICAL FIX: For declarations (DEF), the scope used in reaching definitions
+            # should be the variable_scope (where it's visible), not the declaration point
+            # This prevents function parameters (visible only in function body [0, 1])
+            # from reaching call sites in different functions (scope [0, 9, 10])
+            if declaration:
+                self.scope = self.variable_scope
         else:
             self.variable_scope = [0]
             self.scope = [0]
@@ -385,13 +392,48 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
     # Handle array subscript
     if current_node.type == "subscript_expression":
         array = current_node.child_by_field_name("argument")
-        # Conservative: both use and define
+        index_expr = current_node.child_by_field_name("index")
+
+        # Conservative: both use and define the array
         if defined is not None:
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, array, statement_id,
                             full_ref=core, declaration=declaration))
         set_add(rda_table[statement_id]["use"],
                Identifier(parser, array, full_ref=core))
+
+        # Track the index expression - this is crucial for loop-carried dependencies
+        # Example: tortoise = in_arr[tortoise] uses tortoise in the index
+        if index_expr:
+            # If index is a simple identifier
+            if index_expr.type in variable_type:
+                index_id = get_index(index_expr, parser.index)
+                if index_id and index_id in parser.symbol_table["scope_map"]:
+                    set_add(rda_table[statement_id]["use"],
+                           Identifier(parser, index_expr, full_ref=index_expr))
+            # If index is a literal (like arr[0])
+            elif index_expr.type in literal_types:
+                set_add(rda_table[statement_id]["use"],
+                       Literal(parser, index_expr, statement_id))
+            else:
+                # Recursively find all identifiers in the index expression
+                # Example: arr[i + 1] or arr[func(x)]
+                identifiers_in_index = recursively_get_children_of_types(
+                    index_expr, variable_type + ["field_expression"],
+                    index=parser.index,
+                    check_list=parser.symbol_table["scope_map"]
+                )
+                for identifier in identifiers_in_index:
+                    set_add(rda_table[statement_id]["use"],
+                           Identifier(parser, identifier, full_ref=identifier))
+                # Also track literals in index
+                literals_in_index = recursively_get_children_of_types(
+                    index_expr, literal_types,
+                    index=parser.index
+                )
+                for literal in literals_in_index:
+                    set_add(rda_table[statement_id]["use"],
+                           Literal(parser, literal, statement_id))
         return
 
     # Simple identifier
@@ -724,12 +766,14 @@ def build_rda_table(parser, CFG_results):
                         add_entry(parser, rda_table, parent_id, used=literal)
 
         # 6. Handle function definitions (parameters)
+        # Parameters are defined at the function_definition node, but we need to ensure
+        # they get the correct scope from the symbol table (function-local, not global)
         elif root_node.type == "function_definition":
             parent_id = get_index(root_node, index)
             if parent_id is None:
                 continue
 
-            # Find and define parameters
+            # Find and define parameters with their proper scope from symbol table
             for child in root_node.named_children:
                 if child.type == "function_declarator":
                     param_list = child.child_by_field_name('parameters')
@@ -738,6 +782,8 @@ def build_rda_table(parser, CFG_results):
                             if param.type == "parameter_declaration":
                                 param_id = extract_param_identifier(param)
                                 if param_id:
+                                    # Define parameter at function_definition node
+                                    # The Identifier class will get the correct scope from symbol_table
                                     add_entry(parser, rda_table, parent_id,
                                             defined=param_id, declaration=True)
                     break
@@ -832,10 +878,102 @@ def build_rda_table(parser, CFG_results):
                 for identifier in identifiers_used:
                     add_entry(parser, rda_table, parent_id, used=identifier)
 
+        # 10a. Handle ternary/conditional expressions: (condition)? true_expr : false_expr
+        elif root_node.type == "conditional_expression":
+            # Find the parent statement (usually expression_statement)
+            parent_statement = return_first_parent_of_types(
+                root_node, statement_types["node_list_type"]
+            )
+            if parent_statement is None:
+                continue
+
+            parent_id = get_index(parent_statement, index)
+            if parent_id is None or parent_id not in CFG_results.graph.nodes:
+                continue
+
+            # Extract identifiers from the condition
+            condition = root_node.child_by_field_name("condition")
+            if condition:
+                # Direct identifier/field_expression in condition
+                if condition.type in variable_type + ["field_expression"]:
+                    add_entry(parser, rda_table, parent_id, used=condition)
+                else:
+                    # Recursively find all identifiers in the condition
+                    identifiers_used = recursively_get_children_of_types(
+                        condition, variable_type + ["field_expression"],
+                        index=parser.index,
+                        check_list=parser.symbol_table["scope_map"]
+                    )
+                    for identifier in identifiers_used:
+                        add_entry(parser, rda_table, parent_id, used=identifier)
+                    # Also track literals in condition
+                    literals_used = recursively_get_children_of_types(
+                        condition, literal_types,
+                        index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
+
+            # Extract identifiers from consequence (true branch)
+            consequence = root_node.child_by_field_name("consequence")
+            if consequence:
+                if consequence.type in variable_type + ["field_expression"]:
+                    add_entry(parser, rda_table, parent_id, used=consequence)
+                else:
+                    identifiers_used = recursively_get_children_of_types(
+                        consequence, variable_type + ["field_expression"],
+                        index=parser.index,
+                        check_list=parser.symbol_table["scope_map"]
+                    )
+                    for identifier in identifiers_used:
+                        add_entry(parser, rda_table, parent_id, used=identifier)
+                    literals_used = recursively_get_children_of_types(
+                        consequence, literal_types,
+                        index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
+
+            # Extract identifiers from alternative (false branch)
+            alternative = root_node.child_by_field_name("alternative")
+            if alternative:
+                if alternative.type in variable_type + ["field_expression"]:
+                    add_entry(parser, rda_table, parent_id, used=alternative)
+                else:
+                    identifiers_used = recursively_get_children_of_types(
+                        alternative, variable_type + ["field_expression"],
+                        index=parser.index,
+                        check_list=parser.symbol_table["scope_map"]
+                    )
+                    for identifier in identifiers_used:
+                        add_entry(parser, rda_table, parent_id, used=identifier)
+                    literals_used = recursively_get_children_of_types(
+                        alternative, literal_types,
+                        index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
+
         # 11. Catch-all: handle any other identifiers as USEs
         else:
             # Skip if this is not an identifier
             if root_node.type not in variable_type:
+                continue
+
+            # Skip identifiers inside do-while condition (already handled in case 9a)
+            # Check if this identifier is within a parenthesized_expression that's a child of do_statement
+            in_do_while_condition = False
+            temp_parent = root_node.parent
+            while temp_parent is not None:
+                if (temp_parent.type == "parenthesized_expression" and
+                    temp_parent.parent is not None and
+                    temp_parent.parent.type == "do_statement"):
+                    # This identifier is in a do-while condition, already handled by case 9a
+                    in_do_while_condition = True
+                    break
+                temp_parent = temp_parent.parent
+
+            if in_do_while_condition:
                 continue
 
             # Find the statement this identifier belongs to
