@@ -559,15 +559,108 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
                         method_call=method_call))
 
 
-def build_rda_table(parser, CFG_results):
+def discover_lambdas(parser, CFG_results):
+    """
+    Discover all lambda expressions and build a mapping.
+
+    Returns:
+        lambda_map: Dict mapping variable names to lambda information
+            {
+                "variable_name": {
+                    "definition_node": <node_id>,  # Statement where lambda is defined
+                    "lambda_node": <node_id>,      # The lambda_expression AST node
+                    "body_nodes": [<node_ids>],    # CFG nodes in lambda body
+                    "captures": [<var_names>]      # Captured variables
+                }
+            }
+    """
+    lambda_map = {}
+    index = parser.index
+    tree = parser.tree
+    cfg_nodes = CFG_results.graph.nodes
+
+    # Find all lambda expressions
+    for node in traverse_tree(tree, ["lambda_expression"]):
+        if node.type != "lambda_expression":
+            continue
+
+        # Find the variable this lambda is assigned to
+        parent = node.parent
+        variable_name = None
+        definition_node_id = None
+
+        # Check if lambda is in an init_declarator (auto var = [](){...})
+        if parent and parent.type == "init_declarator":
+            # Get the declarator (variable name)
+            declarator = parent.child_by_field_name("declarator")
+            if declarator and declarator.type == "identifier":
+                variable_name = st(declarator)
+
+                # Find the enclosing statement (declaration)
+                statement = parent.parent  # init_declarator -> declaration
+                if statement:
+                    definition_node_id = get_index(statement, index)
+
+        if not variable_name or not definition_node_id:
+            # Lambda not assigned to a simple variable (could be inline, etc.)
+            continue
+
+        # Extract lambda body nodes (statements in compound_statement)
+        body_nodes = []
+        for child in node.children:
+            if child.type == "compound_statement":
+                # Get all statement children
+                for stmt in child.named_children:
+                    stmt_id = get_index(stmt, index)
+                    if stmt_id and stmt_id in cfg_nodes:
+                        body_nodes.append(stmt_id)
+                break
+
+        # Extract captured variables
+        captures = []
+        for child in node.children:
+            if child.type == "lambda_capture_specifier":
+                # Process captured variables
+                for capture in child.named_children:
+                    if capture.type in variable_type:
+                        captures.append(st(capture))
+                break
+
+        # Get lambda_expression node ID
+        lambda_node_id = get_index(node, index)
+
+        # Store in lambda_map
+        lambda_map[variable_name] = {
+            "definition_node": definition_node_id,
+            "lambda_node": lambda_node_id,
+            "body_nodes": body_nodes,
+            "captures": captures
+        }
+
+        if debug:
+            logger.info(f"Discovered lambda: {variable_name} at node {definition_node_id}, "
+                       f"body nodes: {body_nodes}, captures: {captures}")
+
+    return lambda_map
+
+
+def build_rda_table(parser, CFG_results, lambda_map=None):
     """
     Build RDA table by traversing AST and tracking DEF/USE.
 
     Combines C and Java approaches for C++ support.
 
+    Args:
+        parser: C++ parser with symbol table
+        CFG_results: CFG driver results
+        lambda_map: Dict mapping variable names to lambda information
+
     Returns:
         rda_table: Dict mapping statement_id to {"def": set, "use": set}
     """
+    if lambda_map is None:
+        lambda_map = {}
+
     rda_table = {}
     index = parser.index
     tree = parser.tree
@@ -576,8 +669,9 @@ def build_rda_table(parser, CFG_results):
     handled_cases = ["compound_statement", "translation_unit", "class_specifier",
                      "struct_specifier", "namespace_definition"]
 
-    # Traverse tree, stopping descent at identifiers
-    for root_node in traverse_tree(tree, variable_type):
+    # Traverse entire tree without stopping (lambda bodies need to be processed)
+    # We filter by node type in each handler instead
+    for root_node in traverse_tree(tree, []):
         if not root_node.is_named:
             continue
 
@@ -628,7 +722,18 @@ def build_rda_table(parser, CFG_results):
             # Extract initializer
             initializer = root_node.child_by_field_name("value")
             if initializer:
-                if initializer.type in variable_type + ["field_expression", "pointer_expression",
+                # Special handling for lambda expressions
+                # Lambda bodies are separate execution contexts with their own CFG nodes
+                # Do NOT extract variables from inside the lambda body
+                if initializer.type == "lambda_expression":
+                    # Only process captured variables (in lambda_capture_specifier)
+                    for child in initializer.children:
+                        if child.type == "lambda_capture_specifier":
+                            for capture in child.named_children:
+                                if capture.type in variable_type:
+                                    add_entry(parser, rda_table, parent_id, used=capture)
+                    # Lambda body will be processed as its own CFG node
+                elif initializer.type in variable_type + ["field_expression", "pointer_expression",
                                                        "subscript_expression", "unary_expression"] + literal_types:
                     add_entry(parser, rda_table, parent_id, used=initializer)
                 else:
@@ -1138,8 +1243,10 @@ def build_rda_table(parser, CFG_results):
                 continue
 
             # Find the statement this identifier belongs to
+            # Note: "lambda_expression" is NOT in stop_types so that identifiers inside
+            # lambda bodies can find their parent statement (e.g., Node 51 in lambda body)
             handled_types_local = (def_statement + assignment + increment_statement +
-                                  function_calls + ["return_statement", "lambda_expression",
+                                  function_calls + ["return_statement",
                                                    "catch_clause", "throw_statement",
                                                    "conditional_expression"])
             parent_statement = return_first_parent_of_types(
@@ -1257,7 +1364,7 @@ def name_match_with_fields(name1, name2):
 
 
 def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
-                                       graph_nodes, processed_edges, properties):
+                                       graph_nodes, processed_edges, properties, lambda_map=None):
     """
     Generate DFG edges from RDA solution.
 
@@ -1266,7 +1373,12 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
             For each def d in IN[s]:
                 If d.name == u.name and scope_check(d.scope, u.scope):
                     Add edge: d.line → s
+
+    Args:
+        lambda_map: Dict mapping variable names to lambda information
     """
+    if lambda_map is None:
+        lambda_map = {}
     final_graph = copy.deepcopy(cfg)
     final_graph.remove_edges_from(list(final_graph.edges()))
 
@@ -1366,6 +1478,95 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
         add_edge(final_graph, edge[0], edge[1],
                {'dataflow_type': 'parameter', 'edge_type': 'DFG_edge'})
 
+    # Phase 3: Lambda indirect call resolution
+    # Connect function pointer/lambda calls to their execution targets
+    if lambda_map:
+        # Build a reverse map: parameter_name -> lambda_name
+        # This tracks which parameters might hold which lambdas
+        param_to_lambda = {}  # {(param_name, func_def_node): lambda_var_name}
+
+        # Analyze parameter flow edges to find lambda->parameter mappings
+        for call_node, func_def_node in processed_edges:
+            # Check if the call passes a lambda variable as argument
+            if call_node not in rda_table:
+                continue
+
+            # Get arguments used at call site
+            uses = rda_table[call_node].get("use", [])
+
+            # Get parameters defined at function definition
+            if func_def_node not in rda_table:
+                continue
+            params = rda_table[func_def_node].get("def", [])
+
+            # At a function_definition node, the first DEF is the function name itself,
+            # followed by the actual parameters. We only want to map parameters, not the function name.
+            # So skip the first param if it's a function_definition node.
+            node_type = read_index(index, func_def_node)[-1] if func_def_node in index.values() else None
+            actual_params = params[1:] if node_type == "function_definition" and params else params
+
+            # Match arguments to parameters (simplified: assumes order correspondence)
+            # In reality, would need more sophisticated matching
+            for used_var in uses:
+                if not isinstance(used_var, Identifier):
+                    continue
+                if used_var.method_call:
+                    continue  # Skip function calls, we want variable references
+
+                # Check if this variable holds a lambda
+                if used_var.name in lambda_map:
+                    # This argument is a lambda!
+                    # Map all actual parameters (not function name) to this lambda
+                    for param in actual_params:
+                        if isinstance(param, Identifier) and not param.method_call:
+                            param_to_lambda[(param.name, func_def_node)] = used_var.name
+                            if debug:
+                                logger.info(f"Mapped parameter {param.name} in func {func_def_node} "
+                                          f"to lambda {used_var.name}")
+
+        # Now find indirect calls through function pointers/parameters
+        for node in graph_nodes:
+            if node not in rda_table:
+                continue
+
+            uses = rda_table[node].get("use", [])
+
+            # Check if this is a function call (has method_call=True)
+            for used_var in uses:
+                if not isinstance(used_var, Identifier):
+                    continue
+                if not used_var.method_call:
+                    continue  # Not a function call
+
+                # Check if this is calling a parameter that holds a lambda
+                # Find which function this call is in
+                node_type = read_index(index, node)[-1] if node in index.values() else None
+
+                # Search for reaching definitions of this variable
+                reaching_defs = rda_solution[node]["IN"]
+                for def_var in reaching_defs:
+                    if not isinstance(def_var, Identifier):
+                        continue
+                    if def_var.name != used_var.name:
+                        continue
+
+                    # Check if this definition is a parameter that maps to a lambda
+                    key = (def_var.name, def_var.line)
+                    if key in param_to_lambda:
+                        lambda_var = param_to_lambda[key]
+                        lambda_info = lambda_map[lambda_var]
+
+                        # Add edges from call site to lambda body execution
+                        for body_node in lambda_info["body_nodes"]:
+                            add_edge(final_graph, node, body_node,
+                                   {'dataflow_type': 'lambda_call',
+                                    'edge_type': 'DFG_edge',
+                                    'color': '#FF6B6B',
+                                    'lambda_var': lambda_var})
+                            if debug:
+                                logger.info(f"Added lambda call edge: {node} -> {body_node} "
+                                          f"(calling lambda {lambda_var})")
+
     return final_graph
 
 
@@ -1441,20 +1642,25 @@ def dfg_cpp(properties, CFG_results):
                     if return_statement.named_children:
                         processed_edges.append(edge)
 
-    # Phase 2: Build RDA table
+    # Phase 2: Discover lambdas
+    start_lambda_time = time.time()
+    lambda_map = discover_lambdas(parser, CFG_results)
+    end_lambda_time = time.time()
+
+    # Phase 3: Build RDA table
     start_rda_init_time = time.time()
-    rda_table = build_rda_table(parser, CFG_results)
+    rda_table = build_rda_table(parser, CFG_results, lambda_map)
     end_rda_init_time = time.time()
 
-    # Phase 3: Run RDA
+    # Phase 4: Run RDA
     start_rda_time = time.time()
     rda_solution = start_rda(index, rda_table, cfg_graph)
     end_rda_time = time.time()
 
-    # Phase 4: Generate DFG edges
+    # Phase 5: Generate DFG edges
     final_graph = get_required_edges_from_def_to_use(
         index, cfg_graph, rda_solution, rda_table,
-        cfg_graph.nodes, processed_edges, properties
+        cfg_graph.nodes, processed_edges, properties, lambda_map
     )
 
     if debug:
