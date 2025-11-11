@@ -364,7 +364,12 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
             # This is &x, which USEs x
             if argument.type in variable_type:
                 arg_index = get_index(argument, parser.index)
+                # Check if it's a variable in scope_map
                 if arg_index and arg_index in parser.symbol_table["scope_map"]:
+                    set_add(rda_table[statement_id]["use"],
+                           Identifier(parser, argument, full_ref=argument))
+                # Also check if it's a function in method_map (for function pointers)
+                elif arg_index and arg_index in parser.method_map:
                     set_add(rda_table[statement_id]["use"],
                            Identifier(parser, argument, full_ref=argument))
             return
@@ -765,7 +770,7 @@ def build_rda_table(parser, CFG_results):
                     for literal in literals_used:
                         add_entry(parser, rda_table, parent_id, used=literal)
 
-        # 6. Handle function definitions (parameters)
+        # 6. Handle function definitions (name and parameters)
         # Parameters are defined at the function_definition node, but we need to ensure
         # they get the correct scope from the symbol table (function-local, not global)
         elif root_node.type == "function_definition":
@@ -776,6 +781,16 @@ def build_rda_table(parser, CFG_results):
             # Find and define parameters with their proper scope from symbol table
             for child in root_node.named_children:
                 if child.type == "function_declarator":
+                    # Extract function name and define it (for function pointers)
+                    func_name_node = child.child_by_field_name("declarator")
+                    if func_name_node and func_name_node.type in variable_type:
+                        func_name_idx = get_index(func_name_node, index)
+                        if func_name_idx and func_name_idx in parser.symbol_table["scope_map"]:
+                            # Define the function name at the function definition node
+                            add_entry(parser, rda_table, parent_id,
+                                     defined=func_name_node, declaration=True)
+
+                    # Extract parameters
                     param_list = child.child_by_field_name('parameters')
                     if param_list:
                         for param in param_list.named_children:
@@ -1151,6 +1166,27 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                     'color': '#00A3FF',
                                     'used_def': used.name})
                             used.satisfied = True
+
+            # Handle unsatisfied function identifier references (e.g., &function_name)
+            # Functions are globally available, not limited by control flow
+            if not used.satisfied:
+                # Search all DEF entries globally for a matching function definition
+                for def_node in graph_nodes:
+                    if def_node not in rda_table:
+                        continue
+                    for definition in rda_table[def_node]["def"]:
+                        if definition.name == used.name:
+                            # Check if this is a function definition node
+                            node_type = read_index(index, def_node)[-1] if def_node in index.values() else None
+                            if node_type == "function_definition":
+                                # Add edge from function definition to usage
+                                add_edge(final_graph, def_node, node,
+                                       {'dataflow_type': 'comesFrom',
+                                        'edge_type': 'DFG_edge',
+                                        'color': '#00A3FF',
+                                        'used_def': used.name})
+                                used.satisfied = True
+                                break
 
         # Optional: last_def edges
         if properties.get("last_def", False):

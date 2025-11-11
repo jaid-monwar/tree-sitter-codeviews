@@ -294,27 +294,36 @@ class Literal:
 
 
 def extract_identifier_from_declarator(declarator_node):
-    """Extract identifier from declarator (may be wrapped in pointer/array/reference)"""
+    """Extract identifier from declarator (may be wrapped in pointer/array/reference/qualified)"""
     if declarator_node.type == "identifier":
         return declarator_node
+    elif declarator_node.type == "qualified_identifier":
+        # Handle qualified identifiers like enclose::inner::x
+        # Recursively extract the innermost identifier
+        for child in declarator_node.children:
+            if child.type in ["identifier", "qualified_identifier"]:
+                result = extract_identifier_from_declarator(child)
+                if result:
+                    return result
+        return None
     elif declarator_node.type == "pointer_declarator":
         for child in declarator_node.children:
-            if child.type in ["identifier", "pointer_declarator", "array_declarator", "reference_declarator"]:
+            if child.type in ["identifier", "pointer_declarator", "array_declarator", "reference_declarator", "qualified_identifier"]:
                 return extract_identifier_from_declarator(child)
     elif declarator_node.type == "reference_declarator":
         for child in declarator_node.children:
-            if child.type in ["identifier", "pointer_declarator", "array_declarator", "reference_declarator"]:
+            if child.type in ["identifier", "pointer_declarator", "array_declarator", "reference_declarator", "qualified_identifier"]:
                 return extract_identifier_from_declarator(child)
     elif declarator_node.type == "array_declarator":
         if declarator_node.children:
             return extract_identifier_from_declarator(declarator_node.children[0])
     elif declarator_node.type == "function_declarator":
         for child in declarator_node.children:
-            if child.type in ["identifier", "pointer_declarator", "parenthesized_declarator"]:
+            if child.type in ["identifier", "pointer_declarator", "parenthesized_declarator", "qualified_identifier"]:
                 return extract_identifier_from_declarator(child)
     elif declarator_node.type == "parenthesized_declarator":
         for child in declarator_node.children:
-            if child.type in ["identifier", "pointer_declarator", "array_declarator", "reference_declarator"]:
+            if child.type in ["identifier", "pointer_declarator", "array_declarator", "reference_declarator", "qualified_identifier"]:
                 return extract_identifier_from_declarator(child)
     return None
 
@@ -402,30 +411,58 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         if operator is not None and argument is not None:
             if argument.type in variable_type:
                 arg_index = get_index(argument, parser.index)
+                # Check if it's a variable in scope_map
                 if arg_index and arg_index in parser.symbol_table["scope_map"]:
+                    set_add(rda_table[statement_id]["use"],
+                           Identifier(parser, argument, full_ref=argument))
+                # Also check if it's a function in method_map (for function pointers)
+                elif arg_index and arg_index in parser.method_map:
                     set_add(rda_table[statement_id]["use"],
                            Identifier(parser, argument, full_ref=argument))
             return
 
-    # Handle pointer dereference: *ptr
+    # Handle pointer expressions: both &x (address-of) and *ptr (dereference)
     if current_node.type == "pointer_expression":
+        # Distinguish between & and * by checking the first child
+        is_address_of = False
+        is_dereference = False
+
+        if current_node.children:
+            operator = current_node.children[0]
+            if operator.type == "&":
+                is_address_of = True
+            elif operator.type == "*":
+                is_dereference = True
+
         pointer = current_node.child_by_field_name("argument")
 
-        # Track USE of the base pointer
-        pointer_index = get_index(pointer, parser.index)
-        if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
-            set_add(rda_table[statement_id]["use"],
-                   Identifier(parser, pointer, full_ref=pointer))
+        if is_address_of:
+            # This is &x - taking the address of a variable or function
+            # The identifier is being used (its address is taken)
+            if pointer and pointer.type in variable_type:
+                pointer_index = get_index(pointer, parser.index)
+                if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
+                    set_add(rda_table[statement_id]["use"],
+                           Identifier(parser, pointer, full_ref=pointer))
+            return
 
-        # Track DEF/USE of dereferenced value
-        if defined is not None:
-            set_add(rda_table[statement_id]["def"],
-                   Identifier(parser, pointer, statement_id,
-                            full_ref=core, declaration=declaration))
-        else:
-            set_add(rda_table[statement_id]["use"],
-                   Identifier(parser, pointer, full_ref=core))
-        return
+        elif is_dereference:
+            # This is *ptr - dereferencing a pointer
+            # Track USE of the base pointer
+            pointer_index = get_index(pointer, parser.index)
+            if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, pointer, full_ref=pointer))
+
+            # Track DEF/USE of dereferenced value
+            if defined is not None:
+                set_add(rda_table[statement_id]["def"],
+                       Identifier(parser, pointer, statement_id,
+                                full_ref=core, declaration=declaration))
+            else:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, pointer, full_ref=core))
+            return
 
     # Handle array subscript: arr[i]
     if current_node.type == "subscript_expression":
@@ -476,22 +513,26 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
                            Literal(parser, literal, statement_id))
         return
 
-    # Handle qualified identifiers: std::cout, MyClass::member
+    # Handle qualified identifiers: std::cout, MyClass::member, enclose::inner::x
     if current_node.type == "qualified_identifier":
-        # For qualified identifiers, treat as a single entity
-        # The parser should have already resolved these in the symbol table
-        node_index = get_index(current_node, parser.index)
+        # Extract the innermost identifier for scope checking
+        # The qualified_identifier itself is NOT in scope_map, only the innermost identifier is
+        innermost_id = extract_identifier_from_declarator(current_node)
+        if innermost_id is None:
+            return
+
+        node_index = get_index(innermost_id, parser.index)
         if node_index is None or node_index not in parser.symbol_table["scope_map"]:
             return
 
         if defined is not None:
             set_add(rda_table[statement_id]["def"],
-                   Identifier(parser, current_node, statement_id,
-                            full_ref=core, declaration=declaration,
+                   Identifier(parser, innermost_id, statement_id,
+                            full_ref=current_node, declaration=declaration,
                             method_call=method_call))
         else:
             set_add(rda_table[statement_id]["use"],
-                   Identifier(parser, current_node, full_ref=core,
+                   Identifier(parser, innermost_id, full_ref=current_node,
                             method_call=method_call))
         return
 
@@ -802,13 +843,13 @@ def build_rda_table(parser, CFG_results):
                         for literal in literals_used:
                             add_entry(parser, rda_table, parent_id, used=literal)
 
-        # 6. Handle function definitions (parameters)
+        # 6. Handle function definitions (name and parameters)
         elif root_node.type == "function_definition":
             parent_id = get_index(root_node, index)
             if parent_id is None:
                 continue
 
-            # Find parameters
+            # Extract function name and define it (for function pointers)
             declarator = root_node.child_by_field_name("declarator")
             if declarator:
                 # Navigate through pointer/reference declarators if needed
@@ -822,6 +863,16 @@ def build_rda_table(parser, CFG_results):
                         break
 
                 if func_declarator and func_declarator.type == "function_declarator":
+                    # Extract function name
+                    func_name_node = func_declarator.child_by_field_name("declarator")
+                    if func_name_node and func_name_node.type in variable_type:
+                        func_name_idx = get_index(func_name_node, index)
+                        if func_name_idx and func_name_idx in parser.symbol_table["scope_map"]:
+                            # Define the function name at the function definition node
+                            add_entry(parser, rda_table, parent_id,
+                                     defined=func_name_node, declaration=True)
+
+                    # Extract parameters
                     param_list = func_declarator.child_by_field_name('parameters')
                     if param_list:
                         for param in param_list.named_children:
@@ -939,6 +990,88 @@ def build_rda_table(parser, CFG_results):
                 for identifier in identifiers_used:
                     add_entry(parser, rda_table, parent_id, used=identifier)
 
+        elif root_node.type == "conditional_expression":
+            # Handle ternary operator: condition ? true_expr : false_expr
+            parent_statement = return_first_parent_of_types(
+                root_node, statement_types["node_list_type"]
+            )
+            if parent_statement is None:
+                continue
+
+            parent_id = get_index(parent_statement, index)
+            if parent_id is None or parent_id not in CFG_results.graph.nodes:
+                if parent_statement and parent_statement.type in inner_types_local:
+                    parent_statement = return_first_parent_of_types(
+                        parent_statement, statement_types["node_list_type"]
+                    )
+                    parent_id = get_index(parent_statement, index)
+                elif parent_statement.type in handled_cases:
+                    continue
+                else:
+                    continue
+
+            # Extract and track the condition
+            condition = root_node.child_by_field_name("condition")
+            if condition:
+                if condition.type in variable_type + ["field_expression", "pointer_expression",
+                                                     "subscript_expression", "unary_expression"] + literal_types:
+                    add_entry(parser, rda_table, parent_id, used=condition)
+                else:
+                    identifiers_used = recursively_get_children_of_types(
+                        condition, variable_type + ["field_expression"],
+                        index=parser.index,
+                        check_list=parser.symbol_table["scope_map"]
+                    )
+                    for identifier in identifiers_used:
+                        add_entry(parser, rda_table, parent_id, used=identifier)
+                    literals_used = recursively_get_children_of_types(
+                        condition, literal_types, index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
+
+            # Extract and track consequence (true branch)
+            consequence = root_node.child_by_field_name("consequence")
+            if consequence:
+                if consequence.type in variable_type + ["field_expression"]:
+                    add_entry(parser, rda_table, parent_id, used=consequence)
+                elif consequence.type in literal_types:
+                    add_entry(parser, rda_table, parent_id, used=consequence)
+                else:
+                    identifiers_used = recursively_get_children_of_types(
+                        consequence, variable_type + ["field_expression"],
+                        index=parser.index,
+                        check_list=parser.symbol_table["scope_map"]
+                    )
+                    for identifier in identifiers_used:
+                        add_entry(parser, rda_table, parent_id, used=identifier)
+                    literals_used = recursively_get_children_of_types(
+                        consequence, literal_types, index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
+
+            # Extract and track alternative (false branch)
+            alternative = root_node.child_by_field_name("alternative")
+            if alternative:
+                if alternative.type in variable_type + ["field_expression"]:
+                    add_entry(parser, rda_table, parent_id, used=alternative)
+                elif alternative.type in literal_types:
+                    add_entry(parser, rda_table, parent_id, used=alternative)
+                else:
+                    identifiers_used = recursively_get_children_of_types(
+                        alternative, variable_type + ["field_expression"],
+                        index=parser.index,
+                        check_list=parser.symbol_table["scope_map"]
+                    )
+                    for identifier in identifiers_used:
+                        add_entry(parser, rda_table, parent_id, used=identifier)
+                    literals_used = recursively_get_children_of_types(
+                        alternative, literal_types, index=parser.index
+                    )
+                    for literal in literals_used:
+                        add_entry(parser, rda_table, parent_id, used=literal)
+
         # 8. Handle lambda expressions
         elif root_node.type == "lambda_expression":
             parent_id = get_index(root_node, index)
@@ -1007,7 +1140,8 @@ def build_rda_table(parser, CFG_results):
             # Find the statement this identifier belongs to
             handled_types_local = (def_statement + assignment + increment_statement +
                                   function_calls + ["return_statement", "lambda_expression",
-                                                   "catch_clause", "throw_statement"])
+                                                   "catch_clause", "throw_statement",
+                                                   "conditional_expression"])
             parent_statement = return_first_parent_of_types(
                 root_node,
                 statement_types["non_control_statement"] + statement_types["control_statement"],
@@ -1171,6 +1305,49 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                     'used_def': used.name})
                             used.satisfied = True
 
+            # Handle unsatisfied function identifier references (e.g., &function_name)
+            # Functions are globally available, not limited by control flow
+            if not used.satisfied:
+                # Search all DEF entries globally for a matching function definition
+                for def_node in graph_nodes:
+                    if def_node not in rda_table:
+                        continue
+                    for definition in rda_table[def_node]["def"]:
+                        if definition.name == used.name:
+                            # Check if this is a function definition node
+                            node_type = read_index(index, def_node)[-1] if def_node in index.values() else None
+                            if node_type == "function_definition":
+                                # Add edge from function definition to usage
+                                add_edge(final_graph, def_node, node,
+                                       {'dataflow_type': 'comesFrom',
+                                        'edge_type': 'DFG_edge',
+                                        'color': '#00A3FF',
+                                        'used_def': used.name})
+                                used.satisfied = True
+                                break
+
+            # Handle unsatisfied global/static variable references
+            # Global and static variables are available throughout the program
+            if not used.satisfied:
+                # Search all DEF entries globally for matching global-scope definitions
+                for def_node in graph_nodes:
+                    if def_node not in rda_table:
+                        continue
+                    for definition in rda_table[def_node]["def"]:
+                        if definition.name == used.name:
+                            # Check if this is a global-scope definition (scope = [0])
+                            if definition.scope == [0] and scope_check(definition.scope, used.scope):
+                                # Add edge from global definition to usage
+                                add_edge(final_graph, definition.line, node,
+                                       {'dataflow_type': 'comesFrom',
+                                        'edge_type': 'DFG_edge',
+                                        'color': '#00A3FF',
+                                        'used_def': used.name})
+                                used.satisfied = True
+                                break
+                    if used.satisfied:
+                        break
+
         # Optional: last_def edges
         if properties.get("last_def", False):
             killed_defs = rda_solution[node]["IN"] - rda_solution[node]["OUT"]
@@ -1234,12 +1411,31 @@ def dfg_cpp(properties, CFG_results):
     # Phase 1: Preprocess CFG for function/method calls
     processed_edges = []
 
-    # Handle method returns
+    # Handle function/method calls and returns
     for edge in list(cfg_graph.edges()):
         edge_data = cfg_graph.get_edge_data(*edge)
         if edge_data and len(edge_data) > 0:
             edge_data = edge_data[0]
-            if edge_data.get("label") == "method_return":
+            label = edge_data.get("label", "")
+
+            # Handle function calls (argument → parameter flow)
+            if label.startswith("function_call|"):
+                call_statement = node_list.get(read_index(index, edge[0]))
+                function_def = node_list.get(read_index(index, edge[1]))
+
+                # Verify we have a valid function call with arguments
+                if call_statement and function_def:
+                    if function_def.type == "function_definition":
+                        # Check if function has parameters
+                        declarator = function_def.child_by_field_name("declarator")
+                        if declarator:
+                            params_node = declarator.child_by_field_name("parameters")
+                            if params_node and params_node.named_children:
+                                # Function has parameters, add edge to track argument flow
+                                processed_edges.append(edge)
+
+            # Handle function returns (return value → caller flow)
+            elif label in ["method_return", "function_return"]:
                 return_statement = node_list.get(read_index(index, edge[0]))
                 if return_statement and return_statement.type == "return_statement":
                     if return_statement.named_children:
