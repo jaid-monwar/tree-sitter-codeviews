@@ -24,6 +24,8 @@ class CFGGraph:
                 normal_label = "constructor_call"
             elif edge[2].startswith("method_call"):
                 normal_label = "method_call"
+            elif edge[2].startswith("virtual_call"):
+                normal_label = "virtual_call"
             else:
                 normal_label = edge[2]
             G.add_edge(

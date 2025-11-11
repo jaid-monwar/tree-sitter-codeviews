@@ -151,12 +151,13 @@ def recursively_get_children_of_types(node, st_types, check_list=None,
 class Identifier:
     """Represents a variable at a specific line with scope information"""
 
-    def __init__(self, parser, node, line=None, declaration=False, full_ref=None, method_call=False):
+    def __init__(self, parser, node, line=None, declaration=False, full_ref=None, method_call=False, has_initializer=False):
         self.core = st(node)
         self.unresolved_name = st(full_ref) if full_ref else st(node)
         self.name = self._resolve_name(node, full_ref, parser)
         self.line = line
         self.declaration = declaration
+        self.has_initializer = has_initializer  # True if declaration has an initializer
         self.method_call = method_call
         self.satisfied = method_call  # Method calls are initially satisfied
 
@@ -352,7 +353,7 @@ def extract_operator_text(assign_node, left_node, right_node):
 
 
 def add_entry(parser, rda_table, statement_id, used=None, defined=None,
-              declaration=False, core=None, method_call=False):
+              declaration=False, core=None, method_call=False, has_initializer=False):
     """
     Add variable USE or DEF to RDA table.
 
@@ -365,6 +366,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         declaration: True if declaration
         core: Full reference node
         method_call: True if this is a method call
+        has_initializer: True if this is a declaration with an initializer
     """
     if statement_id not in rda_table:
         rda_table[statement_id] = defaultdict(list)
@@ -391,7 +393,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, argument, statement_id,
                             full_ref=current_node, declaration=declaration,
-                            method_call=method_call))
+                            method_call=method_call, has_initializer=has_initializer))
         else:
             set_add(rda_table[statement_id]["use"],
                    Identifier(parser, argument, full_ref=current_node,
@@ -458,7 +460,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
             if defined is not None:
                 set_add(rda_table[statement_id]["def"],
                        Identifier(parser, pointer, statement_id,
-                                full_ref=core, declaration=declaration))
+                                full_ref=core, declaration=declaration, has_initializer=has_initializer))
             else:
                 set_add(rda_table[statement_id]["use"],
                        Identifier(parser, pointer, full_ref=core))
@@ -482,7 +484,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         if defined is not None:
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, array, statement_id,
-                            full_ref=core, declaration=declaration))
+                            full_ref=core, declaration=declaration, has_initializer=has_initializer))
         set_add(rda_table[statement_id]["use"],
                Identifier(parser, array, full_ref=core))
 
@@ -529,7 +531,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, innermost_id, statement_id,
                             full_ref=current_node, declaration=declaration,
-                            method_call=method_call))
+                            method_call=method_call, has_initializer=has_initializer))
         else:
             set_add(rda_table[statement_id]["use"],
                    Identifier(parser, innermost_id, full_ref=current_node,
@@ -552,7 +554,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         set_add(rda_table[statement_id]["def"],
                Identifier(parser, defined, statement_id,
                         full_ref=core, declaration=declaration,
-                        method_call=method_call))
+                        method_call=method_call, has_initializer=has_initializer))
     else:
         set_add(rda_table[statement_id]["use"],
                Identifier(parser, used, full_ref=core,
@@ -715,12 +717,16 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
 
             var_identifier = extract_identifier_from_declarator(declarator)
 
+            # Check if this declaration has an initializer
+            initializer = root_node.child_by_field_name("value")
+            has_initializer = initializer is not None
+
             if var_identifier:
                 add_entry(parser, rda_table, parent_id,
-                         defined=var_identifier, declaration=True)
+                         defined=var_identifier, declaration=True,
+                         has_initializer=has_initializer)
 
             # Extract initializer
-            initializer = root_node.child_by_field_name("value")
             if initializer:
                 # Special handling for lambda expressions
                 # Lambda bodies are separate execution contexts with their own CFG nodes
@@ -805,8 +811,21 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
             operator_text = extract_operator_text(root_node, left_node, right_node)
 
             # Compound assignments: x += y means USE x first, then DEFINE
+            # For C++, regular assignments on class types also USE the left side
+            # (assignment operator is called on the existing object)
+            # To be safe, we treat ALL assignments as using the left side
             if operator_text != "=":
+                # Compound assignment - definitely uses left side
                 add_entry(parser, rda_table, parent_id, used=left_node)
+            else:
+                # Regular assignment: For class/struct types, this calls the assignment
+                # operator on the existing object, so it uses the old value.
+                # For primitive types, this adds an extra edge which is conservative but harmless.
+                # Check if left side is an identifier (not field access, array subscript, etc.)
+                if left_node.type in variable_type:
+                    # Track USE of the left side only for simple variables
+                    # (for class types, this represents calling the assignment operator)
+                    add_entry(parser, rda_table, parent_id, used=left_node)
 
             # Left side is defined
             add_entry(parser, rda_table, parent_id, defined=left_node)
@@ -889,12 +908,16 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
             if function_node:
                 function_name = st(function_node)
 
-                # Track method calls on objects (obj.method())
+                # Track method calls on objects (obj.method() or obj->method())
                 if function_node.type == "field_expression":
-                    # This is a method call: obj.method()
-                    # Track USE and potential DEF of the object
-                    add_entry(parser, rda_table, parent_id, used=function_node, method_call=True)
-                    add_entry(parser, rda_table, parent_id, defined=function_node, method_call=True)
+                    # This is a method call: obj.method() or obj->method()
+                    # Only track USE of the base object (not the whole field expression)
+                    # Extract the base object from the field_expression
+                    argument = function_node.child_by_field_name("argument")
+                    if argument:
+                        # Track USE of the base object only
+                        add_entry(parser, rda_table, parent_id, used=argument)
+                    # Note: We do NOT add a DEF entry - method calls don't define the object
                 elif function_node.type in variable_type:
                     # Simple function call
                     add_entry(parser, rda_table, parent_id, used=function_node, method_call=True)
@@ -903,10 +926,53 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
             is_input_function = function_name in input_functions or \
                                (function_name and any(inp in function_name for inp in ["cin", "scanf"]))
 
+            # Special handling for variadic function macros
+            is_variadic_macro = function_name in ["va_start", "va_arg", "va_end"]
+
             # Process arguments
             args_node = root_node.child_by_field_name("arguments")
             if args_node:
-                for arg in args_node.named_children:
+                arg_list = list(args_node.named_children)
+                for idx, arg in enumerate(arg_list):
+                    # Special handling for variadic macros
+                    if is_variadic_macro:
+                        # va_start(valist, last_arg): valist is DEFINED (initialized)
+                        if function_name == "va_start" and idx == 0:
+                            # First argument is the va_list being initialized
+                            if arg.type in variable_type:
+                                add_entry(parser, rda_table, parent_id, defined=arg, declaration=False, has_initializer=True)
+                            else:
+                                # Extract identifiers from complex expression
+                                identifiers_defined = recursively_get_children_of_types(
+                                    arg, variable_type,
+                                    index=parser.index,
+                                    check_list=parser.symbol_table["scope_map"]
+                                )
+                                for identifier in identifiers_defined:
+                                    add_entry(parser, rda_table, parent_id, defined=identifier, declaration=False, has_initializer=True)
+                            continue  # Don't process as regular argument
+
+                        # va_arg(valist, type): valist is both USED and DEFINED (read and modify)
+                        elif function_name == "va_arg" and idx == 0:
+                            # First argument is the va_list being read and modified
+                            if arg.type in variable_type:
+                                add_entry(parser, rda_table, parent_id, used=arg)
+                                add_entry(parser, rda_table, parent_id, defined=arg, declaration=False)
+                            else:
+                                # Extract identifiers from complex expression
+                                identifiers_used = recursively_get_children_of_types(
+                                    arg, variable_type,
+                                    index=parser.index,
+                                    check_list=parser.symbol_table["scope_map"]
+                                )
+                                for identifier in identifiers_used:
+                                    add_entry(parser, rda_table, parent_id, used=identifier)
+                                    add_entry(parser, rda_table, parent_id, defined=identifier, declaration=False)
+                            continue  # Don't process as regular argument
+
+                        # va_end(valist): valist is only USED (finalization)
+                        # This is handled by the regular argument processing below
+
                     # For input functions, special handling
                     if is_input_function:
                         # Check for &var or pointer arguments - these are definitions
@@ -1246,9 +1312,9 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
             # Note: "lambda_expression" is NOT in stop_types so that identifiers inside
             # lambda bodies can find their parent statement (e.g., Node 51 in lambda body)
             handled_types_local = (def_statement + assignment + increment_statement +
-                                  function_calls + ["return_statement",
-                                                   "catch_clause", "throw_statement",
-                                                   "conditional_expression"])
+                                  function_calls + declaration_statement +
+                                  ["return_statement", "catch_clause", "throw_statement",
+                                   "conditional_expression"])
             parent_statement = return_first_parent_of_types(
                 root_node,
                 statement_types["non_control_statement"] + statement_types["control_statement"],
@@ -1260,6 +1326,10 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
 
             parent_id = get_index(parent_statement, index)
             if parent_id is None or parent_id not in CFG_results.graph.nodes:
+                continue
+
+            # Skip if this identifier is part of a declaration (being declared, not used)
+            if parent_statement.type in declaration_statement:
                 continue
 
             # This identifier is a USE
@@ -1364,7 +1434,7 @@ def name_match_with_fields(name1, name2):
 
 
 def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
-                                       graph_nodes, processed_edges, properties, lambda_map=None):
+                                       graph_nodes, processed_edges, properties, lambda_map=None, node_list=None):
     """
     Generate DFG edges from RDA solution.
 
@@ -1376,9 +1446,12 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
 
     Args:
         lambda_map: Dict mapping variable names to lambda information
+        node_list: Dict mapping node indices to AST nodes
     """
     if lambda_map is None:
         lambda_map = {}
+    if node_list is None:
+        node_list = {}
     final_graph = copy.deepcopy(cfg)
     final_graph.remove_edges_from(list(final_graph.edges()))
 
@@ -1395,26 +1468,73 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                 continue
 
             # Find reaching definitions
+            # Collect all matching definitions first
+            matching_defs = []
+            matching_field_defs = []
+
             for available_def in rda_solution[node]["IN"]:
+                # Skip uninitialized declarations (they don't define values, only names)
+                if hasattr(available_def, 'declaration') and hasattr(available_def, 'has_initializer'):
+                    if available_def.declaration and not available_def.has_initializer:
+                        continue
+
                 # Exact match
                 if available_def.name == used.name:
-                    if scope_check(available_def.scope, used.scope):
-                        add_edge(final_graph, available_def.line, node,
-                               {'dataflow_type': 'comesFrom',
-                                'edge_type': 'DFG_edge',
-                                'color': '#00A3FF',
-                                'used_def': used.name})
-                        used.satisfied = True
-
+                    # Check if DEF's scope can reach where the USE appears (variable_scope)
+                    if scope_check(available_def.scope, used.variable_scope):
+                        matching_defs.append(available_def)
                 # Partial match for field access
                 elif "." in used.name or "." in available_def.name:
                     if name_match_with_fields(used.name, available_def.name):
-                        if scope_check(available_def.scope, used.scope):
+                        if scope_check(available_def.scope, used.variable_scope):
+                            matching_field_defs.append(available_def)
+
+            # Filter out definitions that are "killed" by later definitions in the same path
+            # If this node defines the same variable, prefer self-loop over earlier definitions
+            def_info = rda_table[node]["def"] if node in rda_table else []
+            defines_same_var = any(d.name == used.name for d in def_info)
+
+            if defines_same_var:
+                # This node both USES and DEFINES the variable - create self-loop for loop-carried dependency
+                # But only if there are reaching definitions (otherwise it's first initialization)
+                if matching_defs:
+                    add_edge(final_graph, node, node,
+                           {'dataflow_type': 'loop_carried',
+                            'edge_type': 'DFG_edge',
+                            'color': '#FFA500',
+                            'used_def': used.name})
+
+                    # Also add edges from reaching definitions (initial flow into the loop)
+                    for available_def in matching_defs:
+                        if available_def.line != node:
                             add_edge(final_graph, available_def.line, node,
                                    {'dataflow_type': 'comesFrom',
                                     'edge_type': 'DFG_edge',
                                     'color': '#00A3FF',
                                     'used_def': used.name})
+                    used.satisfied = True
+            elif matching_defs:
+                # For each matching definition, create an edge
+                for available_def in matching_defs:
+                    if available_def.line != node:
+                        add_edge(final_graph, available_def.line, node,
+                               {'dataflow_type': 'comesFrom',
+                                'edge_type': 'DFG_edge',
+                                'color': '#00A3FF',
+                                'used_def': used.name})
+                    used.satisfied = True
+            elif matching_field_defs:
+                # Handle field access matches
+                for available_def in matching_field_defs:
+                    if name_match_with_fields(used.name, available_def.name):
+                        if scope_check(available_def.scope, used.variable_scope):
+                            # Prevent self-loops: don't create edge from a node to itself
+                            if available_def.line != node:
+                                add_edge(final_graph, available_def.line, node,
+                                       {'dataflow_type': 'comesFrom',
+                                        'edge_type': 'DFG_edge',
+                                        'color': '#00A3FF',
+                                        'used_def': used.name})
                             used.satisfied = True
 
             # Handle unsatisfied function identifier references (e.g., &function_name)
@@ -1429,12 +1549,14 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                             # Check if this is a function definition node
                             node_type = read_index(index, def_node)[-1] if def_node in index.values() else None
                             if node_type == "function_definition":
-                                # Add edge from function definition to usage
-                                add_edge(final_graph, def_node, node,
-                                       {'dataflow_type': 'comesFrom',
-                                        'edge_type': 'DFG_edge',
-                                        'color': '#00A3FF',
-                                        'used_def': used.name})
+                                # Prevent self-loops: don't create edge from a node to itself
+                                if def_node != node:
+                                    # Add edge from function definition to usage
+                                    add_edge(final_graph, def_node, node,
+                                           {'dataflow_type': 'comesFrom',
+                                            'edge_type': 'DFG_edge',
+                                            'color': '#00A3FF',
+                                            'used_def': used.name})
                                 used.satisfied = True
                                 break
 
@@ -1449,9 +1571,11 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                         if definition.name == used.name:
                             # Check if this is a global-scope definition (scope = [0])
                             if definition.scope == [0] and scope_check(definition.scope, used.scope):
-                                # Add edge from global definition to usage
-                                add_edge(final_graph, definition.line, node,
-                                       {'dataflow_type': 'comesFrom',
+                                # Prevent self-loops: don't create edge from a node to itself
+                                if definition.line != node:
+                                    # Add edge from global definition to usage
+                                    add_edge(final_graph, definition.line, node,
+                                           {'dataflow_type': 'comesFrom',
                                         'edge_type': 'DFG_edge',
                                         'color': '#00A3FF',
                                         'used_def': used.name})
@@ -1473,10 +1597,119 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                     add_edge(final_graph, killed_def.line, node,
                            {'color': 'orange', 'dataflow_type': 'lastDef'})
 
-    # Add function parameter/return edges
+    # Add function parameter/return and OOP edges
     for edge in processed_edges:
-        add_edge(final_graph, edge[0], edge[1],
-               {'dataflow_type': 'parameter', 'edge_type': 'DFG_edge'})
+        # Get edge label to determine the type of data flow
+        edge_data = cfg.get_edge_data(*edge)
+        if edge_data and len(edge_data) > 0:
+            edge_data = edge_data[0]
+            label = edge_data.get("label", "")
+
+            # Determine the data flow type and description
+            if label == "constructor_call":
+                # Object declaration → constructor: 'this' pointer creation
+                source_node = node_list.get(read_index(index, edge[0]))
+                # Extract the object name from the declaration
+                obj_name = "this"
+                if source_node and source_node.type == "declaration":
+                    # Try to get the declarator
+                    for child in source_node.named_children:
+                        if child.type in ["init_declarator", "identifier", "type_identifier"]:
+                            if child.type == "init_declarator":
+                                decl = child.child_by_field_name("declarator")
+                                if decl and decl.type == "identifier":
+                                    obj_name = st(decl)
+                            elif child.type == "identifier":
+                                obj_name = st(child)
+
+                add_edge(final_graph, edge[0], edge[1],
+                       {'dataflow_type': 'constructor_call',
+                        'edge_type': 'DFG_edge',
+                        'color': '#FF6B6B',
+                        'object_name': obj_name})
+
+            elif label == "base_constructor_call":
+                # Derived constructor → base constructor: 'this' pointer chain
+                add_edge(final_graph, edge[0], edge[1],
+                       {'dataflow_type': 'base_constructor_call',
+                        'edge_type': 'DFG_edge',
+                        'color': '#FF6B6B',
+                        'object_name': 'this'})
+
+            elif label == "scope_exit_destructor":
+                # Scope exit → destructor: object destruction
+                add_edge(final_graph, edge[0], edge[1],
+                       {'dataflow_type': 'destructor_call',
+                        'edge_type': 'DFG_edge',
+                        'color': '#C44569',
+                        'object_name': 'this'})
+
+            elif label == "base_destructor_call":
+                # Derived destructor → base destructor: 'this' pointer chain
+                add_edge(final_graph, edge[0], edge[1],
+                       {'dataflow_type': 'base_destructor_call',
+                        'edge_type': 'DFG_edge',
+                        'color': '#C44569',
+                        'object_name': 'this'})
+
+            elif label == "virtual_call":
+                # Virtual method call → implementation: polymorphic dispatch
+                # Extract the object variable name from the call site
+                source_node = node_list.get(read_index(index, edge[0]))
+                obj_name = "this"
+
+                if source_node and source_node.type == "expression_statement":
+                    # Get the call_expression
+                    call_expr = source_node.named_children[0] if source_node.named_children else None
+                    if call_expr and call_expr.type == "call_expression":
+                        # Get the function being called (should be field_expression)
+                        func_node = call_expr.child_by_field_name("function")
+                        if func_node and func_node.type == "field_expression":
+                            # Extract the base object (argument)
+                            arg_node = func_node.child_by_field_name("argument")
+                            if arg_node:
+                                obj_name = st(arg_node)
+
+                add_edge(final_graph, edge[0], edge[1],
+                       {'dataflow_type': 'virtual_dispatch',
+                        'edge_type': 'DFG_edge',
+                        'color': '#4834DF',
+                        'object_name': obj_name})
+
+            elif label == "method_call":
+                # Non-virtual method call → implementation: static dispatch
+                # Extract the object variable name from the call site
+                source_node = node_list.get(read_index(index, edge[0]))
+                obj_name = "this"
+
+                if source_node and source_node.type == "expression_statement":
+                    # Get the call_expression
+                    call_expr = source_node.named_children[0] if source_node.named_children else None
+                    if call_expr and call_expr.type == "call_expression":
+                        # Get the function being called (should be field_expression)
+                        func_node = call_expr.child_by_field_name("function")
+                        if func_node and func_node.type == "field_expression":
+                            # Extract the base object (argument)
+                            arg_node = func_node.child_by_field_name("argument")
+                            if arg_node:
+                                obj_name = st(arg_node)
+
+                add_edge(final_graph, edge[0], edge[1],
+                       {'dataflow_type': 'method_call',
+                        'edge_type': 'DFG_edge',
+                        'color': '#00CED1',
+                        'object_name': obj_name})
+
+            else:
+                # Only add parameter edges for function returns, not function calls
+                # Function calls (call -> function) don't represent data flow in this simple model
+                # Return statements (return -> call) do represent data flow
+                if label in ["method_return", "function_return"]:
+                    add_edge(final_graph, edge[0], edge[1],
+                           {'dataflow_type': 'parameter',
+                            'edge_type': 'DFG_edge'})
+                # Skip function_call edges - they would be backwards (call -> function)
+                # We already handle argument-to-parameter flow via RDA
 
     # Phase 3: Lambda indirect call resolution
     # Connect function pointer/lambda calls to their execution targets
@@ -1609,7 +1842,7 @@ def dfg_cpp(properties, CFG_results):
     cfg_graph = copy.deepcopy(CFG_results.graph)
     node_list = CFG_results.node_list
 
-    # Phase 1: Preprocess CFG for function/method calls
+    # Phase 1: Preprocess CFG for function/method calls and OOP features
     processed_edges = []
 
     # Handle function/method calls and returns
@@ -1642,6 +1875,42 @@ def dfg_cpp(properties, CFG_results):
                     if return_statement.named_children:
                         processed_edges.append(edge)
 
+            # Handle constructor calls (object declaration → constructor)
+            elif label == "constructor_call":
+                # Edge from declaration statement to constructor
+                # This represents the 'this' pointer (the object being constructed)
+                processed_edges.append(edge)
+
+            # Handle base constructor calls (derived constructor → base constructor)
+            elif label == "base_constructor_call":
+                # Edge from derived class constructor to base class constructor
+                # This represents the 'this' pointer being passed up the constructor chain
+                processed_edges.append(edge)
+
+            # Handle destructor calls on scope exit (scope exit → destructor)
+            elif label == "scope_exit_destructor":
+                # Edge from scope exit (e.g., return statement, end of block) to destructor
+                # This represents the object being destroyed
+                processed_edges.append(edge)
+
+            # Handle base destructor calls (derived destructor → base destructor)
+            elif label == "base_destructor_call":
+                # Edge from derived class destructor to base class destructor
+                # This represents the 'this' pointer being passed up the destructor chain
+                processed_edges.append(edge)
+
+            # Handle virtual method calls (call site → actual implementation)
+            elif label == "virtual_call":
+                # Edge from call site to virtual method implementation
+                # This represents the polymorphic dispatch
+                processed_edges.append(edge)
+
+            # Handle non-virtual method calls (call site → static method)
+            elif label == "method_call":
+                # Edge from call site to non-virtual method implementation
+                # This represents static (compile-time) dispatch
+                processed_edges.append(edge)
+
     # Phase 2: Discover lambdas
     start_lambda_time = time.time()
     lambda_map = discover_lambdas(parser, CFG_results)
@@ -1660,7 +1929,7 @@ def dfg_cpp(properties, CFG_results):
     # Phase 5: Generate DFG edges
     final_graph = get_required_edges_from_def_to_use(
         index, cfg_graph, rda_solution, rda_table,
-        cfg_graph.nodes, processed_edges, properties, lambda_map
+        cfg_graph.nodes, processed_edges, properties, lambda_map, node_list
     )
 
     if debug:
