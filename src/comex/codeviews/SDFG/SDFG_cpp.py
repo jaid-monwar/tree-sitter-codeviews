@@ -111,6 +111,181 @@ def return_first_parent_of_types(node, parent_types, stop_types=None):
     return None
 
 
+def is_node_inside_loop(ast_node):
+    """
+    Check if an AST node is inside a loop structure.
+
+    Args:
+        ast_node: AST node to check
+
+    Returns:
+        True if node is inside a loop (for/while/do-while), False otherwise
+    """
+    if ast_node is None:
+        return False
+
+    current = ast_node
+    while current.parent is not None:
+        if current.parent.type in ["for_statement", "while_statement",
+                                   "do_statement", "for_range_loop"]:
+            return True
+        current = current.parent
+    return False
+
+
+def get_loop_condition_node(ast_node, parser):
+    """
+    Get the loop condition CFG node for a node inside a loop body.
+
+    Args:
+        ast_node: AST node inside a loop body
+        parser: Parser with index
+
+    Returns:
+        Tuple (is_in_loop_body, loop_condition_id):
+        - is_in_loop_body: True if node is inside a loop body
+        - loop_condition_id: CFG node ID of the loop condition, or None
+    """
+    if ast_node is None:
+        return False, None
+
+    # Find the parent loop structure
+    current = ast_node
+    while current.parent is not None:
+        parent_type = current.parent.type
+
+        if parent_type in ["for_statement", "while_statement",
+                          "do_statement", "for_range_loop"]:
+            # Found a parent loop - get its CFG node ID (the condition node)
+            loop_condition_id = get_index(current.parent, parser.index)
+            return True, loop_condition_id
+
+        current = current.parent
+
+    return False, None
+
+
+def get_variable_type(parser, node):
+    """
+    Get the type of a variable from parser's symbol table.
+
+    Args:
+        parser: C++ parser with symbol table
+        node: AST node representing the variable
+
+    Returns:
+        String representing the type, or None if not found
+    """
+    var_index = get_index(node, parser.index)
+    if var_index is None:
+        return None
+
+    # Check if this variable has a declaration
+    if var_index in parser.declaration_map:
+        decl_index = parser.declaration_map[var_index]
+        if decl_index in parser.symbol_table.get("data_type", {}):
+            return parser.symbol_table["data_type"][decl_index]
+
+    # Check if the node itself has type info (for declarations)
+    if var_index in parser.symbol_table.get("data_type", {}):
+        return parser.symbol_table["data_type"][var_index]
+
+    return None
+
+
+def is_primitive_type(type_string):
+    """
+    Check if a type string represents a C++ primitive type.
+
+    Args:
+        type_string: String representing the type
+
+    Returns:
+        True if primitive, False otherwise
+    """
+    if type_string is None:
+        return False
+
+    # C++ primitive types and their variants
+    primitive_types = {
+        # Integer types
+        'int', 'short', 'long', 'char', 'wchar_t', 'char8_t', 'char16_t', 'char32_t',
+        'signed', 'unsigned',
+        # Fixed-width integer types from <cstdint>
+        'int8_t', 'int16_t', 'int32_t', 'int64_t',
+        'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+        'int_fast8_t', 'int_fast16_t', 'int_fast32_t', 'int_fast64_t',
+        'uint_fast8_t', 'uint_fast16_t', 'uint_fast32_t', 'uint_fast64_t',
+        'int_least8_t', 'int_least16_t', 'int_least32_t', 'int_least64_t',
+        'uint_least8_t', 'uint_least16_t', 'uint_least32_t', 'uint_least64_t',
+        'intmax_t', 'uintmax_t', 'intptr_t', 'uintptr_t',
+        'size_t', 'ssize_t', 'ptrdiff_t',
+        # Floating-point types
+        'float', 'double',
+        # Boolean
+        'bool',
+        # Void
+        'void',
+        # C types
+        'DWORD', 'WORD', 'BYTE',
+    }
+
+    # Remove const, volatile, and whitespace
+    type_clean = type_string.strip().replace('const', '').replace('volatile', '').strip()
+
+    # Check for exact match
+    if type_clean in primitive_types:
+        return True
+
+    # Check for compound types (e.g., "unsigned int", "long long")
+    tokens = type_clean.split()
+    if all(token in primitive_types for token in tokens):
+        return True
+
+    # Check if any primitive type keyword appears in the string
+    # This handles cases like "unsigned int" or "long double"
+    for prim in primitive_types:
+        if prim in type_clean:
+            # Make sure it's not part of a class name (e.g., MyIntClass)
+            # For now, use simple heuristic: if it's the only token or starts the string
+            if type_clean == prim or type_clean.startswith(prim + ' '):
+                return True
+
+    return False
+
+
+def is_class_or_struct_type(parser, type_string):
+    """
+    Check if a type string represents a class or struct type.
+
+    Args:
+        parser: C++ parser with symbol table
+        type_string: String representing the type
+
+    Returns:
+        True if class/struct, False otherwise
+    """
+    if type_string is None:
+        return False
+
+    # Not a primitive = likely a class or struct
+    # Also check parser.records if available (for OOP tracking)
+    if not is_primitive_type(type_string):
+        # Check if it's in the parser's records (classes/structs)
+        if hasattr(parser, 'records') and type_string in parser.records:
+            return True
+
+        # Check for std:: types (which are classes)
+        if 'std::' in type_string or '::' in type_string:
+            return True
+
+        # If not primitive and looks like a type identifier, assume class/struct
+        # (conservative: better to miss a use than create false edges)
+        return True
+
+    return False
+
+
 def recursively_get_children_of_types(node, st_types, check_list=None,
                                      index=None, result=None, stop_types=None):
     """Recursively find child nodes of given types"""
@@ -813,19 +988,23 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
             # Compound assignments: x += y means USE x first, then DEFINE
             # For C++, regular assignments on class types also USE the left side
             # (assignment operator is called on the existing object)
-            # To be safe, we treat ALL assignments as using the left side
             if operator_text != "=":
                 # Compound assignment - definitely uses left side
                 add_entry(parser, rda_table, parent_id, used=left_node)
             else:
                 # Regular assignment: For class/struct types, this calls the assignment
                 # operator on the existing object, so it uses the old value.
-                # For primitive types, this adds an extra edge which is conservative but harmless.
-                # Check if left side is an identifier (not field access, array subscript, etc.)
+                # For primitive types, this is a simple copy and does NOT use the old value.
                 if left_node.type in variable_type:
-                    # Track USE of the left side only for simple variables
-                    # (for class types, this represents calling the assignment operator)
-                    add_entry(parser, rda_table, parent_id, used=left_node)
+                    # Get the variable's type
+                    var_type = get_variable_type(parser, left_node)
+
+                    # Only track USE for class/struct types
+                    # For primitive types, assignment is just a copy (no use of old value)
+                    if is_class_or_struct_type(parser, var_type):
+                        # Class/struct assignment calls operator=, so it uses the old value
+                        add_entry(parser, rda_table, parent_id, used=left_node)
+                    # For primitive types: no USE, only DEF (handled below)
 
             # Left side is defined
             add_entry(parser, rda_table, parent_id, defined=left_node)
@@ -1434,7 +1613,7 @@ def name_match_with_fields(name1, name2):
 
 
 def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
-                                       graph_nodes, processed_edges, properties, lambda_map=None, node_list=None):
+                                       graph_nodes, processed_edges, properties, lambda_map=None, node_list=None, parser=None):
     """
     Generate DFG edges from RDA solution.
 
@@ -1495,16 +1674,31 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
             defines_same_var = any(d.name == used.name for d in def_info)
 
             if defines_same_var:
-                # This node both USES and DEFINES the variable - create self-loop for loop-carried dependency
-                # But only if there are reaching definitions (otherwise it's first initialization)
+                # This node both USES and DEFINES the variable
+                # Create self-loop ONLY if:
+                # 1. It's inside a loop, AND
+                # 2. The reaching definitions include this same node (from a previous iteration)
+                # Otherwise, it's either a sequential update (e.g., node++ in switch) or
+                # the value comes from a different statement in the previous iteration
                 if matching_defs:
-                    add_edge(final_graph, node, node,
-                           {'dataflow_type': 'loop_carried',
-                            'edge_type': 'DFG_edge',
-                            'color': '#FFA500',
-                            'used_def': used.name})
+                    # Get the AST node to check if it's inside a loop
+                    node_key = read_index(index, node) if node in index.values() else None
+                    ast_node = node_list.get(node_key) if node_list and node_key else None
 
-                    # Also add edges from reaching definitions (initial flow into the loop)
+                    # Check if any of the reaching definitions is from this same node
+                    # This indicates a true loop-carried dependency where the statement
+                    # uses its own output from a previous iteration
+                    has_loop_carried_def = any(d.line == node for d in matching_defs)
+
+                    # Only create self-loop if there's actually a loop-carried dependency
+                    if has_loop_carried_def and ast_node and is_node_inside_loop(ast_node):
+                        add_edge(final_graph, node, node,
+                               {'dataflow_type': 'loop_carried',
+                                'edge_type': 'DFG_edge',
+                                'color': '#FFA500',
+                                'used_def': used.name})
+
+                    # Also add edges from reaching definitions (initial flow into the loop or statement)
                     for available_def in matching_defs:
                         if available_def.line != node:
                             add_edge(final_graph, available_def.line, node,
@@ -1929,7 +2123,7 @@ def dfg_cpp(properties, CFG_results):
     # Phase 5: Generate DFG edges
     final_graph = get_required_edges_from_def_to_use(
         index, cfg_graph, rda_solution, rda_table,
-        cfg_graph.nodes, processed_edges, properties, lambda_map, node_list
+        cfg_graph.nodes, processed_edges, properties, lambda_map, node_list, parser
     )
 
     if debug:
