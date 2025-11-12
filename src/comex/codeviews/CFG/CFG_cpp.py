@@ -1839,6 +1839,9 @@ class CFGGraph_cpp(CFGGraph):
                         # Will resolve the specialization later during edge generation
                         self.template_instantiations[var_name] = (class_name, template_args, None)
 
+                    # Don't recursively process declaration children - we've already handled everything
+                    return
+
         # Handle constructor calls from new expressions
         # Example: Base* basePtr = new Derived();
         elif root_node.type == "new_expression":

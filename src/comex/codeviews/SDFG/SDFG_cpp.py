@@ -690,11 +690,25 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         argument = current_node.child_by_field_name("argument")
 
         if defined is not None:
+            # When a field is being defined (e.g., obj.field = value),
+            # the object itself is USED (to access the member), and the field is DEFINED
+            # First, track USE of the base object (just the object, not the full field expression)
+            if argument:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, argument, line=statement_id))  # Track object with line number
+            # Then track DEF of the full field expression
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, argument, statement_id,
                             full_ref=current_node, declaration=declaration,
                             method_call=method_call, has_initializer=has_initializer))
         else:
+            # When a field is being used (e.g., reading obj.field),
+            # Track both the object USE and the full field expression USE
+            if argument:
+                # Track the base object as being used with the current line number
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, argument, line=statement_id))
+            # Also track the full field expression as being used
             set_add(rda_table[statement_id]["use"],
                    Identifier(parser, argument, full_ref=current_node,
                             method_call=method_call))
@@ -2158,14 +2172,33 @@ def add_edge(final_graph, source, target, attrib=None):
         nx.set_edge_attributes(final_graph, {(source, target, edge_key): attrib})
 
 
-def name_match_with_fields(name1, name2):
-    """Check if two names match (handling field access)"""
-    if name1 == name2:
+def name_match_with_fields(use_name, def_name):
+    """
+    Check if a definition satisfies a use (handling field access).
+
+    Args:
+        use_name: The name being used (e.g., "obj" or "obj.field")
+        def_name: The name being defined (e.g., "obj" or "obj.field")
+
+    Returns:
+        True if the definition can satisfy the use
+    """
+    # Exact match
+    if use_name == def_name:
         return True
 
-    # One is prefix of other (field access)
-    if name1.startswith(name2 + ".") or name2.startswith(name1 + "."):
-        return True
+    # If using a field (obj.field), it can be satisfied by:
+    # 1. A definition of the same field (obj.field)
+    # 2. A definition of the whole object (obj)
+    if "." in use_name:
+        # Check if def_name is the base object
+        base_obj = use_name.split(".")[0]
+        if def_name == base_obj:
+            return True
+
+    # If using just an object (obj), it can only be satisfied by
+    # a definition of the object itself, not its fields
+    # So we don't match if def_name is a field of use_name
 
     return False
 
@@ -2210,10 +2243,14 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
             matching_field_defs = []
 
             for available_def in rda_solution[node]["IN"]:
-                # Skip uninitialized declarations (they don't define values, only names)
-                if hasattr(available_def, 'declaration') and hasattr(available_def, 'has_initializer'):
-                    if available_def.declaration and not available_def.has_initializer:
-                        continue
+                # In C++, even declarations without explicit initializers can define values
+                # (e.g., "Book obj;" calls the default constructor)
+                # So we don't skip declarations for C++
+                # For other languages, skip uninitialized declarations
+                if parser.src_language != "cpp":
+                    if hasattr(available_def, 'declaration') and hasattr(available_def, 'has_initializer'):
+                        if available_def.declaration and not available_def.has_initializer:
+                            continue
 
                 # Exact match
                 if available_def.name == used.name:
@@ -2274,6 +2311,9 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                 'edge_type': 'DFG_edge',
                                 'color': '#00A3FF',
                                 'used_def': used.name})
+                        used.satisfied = True
+                # Only mark satisfied after creating edges
+                if matching_defs:
                     used.satisfied = True
             elif matching_field_defs:
                 # Handle field access matches
