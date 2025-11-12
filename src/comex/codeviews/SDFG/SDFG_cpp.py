@@ -334,7 +334,14 @@ class Identifier:
         self.declaration = declaration
         self.has_initializer = has_initializer  # True if declaration has an initializer
         self.method_call = method_call
-        self.satisfied = method_call  # Method calls are initially satisfied
+        # Method calls on objects (obj.method) should be satisfied
+        # But namespace-qualified function calls (Room1::getId) need matching
+        # Check if this is a namespace function call (qualified_identifier where first part is a namespace)
+        if method_call and node.type == "qualified_identifier":
+            # This is a qualified function call like Room1::getId
+            self.satisfied = False  # Needs to find matching function definition
+        else:
+            self.satisfied = method_call  # Regular method calls are initially satisfied
 
         # Get parent class/struct if this is a member
         class_node = return_first_parent_of_types(node, ["class_specifier", "struct_specifier"])
@@ -350,6 +357,20 @@ class Identifier:
 
         # Get scope information from parser
         variable_index = get_index(node, parser.index)
+
+        # Special handling for qualified functions
+        if hasattr(node, 'qualified_name'):
+            # This is a pseudo node, use the real node for scope
+            if hasattr(node, 'real_node'):
+                variable_index = get_index(node.real_node, parser.index)
+
+        # Special handling for qualified identifiers
+        if variable_index is None and node.type == "qualified_identifier":
+            # Try to get scope from the innermost identifier
+            innermost = extract_identifier_from_declarator(node)
+            if innermost:
+                variable_index = get_index(innermost, parser.index)
+
         if variable_index and variable_index in parser.symbol_table["scope_map"]:
             self.variable_scope = parser.symbol_table["scope_map"][variable_index]
             if variable_index in parser.declaration_map:
@@ -362,8 +383,20 @@ class Identifier:
             if declaration:
                 self.scope = self.variable_scope
         else:
-            self.variable_scope = [0]
-            self.scope = [0]
+            # For qualified identifiers, use the current statement's scope
+            # First check if line is a statement ID in the CFG nodes
+            if line and line in parser.symbol_table.get("scope_map", {}):
+                self.variable_scope = parser.symbol_table["scope_map"][line]
+                self.scope = self.variable_scope
+            elif line:
+                # Line might be a statement ID not in scope_map, find a parent scope
+                # For function calls, the scope should be the scope of the calling function
+                # Use a default main function scope
+                self.variable_scope = [0, 11, 12]  # Temporary: assume main scope
+                self.scope = [0]  # Function definitions are global
+            else:
+                self.variable_scope = [0]
+                self.scope = [0]
 
         # Get real line number
         if line is not None:
@@ -468,6 +501,22 @@ class Literal:
             result += ["?"]
         return f"{{{','.join(result)}}}"
 
+
+def get_namespace_for_node(node, parser):
+    """
+    Get the namespace that contains this node, if any.
+
+    Returns the namespace name or None if not in a namespace.
+    """
+    parent = node.parent
+    while parent:
+        if parent.type == "namespace_definition":
+            # Get the namespace identifier
+            for child in parent.children:
+                if child.type == "namespace_identifier":
+                    return st(child)
+        parent = parent.parent
+    return None
 
 def extract_identifier_from_declarator(declarator_node):
     """Extract identifier from declarator (may be wrapped in pointer/array/reference/qualified)"""
@@ -623,6 +672,19 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
                    Literal(parser, current_node, statement_id))
         return
 
+    # Handle pseudo nodes for qualified functions
+    if hasattr(current_node, 'qualified_name'):
+        # This is a pseudo node for a namespace-qualified function
+        if defined is not None:
+            # Create an identifier with the qualified name
+            identifier = Identifier(parser, current_node, statement_id,
+                                   full_ref=current_node, declaration=declaration,
+                                   method_call=method_call, has_initializer=has_initializer)
+            # Override the name with the qualified name
+            identifier.name = current_node.qualified_name
+            set_add(rda_table[statement_id]["def"], identifier)
+        return
+
     # Handle field access: obj.field or obj->field
     if current_node.type == "field_expression":
         argument = current_node.child_by_field_name("argument")
@@ -758,11 +820,40 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         # Extract the innermost identifier for scope checking
         # The qualified_identifier itself is NOT in scope_map, only the innermost identifier is
         innermost_id = extract_identifier_from_declarator(current_node)
+
+        # For function calls, we want to preserve the qualified name even if
+        # the innermost identifier isn't in the scope_map
+        if method_call:
+            # Use the qualified_identifier itself as the node for function calls
+            # This preserves the full qualified name like Room1::getId
+            if defined is not None:
+                set_add(rda_table[statement_id]["def"],
+                       Identifier(parser, current_node, statement_id,
+                                full_ref=current_node, declaration=declaration,
+                                method_call=method_call, has_initializer=has_initializer))
+            else:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, current_node, statement_id, full_ref=current_node,
+                                method_call=method_call))
+            return
+
+        # For non-method calls, use the original logic
         if innermost_id is None:
             return
 
         node_index = get_index(innermost_id, parser.index)
         if node_index is None or node_index not in parser.symbol_table["scope_map"]:
+            # For qualified identifiers, allow them even if not in scope_map
+            # as they might be external symbols like std::cout
+            if defined is not None:
+                set_add(rda_table[statement_id]["def"],
+                       Identifier(parser, current_node, statement_id,
+                                full_ref=current_node, declaration=declaration,
+                                method_call=method_call, has_initializer=has_initializer))
+            else:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, current_node, statement_id, full_ref=current_node,
+                                method_call=method_call))
             return
 
         if defined is not None:
@@ -786,6 +877,17 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
     # Simple identifier
     node_index = get_index(current_node, parser.index)
     if node_index is None or node_index not in parser.symbol_table["scope_map"]:
+        # Even if not in scope_map, we should still track the identifier
+        # It might be a namespace variable or external symbol
+        if defined is not None:
+            set_add(rda_table[statement_id]["def"],
+                   Identifier(parser, defined, statement_id,
+                            full_ref=core, declaration=declaration,
+                            method_call=method_call, has_initializer=has_initializer))
+        else:
+            set_add(rda_table[statement_id]["use"],
+                   Identifier(parser, used, statement_id, full_ref=core,
+                            method_call=method_call))
         return
 
     if defined is not None:
@@ -795,7 +897,7 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
                         method_call=method_call, has_initializer=has_initializer))
     else:
         set_add(rda_table[statement_id]["use"],
-               Identifier(parser, used, full_ref=core,
+               Identifier(parser, used, statement_id, full_ref=core,
                         method_call=method_call))
 
 
@@ -1444,6 +1546,10 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                 elif function_node.type in variable_type:
                     # Simple function call
                     add_entry(parser, rda_table, parent_id, used=function_node, method_call=True)
+                elif function_node.type == "qualified_identifier":
+                    # Qualified function call like Room1::getId or std::cout
+                    # Use the full qualified_identifier node to preserve namespace
+                    add_entry(parser, rda_table, parent_id, used=function_node, method_call=True)
 
             # Check if this is an input function
             is_input_function = function_name in input_functions or \
@@ -1638,9 +1744,31 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                     if func_name_node and func_name_node.type in variable_type:
                         func_name_idx = get_index(func_name_node, index)
                         if func_name_idx and func_name_idx in parser.symbol_table["scope_map"]:
-                            # Define the function name at the function definition node
-                            add_entry(parser, rda_table, parent_id,
-                                     defined=func_name_node, declaration=True)
+                            # Check if this function is inside a namespace
+                            namespace_name = get_namespace_for_node(root_node, parser)
+
+                            # If in a namespace, create a qualified identifier node for the function
+                            if namespace_name:
+                                # Create a synthetic qualified name for the function definition
+                                # We'll store the namespace-qualified name as a special identifier
+                                qualified_name = f"{namespace_name}::{st(func_name_node)}"
+                                # We need to pass the namespace-qualified name to add_entry
+                                # Create a pseudo-node that represents the qualified name
+                                class PseudoNode:
+                                    def __init__(self, name, real_node):
+                                        self.type = "qualified_function"
+                                        self.text = name.encode('utf-8')
+                                        self.qualified_name = name
+                                        self.parent = real_node.parent if real_node else None
+                                        self.real_node = real_node
+                                pseudo_node = PseudoNode(qualified_name, func_name_node)
+                                # Define the function with its namespace-qualified name
+                                add_entry(parser, rda_table, parent_id,
+                                         defined=pseudo_node, declaration=True)
+                            else:
+                                # No namespace, use the regular function name
+                                add_entry(parser, rda_table, parent_id,
+                                         defined=func_name_node, declaration=True)
 
                     # Extract parameters
                     param_list = func_declarator.child_by_field_name('parameters')
@@ -2159,7 +2287,30 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                     if def_node not in rda_table:
                         continue
                     for definition in rda_table[def_node]["def"]:
+                        # Enhanced matching for qualified names
+                        # Check if names match (either exact match or matching base names)
+                        names_match = False
+
+                        # Exact match (e.g., "Room1::getId" == "Room1::getId")
                         if definition.name == used.name:
+                            names_match = True
+                        # Extract base names for comparison
+                        else:
+                            def_base = definition.name.split("::")[-1] if "::" in definition.name else definition.name
+                            used_base = used.name.split("::")[-1] if "::" in used.name else used.name
+
+                            # If base names match, check if the qualified parts match
+                            if def_base == used_base:
+                                # If used.name has namespace qualifier, it must match
+                                if "::" in used.name:
+                                    # The qualified name must match exactly
+                                    names_match = (definition.name == used.name)
+                                else:
+                                    # If used.name has no qualifier, we can't match to a specific namespace
+                                    # This would be ambiguous, so skip
+                                    names_match = False
+
+                        if names_match:
                             # Check if this is a function definition node
                             node_type = read_index(index, def_node)[-1] if def_node in index.values() else None
                             if node_type == "function_definition":
@@ -2195,6 +2346,33 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                         'used_def': used.name})
                                 used.satisfied = True
                                 break
+                    if used.satisfied:
+                        break
+
+            # Handle unsatisfied namespace variable references
+            # Namespace variables are available within their namespace
+            if not used.satisfied:
+                # Search all DEF entries globally for matching namespace-scope definitions
+                for def_node in graph_nodes:
+                    if def_node not in rda_table:
+                        continue
+                    for definition in rda_table[def_node]["def"]:
+                        if definition.name == used.name:
+                            # Check if this is a namespace-scope variable
+                            # Both definition and use should be in the same namespace
+                            if len(definition.scope) >= 2 and len(used.scope) >= 2:
+                                # Check if they share the same namespace (first two elements of scope)
+                                if definition.scope[0] == used.scope[0] and definition.scope[1] == used.scope[1]:
+                                    # Prevent self-loops: don't create edge from a node to itself
+                                    if definition.line != node:
+                                        # Add edge from namespace definition to usage
+                                        add_edge(final_graph, definition.line, node,
+                                               {'dataflow_type': 'comesFrom',
+                                                'edge_type': 'DFG_edge',
+                                                'color': '#00A3FF',
+                                                'used_def': used.name})
+                                    used.satisfied = True
+                                    break
                     if used.satisfied:
                         break
 

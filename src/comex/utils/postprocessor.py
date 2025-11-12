@@ -62,14 +62,19 @@ def write_to_dot(og_graph, filename, output_png=False, src_language=None):
 
                 graph.nodes[node]['label'] = label
 
-        # Fix edge attributes that might contain DOT reserved keywords
+        # Fix edge attributes that might contain DOT reserved keywords or special characters
         for u, v, key, data in graph.edges(keys=True, data=True):
             # Check string-valued attributes like used_def, used_var
             for attr_name in ['used_def', 'used_var']:
                 if attr_name in data:
                     attr_value = str(data[attr_name])
-                    # Quote if it's a DOT reserved keyword
-                    if attr_value in dot_reserved_keywords:
+                    # Quote if it's a DOT reserved keyword or contains special characters
+                    # For C/C++, quote if it contains :: (namespace qualifier)
+                    needs_quoting = (
+                        attr_value in dot_reserved_keywords or
+                        (src_language in ['c', 'cpp'] and '::' in attr_value)
+                    )
+                    if needs_quoting:
                         graph.edges[u, v, key][attr_name] = f'"{attr_value}"'
 
         nx.nx_pydot.write_dot(graph, filename)
