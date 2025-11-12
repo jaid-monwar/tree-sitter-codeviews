@@ -515,6 +515,69 @@ def extract_param_identifier(param_node):
     return None
 
 
+def is_reference_variable(parser, node):
+    """
+    Check if a variable node represents a reference variable.
+
+    This is determined by checking if the variable's declaration
+    involves a reference_declarator in the AST.
+
+    Args:
+        parser: C++ parser with declaration_map and tree
+        node: AST node representing the variable (identifier)
+
+    Returns:
+        True if the variable is a reference, False otherwise
+    """
+    if node is None or node.type not in ['identifier']:
+        return False
+
+    # Get the variable's index
+    var_index = get_index(node, parser.index)
+    if var_index is None:
+        return False
+
+    # Look up declaration using declaration_map
+    if var_index not in parser.declaration_map:
+        return False
+
+    decl_index = parser.declaration_map[var_index]
+
+    # Find the declaration node by matching its index and position
+    def find_node_by_index(root, target_index):
+        """Find node with matching index by traversing tree"""
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            # Check if this node has the target index
+            node_idx = get_index(current, parser.index)
+            if node_idx == target_index:
+                return current
+            # Add children to stack
+            for child in current.children:
+                stack.append(child)
+        return None
+
+    # Search for the declaration node
+    decl_node = find_node_by_index(parser.tree.root_node, decl_index)
+
+    if decl_node:
+        # Check if this declaration node's parent is a reference_declarator
+        parent = decl_node.parent
+        depth = 0
+        while parent and depth < 5:  # Limit search depth
+            if parent.type == "reference_declarator":
+                return True
+            # Stop at declaration boundaries
+            if parent.type in ["parameter_declaration", "declaration",
+                              "function_definition", "translation_unit"]:
+                break
+            depth += 1
+            parent = parent.parent
+
+    return False
+
+
 def extract_operator_text(assign_node, left_node, right_node):
     """Extract operator from assignment (=, +=, -=, etc.)"""
     left_text = left_node.text
@@ -1273,16 +1336,19 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                 # Regular assignment: For class/struct types, this calls the assignment
                 # operator on the existing object, so it uses the old value.
                 # For primitive types, this is a simple copy and does NOT use the old value.
+                # EXCEPTION: Reference types always USE the reference binding, even for primitives.
                 if left_node.type in variable_type:
                     # Get the variable's type
                     var_type = get_variable_type(parser, left_node)
 
-                    # Only track USE for class/struct types
-                    # For primitive types, assignment is just a copy (no use of old value)
-                    if is_class_or_struct_type(parser, var_type):
+                    # Track USE if:
+                    # 1. It's a class/struct type (operator= is called), OR
+                    # 2. It's a reference variable (uses the reference binding established by parameter/declaration)
+                    if is_class_or_struct_type(parser, var_type) or is_reference_variable(parser, left_node):
                         # Class/struct assignment calls operator=, so it uses the old value
+                        # Reference assignment uses the reference binding from parameter/declaration
                         add_entry(parser, rda_table, parent_id, used=left_node)
-                    # For primitive types: no USE, only DEF (handled below)
+                    # For primitive non-reference types: no USE, only DEF (handled below)
 
             # Left side is defined
             add_entry(parser, rda_table, parent_id, defined=left_node)
@@ -1584,7 +1650,7 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                                 param_id = extract_param_identifier(param)
                                 if param_id:
                                     add_entry(parser, rda_table, parent_id,
-                                            defined=param_id, declaration=True)
+                                            defined=param_id, declaration=True, has_initializer=True)
 
         # 7. Handle control flow conditions
         elif root_node.type == "if_statement":
