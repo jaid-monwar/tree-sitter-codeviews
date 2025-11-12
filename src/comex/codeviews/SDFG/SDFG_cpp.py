@@ -882,7 +882,7 @@ def collect_function_metadata(parser):
 
     Returns:
         Dict mapping function_name -> {
-            "params": [(param_name, is_pointer_or_ref, param_index), ...],
+            "params": [(param_name, is_pointer, is_reference, param_index), ...],
             "node": function_definition AST node
         }
     """
@@ -926,12 +926,16 @@ def collect_function_metadata(parser):
                         for param in param_list.named_children:
                             if param.type == "parameter_declaration":
                                 param_name = None
-                                is_pointer_or_ref = False
+                                is_pointer = False
+                                is_reference = False
 
                                 # Check if parameter is a pointer or reference
                                 for p_child in param.named_children:
                                     if p_child.type in ["pointer_declarator", "reference_declarator"]:
-                                        is_pointer_or_ref = True
+                                        if p_child.type == "pointer_declarator":
+                                            is_pointer = True
+                                        else:
+                                            is_reference = True
                                         # Extract parameter name from pointer/reference_declarator
                                         inner = p_child
                                         while inner:
@@ -951,7 +955,7 @@ def collect_function_metadata(parser):
                                             param_name = st(p_child)
 
                                 if param_name:
-                                    params.append((param_name, is_pointer_or_ref, param_idx))
+                                    params.append((param_name, is_pointer, is_reference, param_idx))
                                     param_idx += 1
                     break
 
@@ -990,8 +994,8 @@ def analyze_pointer_modifications(parser, function_metadata):
 
         # Build map of parameter names to indices (only for pointer/ref params)
         param_name_to_idx = {}
-        for param_name, is_pointer_or_ref, param_idx in meta["params"]:
-            if is_pointer_or_ref:
+        for param_name, is_pointer, is_reference, param_idx in meta["params"]:
+            if is_pointer or is_reference:
                 param_name_to_idx[param_name] = param_idx
 
         if not param_name_to_idx:
@@ -2356,6 +2360,315 @@ def rda_cfg_map(rda_solution, CFG_results):
     return graph
 
 
+def collect_call_site_information(parser, function_metadata, cfg_graph):
+    """
+    Collect information about function call sites for interprocedural analysis.
+
+    For each call site, track:
+    - Which function is called
+    - Which arguments are passed by reference (&var)
+    - The mapping of actual arguments to formal parameters
+
+    Returns:
+        List of dicts with call site information:
+        {
+            "call_site_node": AST node,
+            "call_site_id": CFG node ID,
+            "function_name": str,
+            "pass_by_ref_args": [(arg_idx, var_name, var_node), ...]
+        }
+    """
+    call_sites = []
+    index = parser.index
+
+    # Find all function call expressions
+    for node in traverse_tree(parser.tree.root_node):
+        if node.type == "call_expression":
+            # Get function name
+            function_name = None
+            func_node = node.child_by_field_name("function")
+            if func_node:
+                if func_node.type == "identifier":
+                    function_name = st(func_node)
+                elif func_node.type == "qualified_identifier":
+                    # Handle qualified names like std::function
+                    function_name = st(func_node)
+                elif func_node.type == "field_expression":
+                    # Method call - skip for now, focus on functions
+                    continue
+
+            if not function_name or function_name not in function_metadata:
+                continue  # Not a user-defined function we have metadata for
+
+            # Get call site CFG node ID
+            parent_statement = return_first_parent_of_types(
+                node, statement_types["node_list_type"]
+            )
+            if not parent_statement:
+                continue
+
+            call_site_id = get_index(parent_statement, index)
+            if call_site_id is None or call_site_id not in cfg_graph.nodes:
+                continue
+
+            # Extract pass-by-reference arguments
+            pass_by_ref_args = []
+            args_node = node.child_by_field_name("arguments")
+            if args_node:
+                # Check if this function has pointer parameters
+                func_params = function_metadata[function_name]["params"]
+
+                for arg_idx, arg in enumerate(args_node.named_children):
+                    # Check if the corresponding parameter is a pointer or reference
+                    if arg_idx < len(func_params):
+                        param_name, is_pointer, is_reference, param_idx = func_params[arg_idx]
+
+                        if is_pointer or is_reference:
+                            # Check if this is &var (address-of expression)
+                            if arg.type == "pointer_expression":
+                                # Check if it's actually & operator (not dereference *)
+                                has_ampersand = False
+                                arg_node = None
+                                for arg_child in arg.children:
+                                    if arg_child.type == "&":
+                                        has_ampersand = True
+                                    elif arg_child.is_named:
+                                        arg_node = arg_child
+
+                                if has_ampersand and arg_node:
+                                    if arg_node.type in ["identifier", "this"]:
+                                        var_name = st(arg_node)
+                                        pass_by_ref_args.append((arg_idx, var_name, arg_node))
+                            # C++ references can be passed directly without &
+                            elif is_reference and arg.type in ["identifier", "this"]:
+                                var_name = st(arg)
+                                arg_index = get_index(arg, index)
+                                if arg_index and arg_index in parser.symbol_table["scope_map"]:
+                                    pass_by_ref_args.append((arg_idx, var_name, arg))
+                            # Arrays decay to pointers - handle direct array passing
+                            elif is_pointer and arg.type in ["identifier", "this"]:
+                                var_name = st(arg)
+                                # Check if this is an array variable in the symbol table
+                                arg_index = get_index(arg, index)
+                                if arg_index and arg_index in parser.symbol_table["scope_map"]:
+                                    pass_by_ref_args.append((arg_idx, var_name, arg))
+
+            if pass_by_ref_args:
+                call_sites.append({
+                    "call_site_node": node,
+                    "call_site_id": call_site_id,
+                    "function_name": function_name,
+                    "pass_by_ref_args": pass_by_ref_args
+                })
+
+    return call_sites
+
+
+def find_modification_sites(parser, function_metadata, pointer_modifications):
+    """
+    Find all modification sites for pointer/reference parameters inside functions.
+
+    For each function, find all statements where a pointer/reference parameter is modified.
+
+    Returns:
+        Dict mapping function_name -> list of (param_idx, modification_node, statement_id)
+    """
+    modification_sites = {}
+    index = parser.index
+
+    for func_name, meta in function_metadata.items():
+        modifications = []
+        func_node = meta["node"]
+        modified_params = pointer_modifications.get(func_name, set())
+
+        # Build map of parameter names to indices (only for modified pointer/reference params)
+        param_name_to_idx = {}
+        for param_name, is_pointer, is_reference, param_idx in meta["params"]:
+            if (is_pointer or is_reference) and param_idx in modified_params:
+                param_name_to_idx[param_name] = param_idx
+
+        if not param_name_to_idx:
+            modification_sites[func_name] = modifications
+            continue
+
+        # Find all modification sites in function body
+        for node in traverse_tree(func_node):
+            modification_param_idx = None
+            mod_node = None
+
+            # Check for assignment expressions
+            if node.type == "assignment_expression":
+                left = node.child_by_field_name("left")
+                if left:
+                    # Check for *param = ... (pointer dereference)
+                    if left.type == "pointer_expression":
+                        arg = left.child_by_field_name("argument")
+                        if arg and arg.type in ["identifier", "this"]:
+                            var_name = st(arg)
+                            if var_name in param_name_to_idx:
+                                modification_param_idx = param_name_to_idx[var_name]
+                                mod_node = node
+
+                    # Check for param[i] = ... or param = ... (subscript or direct)
+                    elif left.type == "subscript_expression":
+                        array_arg = left.child_by_field_name("argument")
+                        if array_arg and array_arg.type in ["identifier", "this"]:
+                            var_name = st(array_arg)
+                            if var_name in param_name_to_idx:
+                                modification_param_idx = param_name_to_idx[var_name]
+                                mod_node = node
+
+                    # Check for direct assignment to reference parameter
+                    elif left.type in ["identifier", "this"]:
+                        var_name = st(left)
+                        if var_name in param_name_to_idx:
+                            modification_param_idx = param_name_to_idx[var_name]
+                            mod_node = node
+
+            # Check for update expressions (++, --)
+            elif node.type == "update_expression":
+                arg = node.child_by_field_name("argument")
+                if arg:
+                    # Handle parenthesized expressions like (*n)++
+                    if arg.type == "parenthesized_expression":
+                        # Get the inner expression
+                        inner_children = [c for c in arg.named_children if c.is_named]
+                        if inner_children:
+                            arg = inner_children[0]
+
+                    # Check for (*param)++ or ++(*param)
+                    if arg.type == "pointer_expression":
+                        inner_arg = arg.child_by_field_name("argument")
+                        if inner_arg and inner_arg.type in ["identifier", "this"]:
+                            var_name = st(inner_arg)
+                            if var_name in param_name_to_idx:
+                                modification_param_idx = param_name_to_idx[var_name]
+                                mod_node = node
+                    # Check for param++ or param[i]++
+                    elif arg.type == "subscript_expression":
+                        array_arg = arg.child_by_field_name("argument")
+                        if array_arg and array_arg.type in ["identifier", "this"]:
+                            var_name = st(array_arg)
+                            if var_name in param_name_to_idx:
+                                modification_param_idx = param_name_to_idx[var_name]
+                                mod_node = node
+                    elif arg.type in ["identifier", "this"]:
+                        var_name = st(arg)
+                        if var_name in param_name_to_idx:
+                            modification_param_idx = param_name_to_idx[var_name]
+                            mod_node = node
+
+            if modification_param_idx is not None and mod_node is not None:
+                # Get the statement CFG node ID
+                parent_statement = return_first_parent_of_types(
+                    mod_node, statement_types["node_list_type"]
+                )
+                if parent_statement:
+                    statement_id = get_index(parent_statement, index)
+                    if statement_id is not None:
+                        modifications.append((modification_param_idx, mod_node, statement_id))
+
+        modification_sites[func_name] = modifications
+
+    return modification_sites
+
+
+def add_interprocedural_edges(final_graph, parser, call_sites, modification_sites,
+                               function_metadata, cfg_graph, rda_table):
+    """
+    Add interprocedural DFG edges for pass-by-reference.
+
+    For each call site where &var or reference is passed to a pointer/reference parameter:
+    1. Add edge from call site to function definition (argument-parameter binding)
+    2. Add edges from modification sites inside function to uses after the call
+
+    Args:
+        final_graph: The DFG graph to add edges to
+        parser: C++ parser
+        call_sites: List of call site information from collect_call_site_information()
+        modification_sites: Dict from find_modification_sites()
+        function_metadata: Dict from collect_function_metadata()
+        cfg_graph: Control flow graph
+        rda_table: RDA table with def/use information
+    """
+    index = parser.index
+
+    for call_site_info in call_sites:
+        call_site_id = call_site_info["call_site_id"]
+        function_name = call_site_info["function_name"]
+        pass_by_ref_args = call_site_info["pass_by_ref_args"]
+
+        if function_name not in function_metadata or function_name not in modification_sites:
+            continue
+
+        func_meta = function_metadata[function_name]
+        func_node = func_meta["node"]
+        func_def_id = get_index(func_node, index)
+
+        if func_def_id is None:
+            continue
+
+        # For each pass-by-reference argument
+        for arg_idx, var_name, var_node in pass_by_ref_args:
+            # 1. Add edge from call site to function definition (argument-parameter binding)
+            add_edge(final_graph, call_site_id, func_def_id,
+                   {'dataflow_type': 'comesFrom',
+                    'edge_type': 'DFG_edge',
+                    'color': '#00A3FF',
+                    'used_def': var_name,
+                    'interprocedural': 'call_to_function'})
+
+            # 2. Find modification sites for this parameter
+            mods = modification_sites.get(function_name, [])
+            for mod_param_idx, mod_node, mod_statement_id in mods:
+                if mod_param_idx == arg_idx:
+                    # Find all uses of var_name after the call site
+                    # We need to find successor nodes in CFG that use var_name
+                    successors = []
+                    visited = set()
+                    queue = [call_site_id]
+
+                    while queue:
+                        current = queue.pop(0)
+                        if current in visited:
+                            continue
+                        visited.add(current)
+
+                        # Check if this node uses var_name
+                        uses_var = False
+                        defines_var = False
+                        if current != call_site_id and current in rda_table:
+                            for used in rda_table[current]["use"]:
+                                if used.name == var_name:
+                                    uses_var = True
+                                    successors.append(current)
+                                    break  # Found a use at this node
+
+                            # Check if this node also defines var_name
+                            for defined in rda_table[current]["def"]:
+                                if defined.name == var_name:
+                                    defines_var = True
+                                    break
+
+                        # Continue exploring if:
+                        # 1. We're at the call site
+                        # 2. We haven't found a use yet at this node
+                        # 3. We found a use but it's also defined (pass-through like another function call)
+                        if current == call_site_id or not uses_var or (uses_var and defines_var):
+                            for edge in cfg_graph.out_edges(current):
+                                if edge[1] not in visited:
+                                    queue.append(edge[1])
+
+                    # Add edges from modification site to uses after call
+                    for use_site in successors:
+                        add_edge(final_graph, mod_statement_id, use_site,
+                               {'dataflow_type': 'comesFrom',
+                                'edge_type': 'DFG_edge',
+                                'color': '#00A3FF',
+                                'used_def': var_name,
+                                'interprocedural': 'modification_to_use'})
+
+
 def dfg_cpp(properties, CFG_results):
     """
     Main driver for generating DFG for C++ programs.
@@ -2473,6 +2786,12 @@ def dfg_cpp(properties, CFG_results):
         index, cfg_graph, rda_solution, rda_table,
         cfg_graph.nodes, processed_edges, properties, lambda_map, node_list, parser
     )
+
+    # Phase 6: Add interprocedural edges for pass-by-reference
+    call_sites = collect_call_site_information(parser, function_metadata, cfg_graph)
+    modification_sites = find_modification_sites(parser, function_metadata, pointer_modifications)
+    add_interprocedural_edges(final_graph, parser, call_sites, modification_sites,
+                               function_metadata, cfg_graph, rda_table)
 
     if debug:
         logger.info("RDA init: {:.3f}s, RDA: {:.3f}s",
