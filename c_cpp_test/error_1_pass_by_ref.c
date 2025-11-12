@@ -6,5 +6,5 @@ int fn(int* c) {
 int main() {
     int k = 0;
     fn(&k);
-    printf("%d\n", k);
+    printf("%d\n", k);      // 100 will be printed
 }

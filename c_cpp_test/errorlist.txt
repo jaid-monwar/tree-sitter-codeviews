@@ -1,2 +1,4 @@
 1.  pass by reference hasn't been fixed. there should be an edge from 8 to 1.
     k is passed by reference into fn, it is being changed inside.
+
+2. can't detect reference passing. also, it thinks that the reference parameter a and a = 100 are different.
