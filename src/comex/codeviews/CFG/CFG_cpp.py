@@ -1711,6 +1711,7 @@ class CFGGraph_cpp(CFGGraph):
                             has_initializer = False
                             is_move = False
                             is_copy = False
+                            is_function_return_init = False  # New flag for function return initialization
 
                             for subchild in child.children:
                                 if subchild.type == "argument_list":
@@ -1733,6 +1734,13 @@ class CFGGraph_cpp(CFGGraph):
                                                 moved_arg = args.named_children[0]
                                                 # Create signature with the moved object's type
                                                 signature = (f"{class_name}&&",)  # Rvalue reference
+                                            break
+                                        else:
+                                            # Regular function call returning an object: Book myBook = createBook(...);
+                                            # This is copy/move initialization from function return (or copy elision)
+                                            # Skip constructor call tracking - the object is constructed at the return site
+                                            # The actual construction happens in the called function's return statement
+                                            is_function_return_init = True
                                             break
                                 elif has_initializer and subchild.type == "identifier":
                                     # Copy constructor: ResourceHolder obj3 = obj2;
@@ -1760,6 +1768,31 @@ class CFGGraph_cpp(CFGGraph):
                                 if key not in self.records["constructor_calls"]:
                                     self.records["constructor_calls"][key] = []
                                 self.records["constructor_calls"][key].append((call_index, parent_index))
+                            elif is_function_return_init:
+                                # Function return initialization (copy elision/move): Book myBook = createBook(...);
+                                # Skip constructor call registration - construction happens at return site
+                                # But we need to register the underlying function call for CFG/DFG edges
+                                # Find the call_expression in the init_declarator
+                                call_expr = None
+                                for subchild in child.children:
+                                    if subchild.type == "call_expression":
+                                        call_expr = subchild
+                                        break
+
+                                if call_expr:
+                                    # Extract function name from call_expression
+                                    func_node = call_expr.child_by_field_name("function")
+                                    if func_node and func_node.type == "identifier":
+                                        func_name = func_node.text.decode('utf-8')
+                                        # Get signature for function matching
+                                        args_node = call_expr.child_by_field_name("arguments")
+                                        signature = self.get_call_signature(args_node)
+                                        # Register as regular function call
+                                        key = (func_name, signature)
+                                        func_call_index = self.get_index(call_expr)
+                                        if key not in self.records["function_calls"]:
+                                            self.records["function_calls"][key] = []
+                                        self.records["function_calls"][key].append((func_call_index, parent_index))
                             else:
                                 # Default constructor: ResourceHolder obj1;
                                 signature = tuple()  # Empty signature for default constructor
@@ -2305,6 +2338,12 @@ class CFGGraph_cpp(CFGGraph):
                 func_type_no_const = func_type_clean.replace('const', '').strip()
                 if call_type_no_const == func_type_no_const:
                     continue
+
+            # String literal to std::string conversion
+            # const char* can implicitly convert to std::string
+            if ('char*' in call_type_clean or 'char *' in call_type_clean) and 'string' in func_type_clean:
+                # Handle std::string, string, basic_string, etc.
+                continue
 
             # No match found
             return False

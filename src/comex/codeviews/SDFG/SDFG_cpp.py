@@ -997,6 +997,16 @@ def is_return_value_used(call_expr_statement):
         True if return value is used (assigned, passed as argument, returned, in conditional)
         False if return value is discarded (standalone statement like fn();)
     """
+    # If this is a declaration statement with initialization, return value is used
+    # Example: Book myBook = createBook(...);
+    if call_expr_statement.type == "declaration":
+        # Check if it has an init_declarator with an initializer
+        for child in call_expr_statement.children:
+            if child.type == "init_declarator":
+                # Has initializer, so return value is used
+                return True
+        return False  # Declaration without initialization
+
     # If this is an expression_statement with a single call_expression child,
     # the return value is discarded
     if call_expr_statement.type == "expression_statement":
@@ -2994,6 +3004,348 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
                                 'interprocedural': 'modification_to_use'})
 
 
+def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
+    """
+    Add interprocedural DFG edges for argument-to-parameter data flow.
+
+    For each function call:
+    1. Extract arguments from call site
+    2. Extract parameters from function definition
+    3. Create edges from arguments to parameters
+
+    Args:
+        final_graph: The DFG graph to add edges to
+        parser: C++ parser
+        cfg_graph: Control flow graph with function_call edges
+        rda_table: RDA table with def/use information
+    """
+    index = parser.index
+    node_list = {(node.start_point, node.end_point, node.type): node
+                 for node in traverse_tree(parser.tree, [])}
+
+    # Process all function_call edges in CFG
+    for edge in list(cfg_graph.edges()):
+        edge_data = cfg_graph.get_edge_data(*edge)
+        if edge_data and len(edge_data) > 0:
+            edge_data = edge_data[0]
+            label = edge_data.get("label", "")
+
+            # Check if this is a function call edge
+            if label.startswith("function_call|"):
+                call_site_id = edge[0]     # Call site
+                func_def_id = edge[1]      # Function definition
+
+                # Get AST nodes
+                call_site_node = node_list.get(read_index(index, call_site_id))
+                func_def_node = node_list.get(read_index(index, func_def_id))
+
+                if not (call_site_node and func_def_node):
+                    continue
+
+                # Verify function definition
+                if func_def_node.type != "function_definition":
+                    continue
+
+                # Find the call_expression within the call site statement
+                call_expr = None
+                for child in traverse_tree(call_site_node, []):
+                    if child.type == "call_expression":
+                        call_expr = child
+                        break
+
+                if not call_expr:
+                    continue
+
+                # Extract arguments from call expression
+                args_node = call_expr.child_by_field_name("arguments")
+                if not args_node or not args_node.named_children:
+                    continue  # No arguments
+
+                arguments = args_node.named_children
+
+                # Extract parameters from function definition
+                declarator = func_def_node.child_by_field_name("declarator")
+                if not declarator:
+                    continue
+
+                # Navigate through pointer/reference declarators if needed
+                func_declarator = declarator
+                while func_declarator and func_declarator.type in ["pointer_declarator", "reference_declarator"]:
+                    for child in func_declarator.children:
+                        if child.type == "function_declarator":
+                            func_declarator = child
+                            break
+                    else:
+                        break
+
+                if not func_declarator or func_declarator.type != "function_declarator":
+                    continue
+
+                params_node = func_declarator.child_by_field_name("parameters")
+                if not params_node or not params_node.named_children:
+                    continue  # No parameters
+
+                parameters = [p for p in params_node.named_children if p.type == "parameter_declaration"]
+
+                # Match arguments to parameters (positional)
+                for idx, (arg, param) in enumerate(zip(arguments, parameters)):
+                    # Extract parameter name
+                    param_declarator = param.child_by_field_name("declarator")
+                    if not param_declarator:
+                        continue
+
+                    # Navigate through complex declarators
+                    param_id = param_declarator
+                    while param_id and param_id.type not in ["identifier"]:
+                        if param_id.type in ["pointer_declarator", "reference_declarator"]:
+                            for child in param_id.named_children:
+                                if child.type == "identifier":
+                                    param_id = child
+                                    break
+                                elif child.type in ["pointer_declarator", "reference_declarator", "function_declarator", "array_declarator"]:
+                                    param_id = child
+                                    break
+                            else:
+                                break
+                        else:
+                            break
+
+                    if not param_id or param_id.type != "identifier":
+                        continue
+
+                    param_name = param_id.text.decode('utf-8')
+
+                    # Create edge from argument (at call site) to parameter (at function definition)
+                    # Note: We create edge from call_site to func_def, with metadata about which arg→param
+                    add_edge(final_graph, call_site_id, func_def_id,
+                           {'dataflow_type': 'comesFrom',
+                            'edge_type': 'DFG_edge',
+                            'color': '#00A3FF',
+                            'used_def': param_name,
+                            'interprocedural': 'argument_to_parameter',
+                            'argument_index': idx})
+
+
+def add_method_member_access_edges(final_graph, parser, cfg_graph, rda_table):
+    """
+    Add interprocedural DFG edges for method member access.
+
+    When an object's method is called (obj.method()), create edges showing:
+    1. The object flows to the method (as implicit 'this' parameter)
+    2. Member accesses within the method (this->field) use the object's data
+
+    Args:
+        final_graph: The DFG graph to add edges to
+        parser: C++ parser
+        cfg_graph: Control flow graph with method_call edges
+        rda_table: RDA table with def/use information
+    """
+    index = parser.index
+    node_list = {(node.start_point, node.end_point, node.type): node
+                 for node in traverse_tree(parser.tree, [])}
+
+    # Process all method_call edges in CFG
+    for edge in list(cfg_graph.edges()):
+        edge_data = cfg_graph.get_edge_data(*edge)
+        if edge_data and len(edge_data) > 0:
+            edge_data = edge_data[0]
+            label = edge_data.get("label", "")
+            object_name = edge_data.get("object_name", "")
+
+            # Check if this is a method call edge
+            if label in ["method_call", "virtual_call"]:
+                call_site_id = edge[0]     # Call site
+                method_def_id = edge[1]    # Method definition
+
+                # Get AST nodes
+                call_site_node = node_list.get(read_index(index, call_site_id))
+                method_def_node = node_list.get(read_index(index, method_def_id))
+
+                if not (call_site_node and method_def_node):
+                    continue
+
+                # Verify method definition
+                if method_def_node.type != "function_definition":
+                    continue
+
+                # Find field_expression nodes (member accesses) within the method body
+                method_body = method_def_node.child_by_field_name("body")
+                if not method_body:
+                    continue
+
+                # Collect all field accesses in the method body
+                field_accesses = []
+                for node in traverse_tree(method_body, []):
+                    if node.type == "field_expression":
+                        # Check if this is accessing a member (not calling a method on another object)
+                        # We want field accesses like: title, author, pages (implicit this->field)
+                        # or explicit: this->title
+                        argument = node.child_by_field_name("argument")
+                        field = node.child_by_field_name("field")
+
+                        if argument and field:
+                            arg_text = argument.text.decode('utf-8')
+                            # Check if accessing via 'this' pointer or similar
+                            if arg_text == "this" or arg_text == object_name:
+                                # Find the statement containing this field access
+                                parent_stmt = node
+                                while parent_stmt and parent_stmt.type not in statement_types["node_list_type"]:
+                                    parent_stmt = parent_stmt.parent
+
+                                if parent_stmt:
+                                    stmt_id = get_index(parent_stmt, index)
+                                    if stmt_id and stmt_id in cfg_graph.nodes:
+                                        field_name = field.text.decode('utf-8')
+                                        field_accesses.append((stmt_id, field_name))
+
+                # Also check for implicit member accesses (accessing members without 'this->')
+                # In C++, members can be accessed directly within methods: cout << title;
+                # Find the class/struct definition to get member names
+                class_members = set()
+                # Navigate up from method to find the class/struct
+                parent = method_def_node.parent
+                while parent:
+                    if parent.type in ["class_specifier", "struct_specifier"]:
+                        # Found the class/struct - extract member names
+                        for node in traverse_tree(parent, []):
+                            if node.type == "field_declaration":
+                                declarator = node.child_by_field_name("declarator")
+                                if declarator:
+                                    if declarator.type == "identifier":
+                                        class_members.add(declarator.text.decode('utf-8'))
+                                    elif declarator.type == "field_identifier":
+                                        class_members.add(declarator.text.decode('utf-8'))
+                                    # Also check init_declarator
+                                    for child in declarator.children:
+                                        if child.type == "identifier":
+                                            class_members.add(child.text.decode('utf-8'))
+                        break
+                    parent = parent.parent
+
+                # Now check for implicit member accesses in USE entries within method
+                for node_id in cfg_graph.nodes:
+                    # Check if this node is within the method body
+                    node_key = read_index(index, node_id) if node_id in index.values() else None
+                    if not node_key:
+                        continue
+                    ast_node = node_list.get(node_key)
+                    if not ast_node:
+                        continue
+
+                    # Check if this node is inside the method body
+                    is_in_method = False
+                    temp = ast_node
+                    while temp:
+                        if temp == method_body:
+                            is_in_method = True
+                            break
+                        temp = temp.parent
+
+                    if not is_in_method:
+                        continue
+
+                    # Check USE entries for this node
+                    if node_id in rda_table:
+                        for used in rda_table[node_id].get("use", []):
+                            if isinstance(used, Identifier):
+                                # Check if this identifier matches a class member
+                                if used.core in class_members:
+                                    field_accesses.append((node_id, used.core))
+
+                # Create edges from call site object to member accesses within method
+                for stmt_id, field_name in field_accesses:
+                    # Add edge showing object's member is used by this statement in the method
+                    add_edge(final_graph, call_site_id, stmt_id,
+                           {'dataflow_type': 'comesFrom',
+                            'edge_type': 'DFG_edge',
+                            'color': '#00A3FF',
+                            'used_def': f"{object_name}.{field_name}",
+                            'interprocedural': 'method_member_access',
+                            'object': object_name,
+                            'member': field_name})
+
+
+def add_function_return_edges(final_graph, parser, cfg_graph, rda_table):
+    """
+    Add interprocedural DFG edges for function return values.
+
+    For each function call where the return value is used:
+    1. Find the return statement(s) in the called function
+    2. Extract the returned expression/variable
+    3. Find the variable being initialized at the call site
+    4. Create edge from returned expression to initialized variable
+
+    Args:
+        final_graph: The DFG graph to add edges to
+        parser: C++ parser
+        cfg_graph: Control flow graph with function_return/method_return edges
+        rda_table: RDA table with def/use information
+    """
+    index = parser.index
+    node_list = {(node.start_point, node.end_point, node.type): node
+                 for node in traverse_tree(parser.tree, [])}
+
+    # Process all function_return and method_return edges in CFG
+    for edge in list(cfg_graph.edges()):
+        edge_data = cfg_graph.get_edge_data(*edge)
+        if edge_data and len(edge_data) > 0:
+            edge_data = edge_data[0]
+            label = edge_data.get("label", "")
+
+            # Check if this is a function/method return edge
+            if label in ["function_return", "method_return"]:
+                return_node_id = edge[0]  # Return statement
+                call_site_id = edge[1]     # Call site
+
+                # Get AST nodes
+                return_statement = node_list.get(read_index(index, return_node_id))
+                call_site_node = node_list.get(read_index(index, call_site_id))
+
+                if not (return_statement and call_site_node):
+                    continue
+
+                # Verify return statement has a value
+                if return_statement.type != "return_statement" or not return_statement.named_children:
+                    continue
+
+                # Check if return value is actually used at call site
+                if not is_return_value_used(call_site_node):
+                    continue
+
+                # Extract returned expression/variable from return statement
+                # The return statement should have USE entries in rda_table
+                returned_vars = []
+                if return_node_id in rda_table:
+                    for used in rda_table[return_node_id].get("use", []):
+                        if isinstance(used, Identifier):
+                            returned_vars.append(used.name)
+
+                if not returned_vars:
+                    continue
+
+                # Extract the variable being initialized/assigned at call site
+                # Look for DEF entries at the call site
+                initialized_vars = []
+                if call_site_id in rda_table:
+                    for defined in rda_table[call_site_id].get("def", []):
+                        if isinstance(defined, Identifier):
+                            initialized_vars.append(defined.name)
+
+                # Create edges from returned variable to initialized variable
+                # For now, create edges for all combinations (could be refined)
+                for ret_var in returned_vars:
+                    for init_var in initialized_vars:
+                        # Add edge from return statement to call site
+                        # showing data flow from returned value to initialized variable
+                        add_edge(final_graph, return_node_id, call_site_id,
+                               {'dataflow_type': 'comesFrom',
+                                'edge_type': 'DFG_edge',
+                                'color': '#00A3FF',
+                                'used_def': init_var,
+                                'interprocedural': 'return_to_caller',
+                                'returned_value': ret_var})
+
+
 def dfg_cpp(properties, CFG_results):
     """
     Main driver for generating DFG for C++ programs.
@@ -3117,6 +3469,15 @@ def dfg_cpp(properties, CFG_results):
     modification_sites = find_modification_sites(parser, function_metadata, pointer_modifications)
     add_interprocedural_edges(final_graph, parser, call_sites, modification_sites,
                                function_metadata, cfg_graph, rda_table)
+
+    # Phase 7: Add interprocedural edges for argument-to-parameter flow
+    add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table)
+
+    # Phase 8: Add interprocedural edges for function return values
+    add_function_return_edges(final_graph, parser, cfg_graph, rda_table)
+
+    # Phase 9: Add interprocedural edges for method member access
+    add_method_member_access_edges(final_graph, parser, cfg_graph, rda_table)
 
     if debug:
         logger.info("RDA init: {:.3f}s, RDA: {:.3f}s",
