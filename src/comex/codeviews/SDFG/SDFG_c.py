@@ -1010,18 +1010,22 @@ def build_rda_table(parser, CFG_results, function_metadata=None, pointer_modific
 
                         # If argument is passed by reference (&var) and the function modifies it
                         if is_modified_param and arg.type == "pointer_expression":
-                            # This is &var - it's DEFINED (modified) through the pointer
-                            # Note: We don't add USE here to avoid self-loop. The address-of
-                            # operator reads the variable's address, not its value, so it's
-                            # not a "use" in the data flow sense.
+                            # This is &var - taking the address is a USE, and the function modifies it (DEF)
+                            # Both USE and DEF are needed: USE creates edge from definition to call site,
+                            # DEF creates edge from call site to subsequent uses
                             inner_arg = arg.child_by_field_name("argument")
                             if inner_arg:
                                 if inner_arg.type in variable_type:
+                                    # USE: Taking address of variable (reads the variable)
+                                    add_entry(parser, rda_table, parent_id, used=inner_arg)
                                     # DEF: Variable is modified through pointer
                                     add_entry(parser, rda_table, parent_id,
                                              defined=inner_arg, declaration=False)
                                 elif inner_arg.type in ["field_expression", "subscript_expression"]:
                                     # Handle &s.field or &arr[i]
+                                    # USE: Taking address requires reading the base variable
+                                    add_entry(parser, rda_table, parent_id, used=inner_arg)
+                                    # DEF: The field/element is modified
                                     add_entry(parser, rda_table, parent_id,
                                              defined=inner_arg, declaration=False)
                                     # Also USE the base variable for indexing
@@ -1587,7 +1591,9 @@ def dfg_c(properties, CFG_results):
 
     # Phase 3: Run RDA
     start_rda_time = time.time()
-    rda_solution = start_rda(index, rda_table, cfg_graph)
+    # Use pre_solve=True to remove function_call/function_return edges from CFG
+    # This prevents definitions from flowing backwards through function calls (avoiding self-loops)
+    rda_solution = start_rda(index, rda_table, cfg_graph, pre_solve=True)
     end_rda_time = time.time()
 
     # Phase 4: Generate DFG edges

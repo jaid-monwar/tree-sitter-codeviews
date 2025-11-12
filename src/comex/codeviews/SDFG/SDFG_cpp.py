@@ -821,7 +821,257 @@ def discover_lambdas(parser, CFG_results):
     return lambda_map
 
 
-def build_rda_table(parser, CFG_results, lambda_map=None):
+def is_return_value_used(call_expr_statement):
+    """
+    Check if a function call's return value is actually used.
+
+    Args:
+        call_expr_statement: The expression_statement or parent node containing the call
+
+    Returns:
+        True if return value is used (assigned, passed as argument, returned, in conditional)
+        False if return value is discarded (standalone statement like fn();)
+    """
+    # If this is an expression_statement with a single call_expression child,
+    # the return value is discarded
+    if call_expr_statement.type == "expression_statement":
+        if len(call_expr_statement.named_children) == 1:
+            child = call_expr_statement.named_children[0]
+            if child.type == "call_expression":
+                return False  # Discarded: fn();
+
+    # Check parent context
+    parent = call_expr_statement.parent
+    while parent:
+        parent_type = parent.type
+
+        # If parent is assignment or declaration, return value is used
+        if parent_type in ["init_declarator", "assignment_expression"]:
+            return True
+
+        # If parent is return statement, return value is used
+        if parent_type == "return_statement":
+            return True
+
+        # If parent is argument_list, return value is used as argument
+        if parent_type == "argument_list":
+            return True
+
+        # If parent is conditional, return value is used
+        if parent_type in ["if_statement", "while_statement", "for_statement",
+                          "do_statement", "switch_statement"]:
+            return True
+
+        # If we hit expression_statement at top level, it's discarded
+        if parent_type == "expression_statement":
+            return False
+
+        parent = parent.parent
+
+    return False  # Default: assume not used
+
+
+def collect_function_metadata(parser):
+    """
+    Collect metadata about all functions in the program.
+
+    For each function, track:
+    - Function name
+    - Parameter names and whether they're pointers/references
+    - Parameter indices
+
+    Returns:
+        Dict mapping function_name -> {
+            "params": [(param_name, is_pointer_or_ref, param_index), ...],
+            "node": function_definition AST node
+        }
+    """
+    metadata = {}
+
+    # Find all function definitions
+    for node in traverse_tree(parser.tree.root_node):
+        if node.type == "function_definition":
+            # Extract function name and parameters
+            func_name = None
+            params = []
+
+            for child in node.named_children:
+                if child.type == "function_declarator":
+                    # Get function name
+                    declarator = child.child_by_field_name("declarator")
+                    if declarator:
+                        if declarator.type == "identifier":
+                            func_name = st(declarator)
+                        elif declarator.type in ["pointer_declarator", "reference_declarator"]:
+                            # Handle function that returns pointer/reference
+                            inner = declarator
+                            while inner and inner.type in ["pointer_declarator", "reference_declarator"]:
+                                inner_declarator = inner.child_by_field_name("declarator")
+                                if inner_declarator:
+                                    inner = inner_declarator
+                                else:
+                                    break
+                            if inner and inner.type == "identifier":
+                                func_name = st(inner)
+                        elif declarator.type == "qualified_identifier":
+                            # Handle qualified names like Class::method
+                            name_node = declarator.child_by_field_name("name")
+                            if name_node:
+                                func_name = st(name_node)
+
+                    # Get parameters
+                    param_list = child.child_by_field_name('parameters')
+                    if param_list:
+                        param_idx = 0
+                        for param in param_list.named_children:
+                            if param.type == "parameter_declaration":
+                                param_name = None
+                                is_pointer_or_ref = False
+
+                                # Check if parameter is a pointer or reference
+                                for p_child in param.named_children:
+                                    if p_child.type in ["pointer_declarator", "reference_declarator"]:
+                                        is_pointer_or_ref = True
+                                        # Extract parameter name from pointer/reference_declarator
+                                        inner = p_child
+                                        while inner:
+                                            if inner.type == "identifier":
+                                                param_name = st(inner)
+                                                break
+                                            elif inner.type in ["pointer_declarator", "reference_declarator"]:
+                                                inner_decl = inner.child_by_field_name("declarator")
+                                                if inner_decl:
+                                                    inner = inner_decl
+                                                else:
+                                                    break
+                                            else:
+                                                break
+                                    elif p_child.type == "identifier":
+                                        if param_name is None:  # Only if not already found
+                                            param_name = st(p_child)
+
+                                if param_name:
+                                    params.append((param_name, is_pointer_or_ref, param_idx))
+                                    param_idx += 1
+                    break
+
+            if func_name:
+                metadata[func_name] = {
+                    "params": params,
+                    "node": node
+                }
+
+    return metadata
+
+
+def analyze_pointer_modifications(parser, function_metadata):
+    """
+    Analyze which pointer/reference parameters are modified within each function.
+
+    A pointer/reference parameter is considered "modified" if:
+    - It's dereferenced on the left side of an assignment: *param = ...
+    - Used in pointer arithmetic with assignment: param[i] = ...
+    - Passed to another function that modifies it (transitive)
+    - Used in field assignment: param->field = ...
+    - For references: direct assignment also counts: ref = ...
+
+    Args:
+        parser: Parser with AST
+        function_metadata: Dict from collect_function_metadata()
+
+    Returns:
+        Dict mapping function_name -> set of parameter indices that are modified
+    """
+    modifications = {}
+
+    for func_name, meta in function_metadata.items():
+        modified_params = set()
+        func_node = meta["node"]
+
+        # Build map of parameter names to indices (only for pointer/ref params)
+        param_name_to_idx = {}
+        for param_name, is_pointer_or_ref, param_idx in meta["params"]:
+            if is_pointer_or_ref:
+                param_name_to_idx[param_name] = param_idx
+
+        if not param_name_to_idx:
+            # No pointer/reference parameters
+            modifications[func_name] = modified_params
+            continue
+
+        # Traverse function body looking for modifications
+        for node in traverse_tree(func_node):
+            # Check for assignment expressions where LHS dereferences/uses a pointer/ref param
+            if node.type == "assignment_expression":
+                left = node.child_by_field_name("left")
+                if left:
+                    # Check for *param = ... (pointer dereference)
+                    if left.type == "pointer_expression":
+                        arg = left.child_by_field_name("argument")
+                        if arg and arg.type == "identifier":
+                            var_name = st(arg)
+                            if var_name in param_name_to_idx:
+                                modified_params.add(param_name_to_idx[var_name])
+
+                    # Check for param[i] = ... (subscript)
+                    elif left.type == "subscript_expression":
+                        array_arg = left.child_by_field_name("argument")
+                        if array_arg and array_arg.type == "identifier":
+                            var_name = st(array_arg)
+                            if var_name in param_name_to_idx:
+                                modified_params.add(param_name_to_idx[var_name])
+
+                    # Check for param->field = ... or param.field = ... (field access)
+                    elif left.type == "field_expression":
+                        obj = left.child_by_field_name("argument")
+                        if obj and obj.type == "identifier":
+                            var_name = st(obj)
+                            if var_name in param_name_to_idx:
+                                modified_params.add(param_name_to_idx[var_name])
+
+                    # For references: direct assignment counts as modification
+                    # ref = ... (identifier on left side)
+                    elif left.type == "identifier":
+                        var_name = st(left)
+                        if var_name in param_name_to_idx:
+                            # This is a reference parameter being assigned
+                            modified_params.add(param_name_to_idx[var_name])
+
+            # Check for update expressions (++, --)
+            elif node.type == "update_expression":
+                arg = node.child_by_field_name("argument")
+                if arg:
+                    # Check for (*param)++ or ++(*param)
+                    if arg.type == "pointer_expression":
+                        inner_arg = arg.child_by_field_name("argument")
+                        if inner_arg and inner_arg.type == "identifier":
+                            var_name = st(inner_arg)
+                            if var_name in param_name_to_idx:
+                                modified_params.add(param_name_to_idx[var_name])
+                    # Check for param[i]++ or param->field++ or ref++
+                    elif arg.type == "subscript_expression":
+                        array_arg = arg.child_by_field_name("argument")
+                        if array_arg and array_arg.type == "identifier":
+                            var_name = st(array_arg)
+                            if var_name in param_name_to_idx:
+                                modified_params.add(param_name_to_idx[var_name])
+                    elif arg.type == "field_expression":
+                        obj = arg.child_by_field_name("argument")
+                        if obj and obj.type == "identifier":
+                            var_name = st(obj)
+                            if var_name in param_name_to_idx:
+                                modified_params.add(param_name_to_idx[var_name])
+                    elif arg.type == "identifier":
+                        var_name = st(arg)
+                        if var_name in param_name_to_idx:
+                            modified_params.add(param_name_to_idx[var_name])
+
+        modifications[func_name] = modified_params
+
+    return modifications
+
+
+def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None, pointer_modifications=None):
     """
     Build RDA table by traversing AST and tracking DEF/USE.
 
@@ -857,13 +1107,30 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
             parent_id = get_index(root_node, index)
             if parent_id is None or parent_id not in CFG_results.graph.nodes:
                 continue
-            vars_used = recursively_get_children_of_types(
-                root_node, variable_type + ["field_expression"],
-                index=parser.index,
-                check_list=parser.symbol_table["scope_map"]
+
+            # Check if return value is a direct expression we can track
+            return_expr = root_node.named_children[0] if root_node.named_children else None
+            if return_expr and return_expr.type in variable_type + ["field_expression",
+                                                                      "pointer_expression",
+                                                                      "subscript_expression"] + literal_types:
+                add_entry(parser, rda_table, parent_id, used=return_expr)
+            else:
+                # Recursively find all variables in the return expression
+                vars_used = recursively_get_children_of_types(
+                    root_node, variable_type + ["field_expression", "pointer_expression", "subscript_expression"],
+                    index=parser.index,
+                    check_list=parser.symbol_table["scope_map"]
+                )
+                for var in vars_used:
+                    add_entry(parser, rda_table, parent_id, used=var)
+
+            # Also track literals
+            literals_used = recursively_get_children_of_types(
+                root_node, literal_types,
+                index=parser.index
             )
-            for var in vars_used:
-                add_entry(parser, rda_table, parent_id, used=var)
+            for literal in literals_used:
+                add_entry(parser, rda_table, parent_id, used=literal)
 
         # 2. Handle variable declarations (init_declarator)
         elif root_node.type in def_statement:
@@ -1173,6 +1440,79 @@ def build_rda_table(parser, CFG_results, lambda_map=None):
                             # Could be a reference parameter
                             add_entry(parser, rda_table, parent_id, defined=arg, declaration=False)
                             continue
+
+                    # Check if this is a user-defined function with pointer/reference params
+                    if not is_input_function and not is_variadic_macro:
+                        # Check if we have metadata for this function
+                        modifies_params = set()
+                        if function_name and function_metadata and function_name in function_metadata:
+                            if pointer_modifications and function_name in pointer_modifications:
+                                modifies_params = pointer_modifications[function_name]
+
+                        # Check if this argument corresponds to a modified pointer/reference parameter
+                        is_modified_param = idx in modifies_params
+
+                        # If argument is passed by address/reference and the function modifies it
+                        if is_modified_param:
+                            # Check for &var (pointer_expression in C++)
+                            if arg.type == "pointer_expression":
+                                inner_arg = arg.child_by_field_name("argument")
+                                if not inner_arg:
+                                    # Fallback: get first child that's an identifier
+                                    inner_arg = arg.named_children[0] if arg.named_children else None
+
+                                if inner_arg:
+                                    if inner_arg.type in variable_type:
+                                        # USE: Taking address of variable (reads the variable)
+                                        add_entry(parser, rda_table, parent_id, used=inner_arg)
+                                        # DEF: Variable is modified through pointer
+                                        add_entry(parser, rda_table, parent_id,
+                                                 defined=inner_arg, declaration=False)
+                                    elif inner_arg.type in ["field_expression", "subscript_expression"]:
+                                        # Handle &s.field or &arr[i]
+                                        # USE: Taking address requires reading the base variable
+                                        add_entry(parser, rda_table, parent_id, used=inner_arg)
+                                        # DEF: The field/element is modified
+                                        add_entry(parser, rda_table, parent_id,
+                                                 defined=inner_arg, declaration=False)
+                                        # Also USE the base variable for indexing
+                                        if inner_arg.type == "subscript_expression":
+                                            index_expr = inner_arg.child_by_field_name("index")
+                                            if index_expr:
+                                                vars_in_index = recursively_get_children_of_types(
+                                                    index_expr, variable_type + ["field_expression"],
+                                                    index=parser.index,
+                                                    check_list=parser.symbol_table["scope_map"]
+                                                )
+                                                for var in vars_in_index:
+                                                    add_entry(parser, rda_table, parent_id, used=var)
+                                continue
+                            # Also check for unary_expression (older tree-sitter versions or alternative syntax)
+                            elif arg.type == "unary_expression":
+                                has_address_of = any(child.type == "&" for child in arg.children)
+                                if has_address_of:
+                                    inner_arg = arg.child_by_field_name("argument")
+                                    if inner_arg:
+                                        if inner_arg.type in variable_type:
+                                            # USE: Taking address of variable
+                                            add_entry(parser, rda_table, parent_id, used=inner_arg)
+                                            # DEF: Variable is modified through pointer
+                                            add_entry(parser, rda_table, parent_id,
+                                                     defined=inner_arg, declaration=False)
+                                        elif inner_arg.type in ["field_expression", "subscript_expression"]:
+                                            # USE: Taking address requires reading the base variable
+                                            add_entry(parser, rda_table, parent_id, used=inner_arg)
+                                            # DEF: The field/element is modified
+                                            add_entry(parser, rda_table, parent_id,
+                                                     defined=inner_arg, declaration=False)
+                                    continue
+
+                            # Check if argument is passed by reference (no &, just the variable)
+                            # In C++, references can be passed directly
+                            elif arg.type in variable_type + ["field_expression"]:
+                                # This could be a reference parameter being modified
+                                add_entry(parser, rda_table, parent_id, defined=arg, declaration=False)
+                                continue
 
                     # Regular arguments are USEs
                     if arg.type in variable_type + ["field_expression"]:
@@ -2065,9 +2405,13 @@ def dfg_cpp(properties, CFG_results):
             # Handle function returns (return value → caller flow)
             elif label in ["method_return", "function_return"]:
                 return_statement = node_list.get(read_index(index, edge[0]))
+                call_site_node = node_list.get(read_index(index, edge[1]))
+
                 if return_statement and return_statement.type == "return_statement":
-                    if return_statement.named_children:
-                        processed_edges.append(edge)
+                    if return_statement.named_children:  # Function returns a value
+                        # Only add edge if return value is actually used at call site
+                        if call_site_node and is_return_value_used(call_site_node):
+                            processed_edges.append(edge)
 
             # Handle constructor calls (object declaration → constructor)
             elif label == "constructor_call":
@@ -2110,9 +2454,13 @@ def dfg_cpp(properties, CFG_results):
     lambda_map = discover_lambdas(parser, CFG_results)
     end_lambda_time = time.time()
 
+    # Phase 2.5: Collect function metadata for interprocedural analysis
+    function_metadata = collect_function_metadata(parser)
+    pointer_modifications = analyze_pointer_modifications(parser, function_metadata)
+
     # Phase 3: Build RDA table
     start_rda_init_time = time.time()
-    rda_table = build_rda_table(parser, CFG_results, lambda_map)
+    rda_table = build_rda_table(parser, CFG_results, lambda_map, function_metadata, pointer_modifications)
     end_rda_init_time = time.time()
 
     # Phase 4: Run RDA
