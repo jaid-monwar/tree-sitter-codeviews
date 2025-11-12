@@ -1,5 +1,2 @@
-1.  If something is passed as a pointer to a function, it can be changed inside the function.
-    So, there should be an arrow to the function from arr. in_arr and arr are the same array when passed as pointer.
-    Also, there is an arrow to "do" that doesn't mean anything. It should be removed.
-
-2.  There should be an arrow from 5 to 7.
+1.  pass by reference hasn't been fixed. there should be an edge from 8 to 1.
+    k is passed by reference into fn, it is being changed inside.
