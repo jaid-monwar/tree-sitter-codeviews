@@ -947,6 +947,13 @@ def collect_function_metadata(parser):
                                                 if inner_decl:
                                                     inner = inner_decl
                                                 else:
+                                                    # No field named "declarator" - check named children
+                                                    # For reference_declarator, the identifier is the named child
+                                                    if inner.named_children:
+                                                        for child in inner.named_children:
+                                                            if child.type == "identifier":
+                                                                param_name = st(child)
+                                                                break
                                                     break
                                             else:
                                                 break
@@ -1515,6 +1522,9 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                             # In C++, references can be passed directly
                             elif arg.type in variable_type + ["field_expression"]:
                                 # This could be a reference parameter being modified
+                                # Add USE first (variable is read to pass to function)
+                                add_entry(parser, rda_table, parent_id, used=arg)
+                                # Then add DEF (variable will be modified through reference)
                                 add_entry(parser, rda_table, parent_id, defined=arg, declaration=False)
                                 continue
 
@@ -2442,9 +2452,7 @@ def collect_call_site_information(parser, function_metadata, cfg_graph):
                             # C++ references can be passed directly without &
                             elif is_reference and arg.type in ["identifier", "this"]:
                                 var_name = st(arg)
-                                arg_index = get_index(arg, index)
-                                if arg_index and arg_index in parser.symbol_table["scope_map"]:
-                                    pass_by_ref_args.append((arg_idx, var_name, arg))
+                                pass_by_ref_args.append((arg_idx, var_name, arg))
                             # Arrays decay to pointers - handle direct array passing
                             elif is_pointer and arg.type in ["identifier", "this"]:
                                 var_name = st(arg)
