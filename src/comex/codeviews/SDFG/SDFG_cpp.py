@@ -2314,16 +2314,89 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                             # Check if this is a function definition node
                             node_type = read_index(index, def_node)[-1] if def_node in index.values() else None
                             if node_type == "function_definition":
-                                # Prevent self-loops: don't create edge from a node to itself
-                                if def_node != node:
-                                    # Add edge from function definition to usage
-                                    add_edge(final_graph, def_node, node,
-                                           {'dataflow_type': 'comesFrom',
-                                            'edge_type': 'DFG_edge',
-                                            'color': '#00A3FF',
-                                            'used_def': used.name})
-                                used.satisfied = True
-                                break
+                                # For a proper DFG, we need to track data flow from return statements
+                                # to the call site, not from function definition to call site
+
+                                # Find return statements that belong to this specific function
+                                # Strategy: Use namespace scope + line number proximity
+                                # A return belongs to a function if:
+                                # 1. It has the same namespace scope (first N-1 elements of function scope)
+                                # 2. Its line number is greater than the function's line number
+                                # 3. It's the closest return after the function definition
+
+                                func_scope = definition.scope
+                                func_line = definition.line
+                                # Namespace scope is all but the last element (last is function scope ID)
+                                namespace_scope = func_scope[:-1] if len(func_scope) > 1 else func_scope
+
+                                return_nodes = []
+
+                                for rnode in graph_nodes:
+                                    # Check if this is a return statement
+                                    rnode_type = read_index(index, rnode)[-1] if rnode in index.values() else None
+                                    if rnode_type == "return_statement":
+                                        # Check if return has a value (not void)
+                                        has_return_value = False
+                                        return_scope = None
+                                        return_line = None
+
+                                        # Check use entries (for the returned variable)
+                                        if rnode in rda_table and rda_table[rnode].get("use"):
+                                            for ret_use in rda_table[rnode]["use"]:
+                                                return_scope = ret_use.scope
+                                                return_line = ret_use.line
+                                                has_return_value = True
+                                                break
+
+                                        # Check if this return belongs to the same namespace and comes after the function
+                                        if has_return_value and return_scope and return_line:
+                                            # Check if namespace scope matches
+                                            namespace_matches = (len(return_scope) == len(namespace_scope) and
+                                                               all(return_scope[i] == namespace_scope[i]
+                                                                   for i in range(len(namespace_scope))))
+
+                                            # Check if return comes after function definition
+                                            # We need to check that the return is inside this specific function
+                                            # by verifying it's between this function and the next function/block
+                                            if namespace_matches and return_line > func_line:
+                                                # Additional check: find all function definitions in the same namespace
+                                                # and verify this return comes before the next function
+                                                is_in_this_function = True
+
+                                                # Find the next function definition in the same namespace after func_line
+                                                next_func_line = float('inf')
+                                                for other_node in graph_nodes:
+                                                    other_type = read_index(index, other_node)[-1] if other_node in index.values() else None
+                                                    if other_type == "function_definition" and other_node != def_node:
+                                                        if other_node in rda_table:
+                                                            for other_def in rda_table[other_node].get("def", []):
+                                                                other_scope = other_def.scope
+                                                                other_line = other_def.line
+                                                                # Check if in same namespace
+                                                                other_namespace = other_scope[:-1] if len(other_scope) > 1 else other_scope
+                                                                if (other_namespace == namespace_scope and
+                                                                    other_line > func_line and
+                                                                    other_line < next_func_line):
+                                                                    next_func_line = other_line
+
+                                                # Return belongs to this function if it's before the next function
+                                                if return_line < next_func_line:
+                                                    return_nodes.append(rnode)
+
+                                # Create edges from return statements to the call site
+                                if return_nodes:
+                                    for ret_node in return_nodes:
+                                        if ret_node != node:
+                                            # Data flows from the return statement to the variable assignment
+                                            add_edge(final_graph, ret_node, node,
+                                                   {'dataflow_type': 'comesFrom',
+                                                    'edge_type': 'DFG_edge',
+                                                    'color': '#00A3FF',
+                                                    'used_def': used.name})
+                                    used.satisfied = True
+                                    break
+                                # If no return statements found (void function or no explicit return),
+                                # don't create any edge - void functions don't flow data
 
             # Handle unsatisfied global/static variable references
             # Global and static variables are available throughout the program
