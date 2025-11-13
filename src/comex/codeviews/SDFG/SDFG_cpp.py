@@ -3178,12 +3178,23 @@ def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
 
                 # Match arguments to parameters (positional)
                 for idx, (arg, param) in enumerate(zip(arguments, parameters)):
-                    # Extract parameter name
+                    # Extract parameter name and check if it's pass-by-reference/pointer
                     param_declarator = param.child_by_field_name("declarator")
                     if not param_declarator:
                         continue
 
-                    # Navigate through complex declarators
+                    # Check if this parameter is pass-by-reference or pass-by-pointer
+                    # Only create interprocedural edges for these cases, not for pass-by-value
+                    is_pass_by_ref_or_ptr = False
+                    if param_declarator.type in ["pointer_declarator", "reference_declarator"]:
+                        is_pass_by_ref_or_ptr = True
+
+                    # For pass-by-value parameters, skip creating interprocedural edges
+                    # Pass-by-value creates a copy, so there's no data flow relationship
+                    if not is_pass_by_ref_or_ptr:
+                        continue
+
+                    # Navigate through complex declarators to find the identifier
                     param_id = param_declarator
                     while param_id and param_id.type not in ["identifier"]:
                         if param_id.type in ["pointer_declarator", "reference_declarator"]:
@@ -3205,7 +3216,8 @@ def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
                     param_name = param_id.text.decode('utf-8')
 
                     # Create edge from argument (at call site) to parameter (at function definition)
-                    # Note: We create edge from call_site to func_def, with metadata about which arg→param
+                    # Note: We only create this edge for pass-by-reference/pointer parameters
+                    # where data flow exists between caller and callee
                     add_edge(final_graph, call_site_id, func_def_id,
                            {'dataflow_type': 'comesFrom',
                             'edge_type': 'DFG_edge',
