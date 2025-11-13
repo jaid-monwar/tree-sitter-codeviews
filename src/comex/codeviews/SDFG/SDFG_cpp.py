@@ -764,18 +764,22 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
 
         elif is_dereference:
             # This is *ptr - dereferencing a pointer
-            # Track USE of the base pointer
-            pointer_index = get_index(pointer, parser.index)
-            if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
-                set_add(rda_table[statement_id]["use"],
-                       Identifier(parser, pointer, full_ref=pointer))
-
             # Track DEF/USE of dereferenced value
             if defined is not None:
+                # When DEFINING *ptr (e.g., *ptr = value), track USE of base pointer
+                # because we need the pointer's value (the address) to write to
+                pointer_index = get_index(pointer, parser.index)
+                if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
+                    set_add(rda_table[statement_id]["use"],
+                           Identifier(parser, pointer, full_ref=pointer))
+
+                # Track DEF of dereferenced value
                 set_add(rda_table[statement_id]["def"],
                        Identifier(parser, pointer, statement_id,
                                 full_ref=core, declaration=declaration, has_initializer=has_initializer))
             else:
+                # When USING *ptr (e.g., return *ptr), only track USE of dereferenced value
+                # Do NOT track USE of the base pointer - it's not semantically meaningful
                 set_add(rda_table[statement_id]["use"],
                        Identifier(parser, pointer, full_ref=core))
             return
@@ -2104,6 +2108,12 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
 
             # Skip if this identifier is part of a declaration (being declared, not used)
             if parent_statement.type in declaration_statement:
+                continue
+
+            # Skip identifiers inside pointer_expressions when used in return/assignment/etc
+            # These are already handled by the pointer_expression handler
+            immediate_parent = root_node.parent
+            if immediate_parent and immediate_parent.type == "pointer_expression":
                 continue
 
             # This identifier is a USE

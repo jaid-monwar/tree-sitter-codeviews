@@ -378,18 +378,22 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
     if current_node.type == "pointer_expression":
         pointer = current_node.child_by_field_name("argument")
 
-        # Track USE of the base pointer (ptr) - needed to know the address
-        pointer_index = get_index(pointer, parser.index)
-        if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
-            set_add(rda_table[statement_id]["use"],
-                   Identifier(parser, pointer, full_ref=pointer))
-
         # Track DEF/USE of the dereferenced value (*ptr)
         if defined is not None:
+            # When DEFINING *ptr (e.g., *ptr = value), track USE of base pointer
+            # because we need the pointer's value (the address) to write to
+            pointer_index = get_index(pointer, parser.index)
+            if pointer_index and pointer_index in parser.symbol_table["scope_map"]:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, pointer, full_ref=pointer))
+
+            # Track DEF of dereferenced value
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, pointer, statement_id,
                             full_ref=core, declaration=declaration))
         else:
+            # When USING *ptr (e.g., return *ptr), only track USE of dereferenced value
+            # Do NOT track USE of the base pointer - it's not semantically meaningful
             set_add(rda_table[statement_id]["use"],
                    Identifier(parser, pointer, full_ref=core))
         return
@@ -1349,6 +1353,12 @@ def build_rda_table(parser, CFG_results, function_metadata=None, pointer_modific
 
             parent_id = get_index(parent_statement, index)
             if parent_id is None or parent_id not in CFG_results.graph.nodes:
+                continue
+
+            # Skip identifiers inside pointer_expressions when used in return/assignment/etc
+            # These are already handled by the pointer_expression handler
+            immediate_parent = root_node.parent
+            if immediate_parent and immediate_parent.type == "pointer_expression":
                 continue
 
             # This identifier is a USE
