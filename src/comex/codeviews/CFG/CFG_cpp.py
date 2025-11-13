@@ -2908,12 +2908,85 @@ class CFGGraph_cpp(CFGGraph):
                 if object_name and object_name in self.template_instantiations:
                     template_instantiation = self.template_instantiations[object_name]
 
+                # Determine the class/type of the object making the call
+                object_class = None
+                if object_name:
+                    # Debug: Track what we're looking for
+                    # print(f"DEBUG: Looking for object '{object_name}'")
+
+                    # First, try to find the object in the current scope's declarations
+                    # Look for the declaration statement where this object was declared
+                    # print(f"DEBUG: Checking {len(self.CFG_node_list)} CFG nodes")
+                    for node_attrs in self.CFG_node_list:
+                        node_id = node_attrs[0]  # First element is the node ID
+                        label = node_attrs[1] if len(node_attrs) > 1 else ""  # Second element is the label
+                        # Look for variable declarations directly in the label (if it's a string)
+                        if isinstance(label, str) and ('tester t;' in label or 'tester2 t2;' in label or 'tester3 t3;' in label):
+                            # print(f"DEBUG: Found declaration in label: {label}")
+                            # Extract the type and variable name from the label
+                            import re
+                            match = re.search(r'(\w+)\s+(\w+);', label)
+                            if match:
+                                declared_type = match.group(1)
+                                declared_name = match.group(2)
+                                if declared_name == object_name:
+                                    object_class = declared_type
+                                    # print(f"DEBUG: Matched declaration for '{object_name}' -> type '{object_class}'")
+                                    break
+
+                        # Original logic as fallback
+                        if node_id in index_to_key:
+                            node_key = index_to_key[node_id]
+                            node = self.node_list.get(node_key)
+                            if node and node.type == "expression_statement":
+                                # Check if this is a variable declaration
+                                # Pattern: "ClassName objectName" or "ClassName objectName = ..."
+                                node_text = node.text.decode('utf-8')
+                                # Debug: Show what declarations we're examining
+                                # if 'tester' in node_text or 'tester2' in node_text or 'tester3' in node_text:
+                                #     print(f"DEBUG: Potential declaration node: {node_text}")
+                                # Check for patterns like "tester t;", "tester2 t2;", "tester3 t3;"
+                                import re
+                                # Strip any leading line numbers or whitespace
+                                clean_text = node_text.strip()
+                                match = re.match(r'^(\w+)\s+(\w+)\s*;', clean_text)
+                                if match:
+                                    declared_type = match.group(1)
+                                    declared_name = match.group(2)
+                                    if declared_name == object_name:
+                                        object_class = declared_type
+                                        print(f"DEBUG: Found declaration '{node_text}' -> type '{object_class}'")
+                                        break
+
+                    # Fallback: Try the original symbol table approach
+                    if not object_class:
+                        for idx, data_type in self.symbol_table.get("data_type", {}).items():
+                            # Check if this declaration is for our object
+                            if idx in self.index:
+                                node_key = self.index[idx]
+                                node = self.node_list.get(node_key)
+                                if node and node.type == "identifier":
+                                    if node.text.decode('utf-8') == object_name:
+                                        # Found the declaration - get the type
+                                        object_class = data_type
+                                        # Remove pointer/reference markers and 'class'/'struct' keywords
+                                        object_class = object_class.replace("*", "").replace("&", "").replace("class ", "").replace("struct ", "").strip()
+                                        break
+
                 # Find matching function(s) with signature matching for overload resolution
                 matching_functions = []
                 for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                     # Match method name - handle both exact matches and out-of-line definitions
                     # (e.g., "displayPrivateMember" should match "FriendClass::displayPrivateMember")
                     name_matches = (fn_name == method_name or fn_name.endswith("::" + method_name))
+
+                    # IMPORTANT FIX: If we know the object's class, only match methods from that class
+                    if object_class and class_name != object_class:
+                        # print(f"DEBUG: Skipping {class_name}::{fn_name} (looking for {object_class})")
+                        continue
+                    # elif object_class:
+                    #     print(f"DEBUG: Matching {class_name}::{fn_name} for object of type {object_class}")
+
                     if name_matches and self.signatures_match(signature, fn_sig):
                         matching_functions.append((fn_id, class_name))
 
