@@ -2679,29 +2679,15 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                         'color': '#4834DF',
                         'object_name': obj_name})
 
+            # Skip method_call edges - they don't represent data flow
+            # Similar to function_call edges, method calls represent control flow
+            # The actual data flow (arguments → parameters) is handled by RDA
+            # For methods that modify object state, the data flow is captured through
+            # member variable def-use chains, not through the method call edge itself
             elif label == "method_call":
-                # Non-virtual method call → implementation: static dispatch
-                # Extract the object variable name from the call site
-                source_node = node_list.get(read_index(index, edge[0]))
-                obj_name = "this"
-
-                if source_node and source_node.type == "expression_statement":
-                    # Get the call_expression
-                    call_expr = source_node.named_children[0] if source_node.named_children else None
-                    if call_expr and call_expr.type == "call_expression":
-                        # Get the function being called (should be field_expression)
-                        func_node = call_expr.child_by_field_name("function")
-                        if func_node and func_node.type == "field_expression":
-                            # Extract the base object (argument)
-                            arg_node = func_node.child_by_field_name("argument")
-                            if arg_node:
-                                obj_name = st(arg_node)
-
-                add_edge(final_graph, edge[0], edge[1],
-                       {'dataflow_type': 'method_call',
-                        'edge_type': 'DFG_edge',
-                        'color': '#00CED1',
-                        'object_name': obj_name})
+                # Skip: non-virtual method calls don't represent data dependencies
+                # Only constructor_call and virtual_dispatch edges are kept
+                pass
 
             else:
                 # Only add parameter edges for function returns, not function calls
@@ -3389,17 +3375,35 @@ def add_method_member_access_edges(final_graph, parser, cfg_graph, rda_table):
                                 if used.core in class_members:
                                     field_accesses.append((node_id, used.core))
 
-                # Create edges from call site object to member accesses within method
-                for stmt_id, field_name in field_accesses:
-                    # Add edge showing object's member is used by this statement in the method
-                    add_edge(final_graph, call_site_id, stmt_id,
-                           {'dataflow_type': 'comesFrom',
-                            'edge_type': 'DFG_edge',
-                            'color': '#00A3FF',
-                            'used_def': f"{object_name}.{field_name}",
-                            'interprocedural': 'method_member_access',
-                            'object': object_name,
-                            'member': field_name})
+                # DISABLED: Creating edges from call site to member uses is semantically incorrect
+                #
+                # The issue: These edges suggest "call_site defines the member value", which is wrong.
+                # In reality: Constructor/previous assignments define members, not the call site.
+                #
+                # Example from error_4_class.cpp:
+                #   Line 10: x = 100;  (constructor - defines x)
+                #   Line 14: x++;      (method body - uses x, then defines x)
+                #   Line 23: t.func()  (call site - DOES NOT define x)
+                #
+                # Correct edges (already exist via RDA):
+                #   Line 10 → Line 14 ✓ (constructor defines, method uses)
+                #
+                # Incorrect edges (this code was creating):
+                #   Line 23 → Line 14 ✗ (call site doesn't define the member)
+                #
+                # The regular RDA mechanism already handles member variable data flow correctly.
+                # If interprocedural tracking is needed in the future, implement proper
+                # context-sensitive analysis, not spurious call-site → use edges.
+                #
+                # for stmt_id, field_name in field_accesses:
+                #     add_edge(final_graph, call_site_id, stmt_id,
+                #            {'dataflow_type': 'comesFrom',
+                #             'edge_type': 'DFG_edge',
+                #             'color': '#00A3FF',
+                #             'used_def': f"{object_name}.{field_name}",
+                #             'interprocedural': 'method_member_access',
+                #             'object': object_name,
+                #             'member': field_name})
 
 
 def add_function_return_edges(final_graph, parser, cfg_graph, rda_table):
