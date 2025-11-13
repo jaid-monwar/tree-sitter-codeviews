@@ -1463,18 +1463,41 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                 # operator on the existing object, so it uses the old value.
                 # For primitive types, this is a simple copy and does NOT use the old value.
                 # EXCEPTION: Reference types always USE the reference binding, even for primitives.
+                # EXCEPTION 2: For previously declared variables (especially parameters),
+                # add a USE to represent the semantic dependency on the declaration.
                 if left_node.type in variable_type:
                     # Get the variable's type
                     var_type = get_variable_type(parser, left_node)
 
                     # Track USE if:
                     # 1. It's a class/struct type (operator= is called), OR
-                    # 2. It's a reference variable (uses the reference binding established by parameter/declaration)
+                    # 2. It's a reference variable (uses the reference binding established by parameter/declaration), OR
+                    # 3. It's a reassignment to a previously declared variable (creates edge from declaration)
                     if is_class_or_struct_type(parser, var_type) or is_reference_variable(parser, left_node):
                         # Class/struct assignment calls operator=, so it uses the old value
                         # Reference assignment uses the reference binding from parameter/declaration
                         add_entry(parser, rda_table, parent_id, used=left_node)
-                    # For primitive non-reference types: no USE, only DEF (handled below)
+                    else:
+                        # For primitive non-reference types: check if this is a reassignment
+                        # to an existing variable (especially parameters)
+                        left_node_index = get_index(left_node, index)
+                        if left_node_index and left_node_index in parser.symbol_table["scope_map"]:
+                            # Check if this is part of an init_declarator (new declaration with initializer)
+                            is_init_declarator = False
+                            check_parent = root_node.parent
+                            while check_parent:
+                                if check_parent.type == "init_declarator":
+                                    is_init_declarator = True
+                                    break
+                                if check_parent.type in statement_types.get("node_list_type", []):
+                                    break
+                                check_parent = check_parent.parent
+
+                            # If not part of a declaration, this is a reassignment to an existing variable
+                            # Add USE to create edge from the original declaration (e.g., parameter)
+                            # Example: int fn(int c) { c = 100; } creates edge from param decl to assignment
+                            if not is_init_declarator:
+                                add_entry(parser, rda_table, parent_id, used=left_node)
 
             # Left side is defined
             add_entry(parser, rda_table, parent_id, defined=left_node)
@@ -2161,7 +2184,23 @@ def start_rda(index, rda_table, cfg_graph, pre_solve=False):
 
 
 def add_edge(final_graph, source, target, attrib=None):
-    """Add edge to MultiDiGraph with attributes"""
+    """Add edge to MultiDiGraph with attributes, preventing duplicates"""
+    # Check if this exact edge already exists (same source, target, and used_def)
+    if attrib is not None:
+        used_def = attrib.get('used_def', None)
+        edge_type = attrib.get('edge_type', None)
+        dataflow_type = attrib.get('dataflow_type', None)
+
+        # Check existing edges for duplicates
+        for u, v, k, data in final_graph.edges(keys=True, data=True):
+            if (u == source and v == target and
+                data.get('used_def') == used_def and
+                data.get('edge_type') == edge_type and
+                data.get('dataflow_type') == dataflow_type):
+                # Duplicate edge found, don't add it
+                return
+
+    # No duplicate found, add the edge
     final_graph.add_edge(source, target)
     if attrib is not None:
         edge_keys = [k for u, v, k in final_graph.edges(keys=True) if u == source and v == target]

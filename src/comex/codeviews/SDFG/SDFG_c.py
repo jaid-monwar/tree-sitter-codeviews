@@ -867,6 +867,29 @@ def build_rda_table(parser, CFG_results, function_metadata=None, pointer_modific
             # Compound assignments: x += y means USE x first, then DEFINE
             if operator_text != "=":
                 add_entry(parser, rda_table, parent_id, used=left_node)
+            else:
+                # Simple assignment (=): For previously declared variables (especially parameters),
+                # add a USE to represent the semantic dependency on the declaration.
+                # This creates edges from parameter declarations to their first assignments.
+                # Example: int fn(int c) { c = 100; } creates edge from param decl to assignment
+                if left_node.type in variable_type:
+                    left_node_index = get_index(left_node, index)
+                    if left_node_index and left_node_index in parser.symbol_table["scope_map"]:
+                        # Check if this is part of an init_declarator (new declaration with initializer)
+                        is_init_declarator = False
+                        check_parent = root_node.parent
+                        while check_parent:
+                            if check_parent.type == "init_declarator":
+                                is_init_declarator = True
+                                break
+                            if check_parent.type in statement_types.get("node_list_type", []):
+                                break
+                            check_parent = check_parent.parent
+
+                        # If not part of a declaration, this is a reassignment to an existing variable
+                        # Add USE to create edge from the original declaration (e.g., parameter)
+                        if not is_init_declarator:
+                            add_entry(parser, rda_table, parent_id, used=left_node)
 
             # Left side is always defined
             add_entry(parser, rda_table, parent_id, defined=left_node)
@@ -1408,8 +1431,23 @@ def start_rda(index, rda_table, cfg_graph, pre_solve=False):
 
 
 def add_edge(final_graph, source, target, attrib=None):
-    """Add edge to graph with attributes"""
-    # Always add edge - MultiDiGraph supports multiple edges between same nodes
+    """Add edge to graph with attributes, preventing duplicates"""
+    # Check if this exact edge already exists (same source, target, and used_def)
+    if attrib is not None:
+        used_def = attrib.get('used_def', None)
+        edge_type = attrib.get('edge_type', None)
+        dataflow_type = attrib.get('dataflow_type', None)
+
+        # Check existing edges for duplicates
+        for u, v, k, data in final_graph.edges(keys=True, data=True):
+            if (u == source and v == target and
+                data.get('used_def') == used_def and
+                data.get('edge_type') == edge_type and
+                data.get('dataflow_type') == dataflow_type):
+                # Duplicate edge found, don't add it
+                return
+
+    # No duplicate found, add the edge
     final_graph.add_edge(source, target)
     if attrib is not None:
         # Get the key of the edge we just added (it will be the highest key)
