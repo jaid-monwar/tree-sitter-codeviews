@@ -66,11 +66,11 @@ class DfgRda:
                 )
             if graph_format == "all" or graph_format == "dot":
                 postprocessor.write_to_dot(
-                    self.graph, output_file.rsplit(".", 1)[0] + ".dot", output_png=True
+                    self.graph, output_file.rsplit(".", 1)[0] + ".dot", output_png=True, src_language=self.src_language
                 )
             if graph_format == "all" or graph_format == "dot":
                 postprocessor.write_to_dot(
-                    self.debug_graph, output_file.rsplit(".", 1)[0] + "_debug.dot", output_png=True
+                    self.debug_graph, output_file.rsplit(".", 1)[0] + "_debug.dot", output_png=True, src_language=self.src_language
                 )
             self.json = postprocessor.write_networkx_to_json(self.graph, output_file)
 
@@ -135,10 +135,12 @@ if __name__ == '__main__':
             graph,
             output_file.rsplit(".", 1)[0] + ".dot",
             output_png=True,
+            src_language=extension,
         )
         debug_graph = result.debug_graph
         postprocessor.write_to_dot(
             debug_graph,
             output_file.rsplit(".", 1)[0] + "_debug.dot",
             output_png=True,
+            src_language=extension,
         )

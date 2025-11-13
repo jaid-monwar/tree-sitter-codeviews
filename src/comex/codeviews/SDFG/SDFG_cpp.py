@@ -333,7 +333,8 @@ class Identifier:
     def __init__(self, parser, node, line=None, declaration=False, full_ref=None, method_call=False, has_initializer=False):
         self.core = st(node)
         self.unresolved_name = st(full_ref) if full_ref else st(node)
-        self.name = self._resolve_name(node, full_ref, parser)
+        self.base_name = self._resolve_name(node, full_ref, parser)  # Store base name before qualification
+        self.name = self.base_name  # Will be qualified later if needed
         self.line = line
         self.declaration = declaration
         self.has_initializer = has_initializer  # True if declaration has an initializer
@@ -350,6 +351,8 @@ class Identifier:
         # Get parent class/struct if this is a member
         class_node = return_first_parent_of_types(node, ["class_specifier", "struct_specifier"])
         self.parent_class = None
+        self.is_member_access = False  # Track if this is accessing a class member
+
         if class_node is not None:
             class_name_node = None
             for child in class_node.children:
@@ -358,6 +361,19 @@ class Identifier:
                     break
             if class_name_node:
                 self.parent_class = st(class_name_node)
+
+                # Check if we're inside a member function (not just in the class declaration)
+                # Look for function_definition between node and class_node
+                parent = node.parent
+                while parent and parent != class_node:
+                    if parent.type == "function_definition":
+                        # We're inside a member function of this class
+                        # Check if this is not a field_expression (obj.field) - those are already qualified
+                        if full_ref is None or full_ref.type not in ["field_expression", "pointer_expression"]:
+                            # This is an implicit member access (just 'x' instead of 'this->x')
+                            self.is_member_access = True
+                        break
+                    parent = parent.parent
 
         # Get scope information from parser
         variable_index = get_index(node, parser.index)
@@ -405,6 +421,10 @@ class Identifier:
         # Get real line number
         if line is not None:
             self.real_line_no = read_index(parser.index, line)[0][0]
+
+        # Qualify the name with class if this is an implicit member access
+        if self.is_member_access and self.parent_class:
+            self.name = f"{self.parent_class}::{self.base_name}"
 
     def _resolve_name(self, node, full_ref, parser):
         """Resolve identifier name for C++"""
