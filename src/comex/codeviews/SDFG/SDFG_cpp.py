@@ -3034,15 +3034,12 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
 
         # For each pass-by-reference argument
         for arg_idx, var_name, var_node in pass_by_ref_args:
-            # 1. Add edge from call site to function definition (argument-parameter binding)
-            add_edge(final_graph, call_site_id, func_def_id,
-                   {'dataflow_type': 'comesFrom',
-                    'edge_type': 'DFG_edge',
-                    'color': '#00A3FF',
-                    'used_def': var_name,
-                    'interprocedural': 'call_to_function'})
+            # Note: Removed call_to_function edge creation here to avoid duplicate edges.
+            # The add_argument_parameter_edges() function already creates argument_to_parameter
+            # edges with more precise information (argument_index), making call_to_function redundant.
+            # This function focuses solely on creating modification_to_use edges.
 
-            # 2. Find modification sites for this parameter
+            # Find modification sites for this parameter
             mods = modification_sites.get(function_name, [])
             for mod_param_idx, mod_node, mod_statement_id in mods:
                 if mod_param_idx == arg_idx:
