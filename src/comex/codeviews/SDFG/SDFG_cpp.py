@@ -14,7 +14,7 @@ assignment = ["assignment_expression"]
 def_statement = ["init_declarator"]
 declaration_statement = ["declaration"]
 increment_statement = ["update_expression"]
-variable_type = ['identifier', 'this']
+variable_type = ['identifier', 'this', 'qualified_identifier']
 function_calls = ["call_expression"]
 method_calls = ["call_expression"]  # In C++, both functions and methods use call_expression
 literal_types = ["number_literal", "string_literal", "char_literal", "raw_string_literal",
@@ -313,8 +313,12 @@ def recursively_get_children_of_types(node, st_types, check_list=None,
         ])
 
     # Recurse on named children
+    # Don't recurse into qualified_identifier children if we're collecting them
     for child in node.named_children:
         if child.type not in stop_types:
+            # If we're collecting qualified_identifiers and this child is one, don't recurse into it
+            if 'qualified_identifier' in st_types and child.type == 'qualified_identifier':
+                continue
             result = recursively_get_children_of_types(
                 child, st_types, result=result, stop_types=stop_types,
                 index=index, check_list=check_list
@@ -438,9 +442,15 @@ class Identifier:
                     arg = full_ref.child_by_field_name("argument")
                     return st(arg) if arg else st(full_ref)
 
-        # Handle qualified identifier: std::cout, MyClass::staticVar
+        # Handle qualified identifier: std::cout, MyClass::staticVar, Room1::p
+        # Extract just the variable/function name (part after last ::)
+        # The full qualified name is preserved in self.unresolved_name
         if full_ref.type == "qualified_identifier":
-            return st(full_ref)
+            qualified_text = st(full_ref)
+            if "::" in qualified_text:
+                # Extract the variable name (last part after ::)
+                return qualified_text.split("::")[-1]
+            return qualified_text
 
         # Handle this pointer
         if st(node) == "this":
@@ -2516,6 +2526,35 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                         'edge_type': 'DFG_edge',
                                         'color': '#00A3FF',
                                         'used_def': used.name})
+                                used.satisfied = True
+                                break
+                    if used.satisfied:
+                        break
+
+            # Handle unsatisfied qualified identifier references (e.g., Room1::p, MyClass::staticVar)
+            # When a variable is accessed with namespace/class qualification from outside its scope
+            if not used.satisfied and "::" in used.name:
+                # Extract the variable name from the qualified identifier (e.g., "p" from "Room1::p")
+                qualified_parts = used.name.split("::")
+                var_name = qualified_parts[-1]  # Last part is the variable name
+
+                # Search all DEF entries globally for matching definitions
+                for def_node in graph_nodes:
+                    if def_node not in rda_table:
+                        continue
+                    for definition in rda_table[def_node]["def"]:
+                        # Match if the definition name equals the variable part
+                        if definition.name == var_name:
+                            # The definition should be in a namespace/class scope (len >= 2)
+                            if len(definition.scope) >= 2:
+                                # Prevent self-loops: don't create edge from a node to itself
+                                if definition.line != node:
+                                    # Add edge from namespace/class definition to qualified usage
+                                    add_edge(final_graph, definition.line, node,
+                                           {'dataflow_type': 'comesFrom',
+                                            'edge_type': 'DFG_edge',
+                                            'color': '#00A3FF',
+                                            'used_def': used.name})
                                 used.satisfied = True
                                 break
                     if used.satisfied:
