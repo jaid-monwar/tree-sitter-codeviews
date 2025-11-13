@@ -2511,16 +2511,43 @@ class CFGGraph_cpp(CFGGraph):
         elif node_type == "nullptr":
             return "nullptr_t"
 
-        # Pointer dereference (*ptr) - lvalue
+        # Pointer expression: can be dereference (*ptr) OR address-of (&var)
         elif node_type == "pointer_expression":
-            # Get what's being dereferenced
-            for child in arg_node.named_children:
-                base_type = self.get_argument_type(child)
+            # Determine which operator: & (address-of) or * (dereference)
+            operator = None
+            operand = None
+            for child in arg_node.children:
+                if child.type == "&":
+                    operator = "&"
+                elif child.type == "*":
+                    operator = "*"
+                elif child.is_named:
+                    operand = child
+
+            if operator == "&" and operand:
+                # Address-of operator: &var
+                # Get the base type and return pointer type
+                base_type = self.get_argument_type(operand)
+                # Remove reference qualifiers (lvalue ref &, rvalue ref &&)
+                base_type = base_type.rstrip('&').rstrip()
+                return base_type + "*"
+            elif operator == "*" and operand:
+                # Dereference operator: *ptr
+                # Get what's being dereferenced
+                base_type = self.get_argument_type(operand)
                 # Remove pointer qualifier, add lvalue reference
                 if base_type.endswith("*"):
                     return base_type[:-1].rstrip() + "&"
                 else:
                     return base_type.rstrip('&').rstrip() + "&"
+            else:
+                # Fallback: treat as dereference (old behavior)
+                for child in arg_node.named_children:
+                    base_type = self.get_argument_type(child)
+                    if base_type.endswith("*"):
+                        return base_type[:-1].rstrip() + "&"
+                    else:
+                        return base_type.rstrip('&').rstrip() + "&"
 
         # Array subscript (arr[i]) - lvalue
         elif node_type == "subscript_expression":
