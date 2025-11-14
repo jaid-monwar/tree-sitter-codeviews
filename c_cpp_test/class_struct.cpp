@@ -22,7 +22,7 @@ struct tester2
     int x = 0;
 
     tester2() {
-        x = 100;
+        x = 200;
     }
 
     int func(int a, int b) {
@@ -37,7 +37,7 @@ class tester3
     int x = 0;
 
     tester3() {
-        x = 100;
+        x = 300;
     }
 
     int func(int a, int b) {

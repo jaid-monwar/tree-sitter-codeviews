@@ -1,4 +1,10 @@
-5.  There is a back-edge from 29 to 25 and 44 to 40.
-    CFG is wrong. There is a function call to tester::func in line 53, but there are edges to tester2::func and tester3::func
+There are 2 ways variables insides structs/classes can be handled in DFG when they are modified externally:
 
-6.  There is no edge from 7 to 8 in the c++ cfg. c cfg is correct.
+1. Each variable inside the struct is handled differently. For example, in error_1_struct.c, there can be an arrow from
+   the definition of obj.a to every use of obj.a. Same goes for obj.b.
+
+2. The entire object is treated as one variable. So, there will be an arrow from the definition of obj to every modification
+   and use of obj.
+
+Currently, both C and C++ handle the same file differently, and none of them conform to one of the standard, instead use a weird mix of both.
+Ensure that both C and C++ use scheme 1, since a class/struct is just a collection of variables on a fundamental level.
