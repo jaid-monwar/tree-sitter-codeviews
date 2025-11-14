@@ -337,16 +337,19 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         return
 
     # Handle struct field access
+    # For C, we track the base struct variable, not individual fields
+    # This means any field modification (obj.a = x or obj.b = y) defines "obj"
+    # and kills previous definitions of "obj", regardless of which field was modified
     if current_node.type == "field_expression":
         if defined is not None:
             set_add(rda_table[statement_id]["def"],
                    Identifier(parser, current_node.child_by_field_name("argument"),
-                            statement_id, full_ref=current_node,
+                            statement_id, full_ref=None,
                             declaration=declaration))
         else:
             set_add(rda_table[statement_id]["use"],
                    Identifier(parser, current_node.child_by_field_name("argument"),
-                            full_ref=current_node))
+                            full_ref=None))
         return
 
     # Handle address-of operator: &x
@@ -822,22 +825,36 @@ def build_rda_table(parser, CFG_results, function_metadata=None, pointer_modific
                 continue
 
             # Find identifier children (uninitialized variables)
+            # Strategy: check all named children for identifiers or declarators
+            # Since this declaration is in the CFG, any identifiers are valid variable names
             for child in root_node.named_children:
                 if child.type == "identifier":
-                    # Check if this identifier is in the symbol table
+                    # This is a variable declaration: int x; or struct st obj;
+                    # IMPORTANT: For struct declarations, we force scope to [0] to match
+                    # field assignments. Field assignments use scope [0] because the field
+                    # identifiers are often not in scope_map. To ensure proper dataflow,
+                    # we need consistent scopes between declarations and uses.
                     child_id = get_index(child, index)
-                    if child_id and child_id in parser.symbol_table["scope_map"]:
-                        # This is a variable declaration: int x;
-                        add_entry(parser, rda_table, parent_id,
-                                 defined=child, declaration=True)
-                elif child.type in ["pointer_declarator", "array_declarator"]:
-                    # Handle int *ptr; or int arr[10];
+                    if child_id:
+                        from collections import defaultdict
+                        if parent_id not in rda_table:
+                            rda_table[parent_id] = defaultdict(list)
+                        # Create Identifier and force scope to [0] for consistency
+                        ident = Identifier(parser, child, parent_id, declaration=True)
+                        ident.scope = [0]
+                        ident.variable_scope = [0]
+                        set_add(rda_table[parent_id]["def"], ident)
+                elif child.type in ["pointer_declarator", "array_declarator",
+                                   "function_declarator", "parenthesized_declarator"]:
+                    # Handle int *ptr; or int arr[10]; or complex declarators
                     var_identifier = extract_identifier_from_declarator(child)
                     if var_identifier:
                         var_id = get_index(var_identifier, index)
-                        if var_id and var_id in parser.symbol_table["scope_map"]:
+                        if var_id:
                             add_entry(parser, rda_table, parent_id,
                                      defined=var_identifier, declaration=True)
+                # Skip type specifiers (struct_specifier, type_identifier, primitive_type, etc.)
+                # These don't contain the variable name
 
         # 3. Handle assignments
         elif root_node.type in assignment:
@@ -872,11 +889,16 @@ def build_rda_table(parser, CFG_results, function_metadata=None, pointer_modific
             if operator_text != "=":
                 add_entry(parser, rda_table, parent_id, used=left_node)
             else:
-                # Simple assignment (=): For previously declared variables (especially parameters),
+                # Simple assignment (=): For struct field assignments (obj.a = x),
+                # we USE the base struct (to access it) before DEFining it (modifying a field).
+                # This creates proper dataflow: declaration -> field assignments -> uses
+                if left_node.type == "field_expression":
+                    add_entry(parser, rda_table, parent_id, used=left_node)
+                # For previously declared variables (especially parameters),
                 # add a USE to represent the semantic dependency on the declaration.
                 # This creates edges from parameter declarations to their first assignments.
                 # Example: int fn(int c) { c = 100; } creates edge from param decl to assignment
-                if left_node.type in variable_type:
+                elif left_node.type in variable_type:
                     left_node_index = get_index(left_node, index)
                     if left_node_index and left_node_index in parser.symbol_table["scope_map"]:
                         # Check if this is part of an init_declarator (new declaration with initializer)
