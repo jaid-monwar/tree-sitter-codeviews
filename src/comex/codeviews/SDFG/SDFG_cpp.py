@@ -716,32 +716,55 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         return
 
     # Handle field access: obj.field or obj->field
+    # For C++, we track the base struct/class variable, not individual fields
+    # This means any field modification (obj.a = x or obj.b = y) defines "obj"
+    # and kills previous definitions of "obj", regardless of which field was modified
+    # This approach matches the C implementation and ensures proper data flow chaining
+    #
+    # EXCEPTION: Method calls (obj.method) when part of a call_expression are tracked
+    # differently - they just USE the object without tracking the method name,
+    # but we let the call_expression handler deal with them naturally.
     if current_node.type == "field_expression":
         argument = current_node.child_by_field_name("argument")
 
+        # Check if this field_expression is the function part of a call_expression
+        # If so, it's a method call and should be handled differently
+        # We only want to intercept actual field access (data members), not method references
+        is_method_call = (current_node.parent and
+                         current_node.parent.type == "call_expression")
+
+        if is_method_call:
+            # This is obj.method() - let call_expression handler deal with it
+            # The old behavior was to track the full field expression for methods
+            # To preserve compatibility with existing tests, we keep the old behavior for methods
+            if defined is not None:
+                set_add(rda_table[statement_id]["def"],
+                       Identifier(parser, argument, statement_id,
+                                full_ref=current_node, declaration=declaration,
+                                method_call=True, has_initializer=has_initializer))
+            else:
+                set_add(rda_table[statement_id]["use"],
+                       Identifier(parser, argument, full_ref=current_node,
+                                method_call=True))
+            return
+
+        # Regular field access (data members) - track at object level
         if defined is not None:
             # When a field is being defined (e.g., obj.field = value),
-            # the object itself is USED (to access the member), and the field is DEFINED
-            # First, track USE of the base object (just the object, not the full field expression)
+            # track DEF of the base object (not the full field expression)
+            # This creates a chain: declaration -> field assignment -> field assignment -> use
             if argument:
-                set_add(rda_table[statement_id]["use"],
-                       Identifier(parser, argument, line=statement_id))  # Track object with line number
-            # Then track DEF of the full field expression
-            set_add(rda_table[statement_id]["def"],
-                   Identifier(parser, argument, statement_id,
-                            full_ref=current_node, declaration=declaration,
-                            method_call=method_call, has_initializer=has_initializer))
+                set_add(rda_table[statement_id]["def"],
+                       Identifier(parser, argument, statement_id,
+                                full_ref=None, declaration=declaration,
+                                method_call=method_call, has_initializer=has_initializer))
         else:
             # When a field is being used (e.g., reading obj.field),
-            # Track both the object USE and the full field expression USE
+            # track USE of the base object (not the full field expression)
             if argument:
-                # Track the base object as being used with the current line number
                 set_add(rda_table[statement_id]["use"],
-                       Identifier(parser, argument, line=statement_id))
-            # Also track the full field expression as being used
-            set_add(rda_table[statement_id]["use"],
-                   Identifier(parser, argument, full_ref=current_node,
-                            method_call=method_call))
+                       Identifier(parser, argument, full_ref=None,
+                                method_call=method_call))
         return
 
     # Handle address-of operator: &x
@@ -1493,13 +1516,18 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                 # Compound assignment - definitely uses left side
                 add_entry(parser, rda_table, parent_id, used=left_node)
             else:
+                # Regular assignment: For class/struct field assignments (obj.a = x),
+                # we USE the base struct (to access it) before DEFining it (modifying a field).
+                # This creates proper dataflow: declaration -> field assignments -> uses
+                if left_node.type == "field_expression":
+                    add_entry(parser, rda_table, parent_id, used=left_node)
                 # Regular assignment: For class/struct types, this calls the assignment
                 # operator on the existing object, so it uses the old value.
                 # For primitive types, this is a simple copy and does NOT use the old value.
                 # EXCEPTION: Reference types always USE the reference binding, even for primitives.
                 # EXCEPTION 2: For previously declared variables (especially parameters),
                 # add a USE to represent the semantic dependency on the declaration.
-                if left_node.type in variable_type:
+                elif left_node.type in variable_type:
                     # Get the variable's type
                     var_type = get_variable_type(parser, left_node)
 
