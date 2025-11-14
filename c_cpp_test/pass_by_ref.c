@@ -10,7 +10,7 @@ int fn_value(int c) {
 
 int main() {
     int k = 0;
-    fn(k);
+    fn_value(k);
     pritnf("value: %d\n", k);      // 0 will be printed
     fn(&k);
     printf("reference: %d\n", k);      // 100 will be printed

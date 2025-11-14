@@ -1,13 +1,4 @@
-1.  double edge in cpp. also, there shouldn't be an edge between 1 and 3 in c or cpp.
-    there should be an edge from 6 to 7, since parameter declaration is a variable declaration.
-    there are edges from fn to both printf statements, instead of just one.
+5.  There is a back-edge from 29 to 25 and 44 to 40.
+    CFG is wrong. There is a function call to tester::func in line 53, but there are edges to tester2::func and tester3::func
 
-2.  double edge
-
-3.  Can't handle namespace. Here Room1::p is being changed and then printed.
-
-4.  there shouldn't be an edge from 23 to 13 since it's pass by value, not reference.
-    shouldn't be an edge from 23 to 14 either
-
-5.  extreme confusion between 3 completely different classes/structs that have the same variable and function names.
-    same problem exists in the cfg. it thinks the 3 functions are same, even though they are in different classes.
+6.  There is no edge from 7 to 8 in the c++ cfg. c cfg is correct.

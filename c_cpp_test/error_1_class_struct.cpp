@@ -11,7 +11,7 @@ class tester
     }
 
     int func(int a, int b) {
-        x++;
+        x += 1;
         return x+a+b;
     }
 };
@@ -26,7 +26,7 @@ struct tester2
     }
 
     int func(int a, int b) {
-        x++;
+        x += 2;
         return x+a+b;
     }
 };
@@ -41,7 +41,7 @@ class tester3
     }
 
     int func(int a, int b) {
-        x++;
+        x += 3;
         return x+a+b;
     }
 };
@@ -54,7 +54,6 @@ int main()
 
     tester2 t2;
     t2.func(p+2, 1);
-    return 0;
 
     tester3 t3;
     t3.func(p+3, 1);
