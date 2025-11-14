@@ -173,9 +173,32 @@ def return_switch_parent_statement(node, non_control_statement):
 
 
 def has_inner_definition(node):
-    """Checks if a node has a definition inside it"""
+    """
+    Checks if a node has a definition inside it.
+
+    Special handling for struct/class/union specifiers:
+    - They are only considered definitions if they have a body (field_declaration_list)
+    - A declaration like 'struct st obj;' is NOT a definition of struct st
+    - A definition like 'struct st { int a; };' IS a definition of struct st
+    """
+    # Special handling for struct/class/union specifiers
+    if node.type in ["struct_specifier", "class_specifier", "union_specifier"]:
+        # Only consider it a definition if it has a body (field_declaration_list)
+        has_body = any(child.type == "field_declaration_list" for child in node.named_children)
+        if has_body:
+            return True
+        # If no body, it's just a reference to an existing type, not a definition
+        # Continue checking children (though typically there won't be any definitions in children)
+        for child in node.children:
+            if has_inner_definition(child):
+                return True
+        return False
+
+    # For other definition types, use the original logic
     if node.type in statement_types["definition_types"]:
         return True
+
+    # Recursively check children
     for child in node.children:
         if has_inner_definition(child):
             return True
