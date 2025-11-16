@@ -1,10 +1,3 @@
-There are 2 ways variables insides structs/classes can be handled in DFG when they are modified externally:
-
-1. Each variable inside the struct is handled differently. For example, in error_1_struct.c, there can be an arrow from
-   the definition of obj.a to every use of obj.a. Same goes for obj.b.
-
-2. The entire object is treated as one variable. So, there will be an arrow from the definition of obj to every modification
-   and use of obj, regardless if it's obj.a or obj.b
-
-Currently, both C and C++ handle the same file differently, and none of them conform to one of the 2 standards, instead use a weird mix of both.
-Ensure that both C and C++ use scheme 2, it makes more sense from an OOP perspective.
+In fig2.cpp, there is a call by reference to a function inside a class.
+While the tool can handle call by reference to a normal function, it appears that it can't do the same if the function resides inside a class.
+Add an edge from 17_ to 9_, and another from 11_ to 18_
