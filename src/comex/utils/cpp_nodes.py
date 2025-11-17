@@ -403,6 +403,17 @@ def get_signature(node):
     if parameter_list is None:
         return tuple(signature)
 
+    # Helper function to count array dimensions (int arr[][] -> pointer level 2)
+    def count_array_dimensions(array_node):
+        count = 0
+        if array_node.type == "array_declarator":
+            count = 1
+            # Check for nested array declarators (multi-dimensional arrays)
+            for subchild in array_node.children:
+                if subchild.type == "array_declarator":
+                    count += count_array_dimensions(subchild)
+        return count
+
     # Include both parameter_declaration nodes and variadic '...' nodes
     # Use parameter_list.children (not filtered) to catch '...' which is not a parameter_declaration
     for param in parameter_list.children:
@@ -427,8 +438,13 @@ def get_signature(node):
                             signature.append(base_type + '&')
                     elif declarator.type == 'pointer_declarator':
                         signature.append(base_type + '*')
+                    elif declarator.type == 'array_declarator':
+                        # Array parameters decay to pointers (int arr[] -> int*)
+                        # Count array dimensions for multi-dimensional arrays
+                        pointer_count = count_array_dimensions(declarator)
+                        signature.append(base_type + '*' * pointer_count)
                     else:
-                        # Other declarator types (array, etc.)
+                        # Other declarator types
                         signature.append(base_type)
                 else:
                     # No declarator, just base type

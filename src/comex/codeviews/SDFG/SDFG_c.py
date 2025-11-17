@@ -582,6 +582,12 @@ def collect_function_metadata(parser):
                                                     break
                                             else:
                                                 break
+                                    elif p_child.type == "array_declarator":
+                                        # In C, array parameters decay to pointers
+                                        # int arr[] is equivalent to int *arr
+                                        is_pointer = True
+                                        # Extract parameter name from array_declarator
+                                        param_name = st(extract_identifier_from_declarator(p_child))
                                     elif p_child.type == "identifier":
                                         if param_name is None:  # Only if not already found in pointer_declarator
                                             param_name = st(p_child)

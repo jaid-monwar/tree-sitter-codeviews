@@ -2555,8 +2555,16 @@ class CFGGraph_cpp(CFGGraph):
             argument = arg_node.child_by_field_name("argument")
             if argument:
                 base_type = self.get_argument_type(argument)
-                # Remove reference qualifiers and add lvalue reference
-                return base_type.rstrip('&').rstrip() + "&"
+                # Remove reference qualifiers first
+                base_type = base_type.rstrip('&').rstrip()
+                # If it's a pointer type (e.g., int*), subscript dereferences it to get the element type
+                # arr[i] where arr is int* → type is int (as lvalue, so int&)
+                if base_type.endswith("*"):
+                    element_type = base_type[:-1].rstrip()
+                    return element_type + "&"
+                else:
+                    # Fallback: add lvalue reference
+                    return base_type + "&"
 
         # Member access (obj.member) - depends on member, but typically lvalue
         elif node_type == "field_expression":

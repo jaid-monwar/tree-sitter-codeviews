@@ -2646,7 +2646,7 @@ def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
                         continue
 
                     is_pass_by_ref_or_ptr = False
-                    if param_declarator.type in ["pointer_declarator", "reference_declarator"]:
+                    if param_declarator.type in ["pointer_declarator", "reference_declarator", "array_declarator"]:
                         is_pass_by_ref_or_ptr = True
 
                     if not is_pass_by_ref_or_ptr:
@@ -2654,7 +2654,7 @@ def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
 
                     param_id = param_declarator
                     while param_id and param_id.type not in ["identifier"]:
-                        if param_id.type in ["pointer_declarator", "reference_declarator"]:
+                        if param_id.type in ["pointer_declarator", "reference_declarator", "array_declarator"]:
                             for child in param_id.named_children:
                                 if child.type == "identifier":
                                     param_id = child

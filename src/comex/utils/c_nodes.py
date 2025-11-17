@@ -79,6 +79,8 @@ def extract_parameter_type(param_node):
     - size_t n -> 'size_t'
     - char **argv -> 'char**'
     - const int * const ptr -> 'int*'
+    - int arr[] -> 'int*' (array parameters decay to pointers)
+    - int arr[][10] -> 'int*' (multi-dimensional arrays decay to pointers)
 
     Returns: string representing the parameter type
     """
@@ -104,6 +106,22 @@ def extract_parameter_type(param_node):
             # Count '*' symbols in the pointer_declarator
             pointer_text = child.text.decode('utf-8')
             pointer_count = pointer_text.count('*')
+
+        # Handle array declarators (int arr[] is equivalent to int *arr in parameters)
+        elif child.type == "array_declarator":
+            # Array parameters decay to pointers
+            # Count each [] as one pointer level
+            def count_array_dimensions(node):
+                count = 0
+                if node.type == "array_declarator":
+                    count = 1
+                    # Check for nested array declarators (multi-dimensional arrays)
+                    for subchild in node.children:
+                        if subchild.type == "array_declarator":
+                            count += count_array_dimensions(subchild)
+                return count
+
+            pointer_count = count_array_dimensions(child)
 
     # Construct the type string
     if base_type:
