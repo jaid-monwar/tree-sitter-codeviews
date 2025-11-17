@@ -1146,7 +1146,8 @@ def collect_function_metadata(parser):
                     # Get function name
                     declarator = child.child_by_field_name("declarator")
                     if declarator:
-                        if declarator.type == "identifier":
+                        if declarator.type in ["identifier", "field_identifier"]:
+                            # field_identifier is used for methods defined inside class body
                             func_name = st(declarator)
                         elif declarator.type in ["pointer_declarator", "reference_declarator"]:
                             # Handle function that returns pointer/reference
@@ -1646,7 +1647,8 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                 if function_node.type == "field_expression":
                     # This is a method call: obj.method() or obj->method()
                     # Only track USE of the base object (not the whole field expression)
-                    # Extract the base object from the field_expression
+                    # The interprocedural edges (argument_to_parameter, modification_to_use) provide
+                    # the essential data flow information for pass-by-reference
                     argument = function_node.child_by_field_name("argument")
                     if argument:
                         # Track USE of the base object only
@@ -2893,8 +2895,11 @@ def collect_call_site_information(parser, function_metadata, cfg_graph):
                     # Handle qualified names like std::function
                     function_name = st(func_node)
                 elif func_node.type == "field_expression":
-                    # Method call - skip for now, focus on functions
-                    continue
+                    # Method call - extract method name from field_expression
+                    # e.g., obj.f1(k) -> field_expression has field="f1"
+                    field_node = func_node.child_by_field_name("field")
+                    if field_node and field_node.type == "field_identifier":
+                        function_name = st(field_node)
 
             if not function_name or function_name not in function_metadata:
                 continue  # Not a user-defined function we have metadata for
@@ -3114,53 +3119,111 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
 
             # Find modification sites for this parameter
             mods = modification_sites.get(function_name, [])
-            for mod_param_idx, mod_node, mod_statement_id in mods:
-                if mod_param_idx == arg_idx:
-                    # Find all uses of var_name after the call site
-                    # We need to find successor nodes in CFG that use var_name
-                    successors = []
-                    visited = set()
-                    queue = [call_site_id]
+            param_mods = [(mod_param_idx, mod_node, mod_statement_id)
+                          for mod_param_idx, mod_node, mod_statement_id in mods
+                          if mod_param_idx == arg_idx]
 
-                    while queue:
-                        current = queue.pop(0)
-                        if current in visited:
+            if not param_mods:
+                continue
+
+            # Determine which modification(s) reach the function exit
+            # Use CFG to find which modifications are NOT killed by subsequent modifications
+            # A modification is "live" at exit if no other modification of the same param comes after it
+            reaching_mods = []
+
+            for mod_param_idx, mod_node, mod_statement_id in param_mods:
+                # Check if any other modification comes after this one in the CFG
+                is_killed = False
+
+                # BFS from this modification site to see if we hit another modification before exit
+                visited_in_func = set()
+                queue_in_func = [mod_statement_id]
+
+                while queue_in_func:
+                    current = queue_in_func.pop(0)
+                    if current in visited_in_func:
+                        continue
+                    visited_in_func.add(current)
+
+                    # Check CFG successors within the function
+                    for edge in cfg_graph.out_edges(current):
+                        successor = edge[1]
+
+                        # Skip if already visited
+                        if successor in visited_in_func:
                             continue
-                        visited.add(current)
 
-                        # Check if this node uses var_name
-                        uses_var = False
-                        defines_var = False
-                        if current != call_site_id and current in rda_table:
-                            for used in rda_table[current]["use"]:
-                                if used.name == var_name:
-                                    uses_var = True
-                                    successors.append(current)
-                                    break  # Found a use at this node
+                        # Check if this successor is another modification of the same parameter
+                        for other_mod_idx, other_mod_node, other_mod_id in param_mods:
+                            if other_mod_id == successor and other_mod_id != mod_statement_id:
+                                # This modification is killed by a later one
+                                is_killed = True
+                                break
 
-                            # Check if this node also defines var_name
-                            for defined in rda_table[current]["def"]:
-                                if defined.name == var_name:
-                                    defines_var = True
-                                    break
+                        if is_killed:
+                            break
 
-                        # Continue exploring if:
-                        # 1. We're at the call site
-                        # 2. We haven't found a use yet at this node
-                        # 3. We found a use but it's also defined (pass-through like another function call)
-                        if current == call_site_id or not uses_var or (uses_var and defines_var):
-                            for edge in cfg_graph.out_edges(current):
-                                if edge[1] not in visited:
-                                    queue.append(edge[1])
+                        # Continue BFS within the function (stop at function boundaries)
+                        edge_data = cfg_graph.get_edge_data(*edge)
+                        if edge_data:
+                            edge_label = edge_data.get(0, {}).get('label', '')
+                            # Don't follow return edges (they leave the function)
+                            if 'return' not in edge_label:
+                                queue_in_func.append(successor)
 
-                    # Add edges from modification site to uses after call
-                    for use_site in successors:
-                        add_edge(final_graph, mod_statement_id, use_site,
-                               {'dataflow_type': 'comesFrom',
-                                'edge_type': 'DFG_edge',
-                                'color': '#00A3FF',
-                                'used_def': var_name,
-                                'interprocedural': 'modification_to_use'})
+                    if is_killed:
+                        break
+
+                if not is_killed:
+                    reaching_mods.append((mod_param_idx, mod_node, mod_statement_id))
+
+            # Only create edges for modifications that reach the function exit
+            for mod_param_idx, mod_node, mod_statement_id in reaching_mods:
+                # Find all uses of var_name after the call site
+                # We need to find successor nodes in CFG that use var_name
+                successors = []
+                visited = set()
+                queue = [call_site_id]
+
+                while queue:
+                    current = queue.pop(0)
+                    if current in visited:
+                        continue
+                    visited.add(current)
+
+                    # Check if this node uses var_name
+                    uses_var = False
+                    defines_var = False
+                    if current != call_site_id and current in rda_table:
+                        for used in rda_table[current]["use"]:
+                            if used.name == var_name:
+                                uses_var = True
+                                successors.append(current)
+                                break  # Found a use at this node
+
+                        # Check if this node also defines var_name
+                        for defined in rda_table[current]["def"]:
+                            if defined.name == var_name:
+                                defines_var = True
+                                break
+
+                    # Continue exploring if:
+                    # 1. We're at the call site
+                    # 2. We haven't found a use yet at this node
+                    # 3. We found a use but it's also defined (pass-through like another function call)
+                    if current == call_site_id or not uses_var or (uses_var and defines_var):
+                        for edge in cfg_graph.out_edges(current):
+                            if edge[1] not in visited:
+                                queue.append(edge[1])
+
+                # Add edges from modification site to uses after call
+                for use_site in successors:
+                    add_edge(final_graph, mod_statement_id, use_site,
+                           {'dataflow_type': 'comesFrom',
+                            'edge_type': 'DFG_edge',
+                            'color': '#00A3FF',
+                            'used_def': var_name,
+                            'interprocedural': 'modification_to_use'})
 
 
 def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
@@ -3188,9 +3251,14 @@ def add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table):
         if edge_data and len(edge_data) > 0:
             edge_data = edge_data[0]
             label = edge_data.get("label", "")
+            controlflow_type = edge_data.get("controlflow_type", "")
 
-            # Check if this is a function call edge
-            if label.startswith("function_call|"):
+            # Check if this is a function call edge (including method calls)
+            # Note: label may be just "function_call" or "method_call", but controlflow_type has the full info
+            is_function_call = label.startswith("function_call") or controlflow_type.startswith("function_call")
+            is_method_call = label.startswith("method_call") or controlflow_type.startswith("method_call")
+
+            if is_function_call or is_method_call:
                 call_site_id = edge[0]     # Call site
                 func_def_id = edge[1]      # Function definition
 
