@@ -1,3 +1,2 @@
-In fig2.cpp, there is a call by reference to a function inside a class.
-While the tool can handle call by reference to a normal function, it appears that it can't do the same if the function resides inside a class.
-Add an edge from 17_ to 9_, and another from 11_ to 18_
+1.  Can't handle functions with array input, creates disconnected CFG and DFG in both C an C++
+    Sending an array to a function is the same as sending a pointer
