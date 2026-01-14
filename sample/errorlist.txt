@@ -1,0 +1,7 @@
+CFG
+1. Edge for the constructor call. First BaseClass constructor, then NS1::DerivedClass constructor
+2. Edge for the call to mutate()
+3. At the end of main(), call to destructor. First NS1::DerivedClass destructor, then BaseClass destructor
+
+DFG
+1. mutate() is pass by reference. There should be an edge from the variable x to mutate()
