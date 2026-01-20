@@ -56,4 +56,5 @@ int main() {
     BaseClass* baseptr = &obj_1;
     int x = 100;
     baseptr->mutate(&x);
+    std::cout << x;
 }
