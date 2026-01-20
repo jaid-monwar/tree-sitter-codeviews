@@ -39,9 +39,7 @@ digraph  {
 183 -> 188  [color="#00A3FF", dataflow_type=comesFrom, edge_type=DFG_edge, key=0, used_def=obj_1];
 188 -> 200  [color="#00A3FF", dataflow_type=comesFrom, edge_type=DFG_edge, key=0, used_def=baseptr];
 195 -> 200  [color="#00A3FF", dataflow_type=comesFrom, edge_type=DFG_edge, key=0, used_def=x];
-195 -> 208  [color="#00A3FF", dataflow_type=comesFrom, edge_type=DFG_edge, key=0, used_def=x];
 200 -> 93  [argument_index=0, color="#00A3FF", dataflow_type=comesFrom, edge_type=DFG_edge, interprocedural=argument_to_parameter, key=0, used_def=k];
 208 -> 79  [color="#C44569", dataflow_type=destructor_call, edge_type=DFG_edge, key=0, object_name=this];
 215 -> 25  [color="#C44569", dataflow_type=base_destructor_call, edge_type=DFG_edge, key=0, object_name=this];
-216 -> 25  [color="#C44569", dataflow_type=base_destructor_call, edge_type=DFG_edge, key=0, object_name=this];
 }

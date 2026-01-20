@@ -303,17 +303,22 @@ def recursively_get_children_of_types(node, st_types, check_list=None,
 class Identifier:
     """Represents a variable at a specific line with scope information"""
 
-    def __init__(self, parser, node, line=None, declaration=False, full_ref=None, method_call=False, has_initializer=False):
+    def __init__(self, parser, node, line=None, declaration=False, full_ref=None, method_call=False, has_initializer=False,
+                 is_pointer_modification_at_call_site=False):
         self.core = st(node)
         self.unresolved_name = st(full_ref) if full_ref else st(node)
-        self.base_name = self._resolve_name(node, full_ref, parser) 
-        self.name = self.base_name  
+        self.base_name = self._resolve_name(node, full_ref, parser)
+        self.name = self.base_name
         self.line = line
         self.declaration = declaration
-        self.has_initializer = has_initializer  
+        self.has_initializer = has_initializer
         self.method_call = method_call
+        # Flag to indicate this definition represents a pointer modification at a call site.
+        # Such definitions are used for RDA kill semantics but should not create intraprocedural edges
+        # because interprocedural modification_to_use edges will be created instead.
+        self.is_pointer_modification_at_call_site = is_pointer_modification_at_call_site
         if method_call and node.type == "qualified_identifier":
-            self.satisfied = False  
+            self.satisfied = False
         else:
             self.satisfied = method_call  
 
@@ -582,7 +587,8 @@ def extract_operator_text(assign_node, left_node, right_node):
 
 
 def add_entry(parser, rda_table, statement_id, used=None, defined=None,
-              declaration=False, core=None, method_call=False, has_initializer=False):
+              declaration=False, core=None, method_call=False, has_initializer=False,
+              is_pointer_modification_at_call_site=False):
     if statement_id not in rda_table:
         rda_table[statement_id] = defaultdict(list)
 
@@ -804,7 +810,8 @@ def add_entry(parser, rda_table, statement_id, used=None, defined=None,
         set_add(rda_table[statement_id]["def"],
                Identifier(parser, defined, statement_id,
                         full_ref=core, declaration=declaration,
-                        method_call=method_call, has_initializer=has_initializer))
+                        method_call=method_call, has_initializer=has_initializer,
+                        is_pointer_modification_at_call_site=is_pointer_modification_at_call_site))
     else:
         set_add(rda_table[statement_id]["use"],
                Identifier(parser, used, statement_id, full_ref=core,
@@ -1338,6 +1345,9 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
 
             function_node = root_node.child_by_field_name("function")
             function_name = None
+            # For method calls via field expressions (e.g., obj->method() or obj.method()),
+            # we need to extract just the method name for metadata lookup
+            method_name_for_lookup = None
 
             if function_node:
                 function_name = st(function_node)
@@ -1346,6 +1356,10 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                     argument = function_node.child_by_field_name("argument")
                     if argument:
                         add_entry(parser, rda_table, parent_id, used=argument)
+                    # Extract the method name for pointer_modifications lookup
+                    field = function_node.child_by_field_name("field")
+                    if field:
+                        method_name_for_lookup = st(field)
                 elif function_node.type in variable_type:
                     add_entry(parser, rda_table, parent_id, used=function_node, method_call=True)
                 elif function_node.type == "qualified_identifier":
@@ -1408,9 +1422,12 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
 
                     if not is_input_function and not is_variadic_macro:
                         modifies_params = set()
-                        if function_name and function_metadata and function_name in function_metadata:
-                            if pointer_modifications and function_name in pointer_modifications:
-                                modifies_params = pointer_modifications[function_name]
+                        # Use method_name_for_lookup for field expressions (e.g., obj->method()),
+                        # otherwise fall back to function_name
+                        lookup_name = method_name_for_lookup if method_name_for_lookup else function_name
+                        if lookup_name and function_metadata and lookup_name in function_metadata:
+                            if pointer_modifications and lookup_name in pointer_modifications:
+                                modifies_params = pointer_modifications[lookup_name]
 
                         is_modified_param = idx in modifies_params
 
@@ -1424,11 +1441,13 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                                     if inner_arg.type in variable_type:
                                         add_entry(parser, rda_table, parent_id, used=inner_arg)
                                         add_entry(parser, rda_table, parent_id,
-                                                 defined=inner_arg, declaration=False)
+                                                 defined=inner_arg, declaration=False,
+                                                 is_pointer_modification_at_call_site=True)
                                     elif inner_arg.type in ["field_expression", "subscript_expression"]:
                                         add_entry(parser, rda_table, parent_id, used=inner_arg)
                                         add_entry(parser, rda_table, parent_id,
-                                                 defined=inner_arg, declaration=False)
+                                                 defined=inner_arg, declaration=False,
+                                                 is_pointer_modification_at_call_site=True)
                                         if inner_arg.type == "subscript_expression":
                                             index_expr = inner_arg.child_by_field_name("index")
                                             if index_expr:
@@ -1448,16 +1467,19 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                                         if inner_arg.type in variable_type:
                                             add_entry(parser, rda_table, parent_id, used=inner_arg)
                                             add_entry(parser, rda_table, parent_id,
-                                                     defined=inner_arg, declaration=False)
+                                                     defined=inner_arg, declaration=False,
+                                                     is_pointer_modification_at_call_site=True)
                                         elif inner_arg.type in ["field_expression", "subscript_expression"]:
                                             add_entry(parser, rda_table, parent_id, used=inner_arg)
                                             add_entry(parser, rda_table, parent_id,
-                                                     defined=inner_arg, declaration=False)
+                                                     defined=inner_arg, declaration=False,
+                                                     is_pointer_modification_at_call_site=True)
                                     continue
 
                             elif arg.type in variable_type + ["field_expression"]:
                                 add_entry(parser, rda_table, parent_id, used=arg)
-                                add_entry(parser, rda_table, parent_id, defined=arg, declaration=False)
+                                add_entry(parser, rda_table, parent_id, defined=arg, declaration=False,
+                                         is_pointer_modification_at_call_site=True)
                                 continue
 
                     if arg.type in variable_type + ["field_expression"]:
@@ -1934,6 +1956,10 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                 'used_def': used.name})
 
                     for available_def in matching_defs:
+                        # Skip definitions that are pointer modification placeholders at call sites.
+                        # These exist only for RDA kill semantics; interprocedural edges will be added separately.
+                        if getattr(available_def, 'is_pointer_modification_at_call_site', False):
+                            continue
                         if available_def.line != node:
                             add_edge(final_graph, available_def.line, node,
                                    {'dataflow_type': 'comesFrom',
@@ -1943,6 +1969,10 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                     used.satisfied = True
             elif matching_defs:
                 for available_def in matching_defs:
+                    # Skip definitions that are pointer modification placeholders at call sites.
+                    # These exist only for RDA kill semantics; interprocedural edges will be added separately.
+                    if getattr(available_def, 'is_pointer_modification_at_call_site', False):
+                        continue
                     if available_def.line != node:
                         add_edge(final_graph, available_def.line, node,
                                {'dataflow_type': 'comesFrom',
@@ -2955,7 +2985,55 @@ def dfg_cpp(properties, CFG_results):
     cfg_graph = copy.deepcopy(CFG_results.graph)
     node_list = CFG_results.node_list
 
+    # Get CFG records for implicit_return_map lookup
+    cfg_records = CFG_results.CFG.records if hasattr(CFG_results, 'CFG') and hasattr(CFG_results.CFG, 'records') else {}
+    implicit_return_map = cfg_records.get('implicit_return_map', {})
+
+    # Build reverse map: implicit_return_id -> destructor_function_id
+    implicit_return_to_destructor = {ir_id: fn_id for fn_id, ir_id in implicit_return_map.items()}
+
     processed_edges = []
+
+    # First pass: collect all called destructors (targets of scope_exit_destructor edges)
+    called_destructors = set()
+    destructor_chain_edges = []  # Collect destructor_chain edges for later processing
+    base_destructor_edges = []   # Collect base_destructor_call edges for filtering
+
+    for edge in list(cfg_graph.edges()):
+        edge_data = cfg_graph.get_edge_data(*edge)
+        if edge_data and len(edge_data) > 0:
+            edge_data = edge_data[0]
+            label = edge_data.get("label", "")
+
+            if label == "scope_exit_destructor":
+                # edge[1] is the destructor function being called
+                called_destructors.add(edge[1])
+            elif label.startswith("destructor_chain|"):
+                destructor_chain_edges.append(edge)
+            elif label == "base_destructor_call":
+                base_destructor_edges.append(edge)
+
+    # Expand called_destructors to include destructors reachable via destructor_chain
+    # destructor_chain edges connect implicit_return of one destructor to another destructor
+    changed = True
+    while changed:
+        changed = False
+        for edge in destructor_chain_edges:
+            source_ir = edge[0]  # implicit_return of some destructor
+            target_destructor = edge[1]  # next destructor in chain
+            # Check if source implicit_return belongs to a called destructor
+            source_destructor = implicit_return_to_destructor.get(source_ir)
+            if source_destructor and source_destructor in called_destructors:
+                if target_destructor not in called_destructors:
+                    called_destructors.add(target_destructor)
+                    changed = True
+
+    # Build set of valid implicit_return nodes (those belonging to called destructors)
+    valid_implicit_returns = set()
+    for destructor_id in called_destructors:
+        ir_id = implicit_return_map.get(destructor_id)
+        if ir_id:
+            valid_implicit_returns.add(ir_id)
 
     for edge in list(cfg_graph.edges()):
         edge_data = cfg_graph.get_edge_data(*edge)
@@ -2994,7 +3072,11 @@ def dfg_cpp(properties, CFG_results):
                 processed_edges.append(edge)
 
             elif label == "base_destructor_call":
-                processed_edges.append(edge)
+                # Only include base_destructor_call edges whose source implicit_return
+                # belongs to a destructor that is actually called
+                source_ir = edge[0]
+                if source_ir in valid_implicit_returns:
+                    processed_edges.append(edge)
 
             elif label == "virtual_call":
                 processed_edges.append(edge)
