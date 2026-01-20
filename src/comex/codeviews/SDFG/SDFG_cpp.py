@@ -909,7 +909,24 @@ def is_return_value_used(call_expr_statement):
 
 
 def collect_function_metadata(parser):
-    metadata = {}
+    """
+    Collect metadata about function definitions.
+
+    Returns two dicts:
+    - metadata_by_name: simple_name -> metadata (may overwrite for same-named functions)
+    - metadata_by_id: func_def_id -> metadata (unique per function)
+
+    Each metadata entry contains:
+    - "params": list of (param_name, is_pointer, is_reference, param_idx)
+    - "node": the function_definition AST node
+    - "func_name": the simple function name
+
+    Note: metadata_by_name is kept for backward compatibility but may lose information
+    when multiple functions have the same name. Use metadata_by_id for precise lookup.
+    """
+    metadata_by_name = {}
+    metadata_by_id = {}
+    index = parser.index
 
     for node in traverse_tree(parser.tree.root_node):
         if node.type == "function_definition":
@@ -980,12 +997,19 @@ def collect_function_metadata(parser):
                     break
 
             if func_name:
-                metadata[func_name] = {
+                func_def_id = get_index(node, index)
+                meta = {
                     "params": params,
-                    "node": node
+                    "node": node,
+                    "func_name": func_name
                 }
+                # Store by name for backward compatibility (may overwrite)
+                metadata_by_name[func_name] = meta
+                # Store by ID for precise lookup (unique)
+                if func_def_id is not None:
+                    metadata_by_id[func_def_id] = meta
 
-    return metadata
+    return metadata_by_name, metadata_by_id
 
 
 def analyze_pointer_modifications(parser, function_metadata):
@@ -2341,21 +2365,30 @@ def collect_call_site_information(parser, function_metadata, cfg_graph):
     return call_sites
 
 
-def find_modification_sites(parser, function_metadata, pointer_modifications):
+def find_modification_sites(parser, function_metadata_by_id, pointer_modifications):
     """
     Find all modification sites for pointer/reference parameters inside functions.
 
     For each function, find all statements where a pointer/reference parameter is modified.
 
+    Args:
+        parser: C++ parser
+        function_metadata_by_id: Dict mapping func_def_id -> metadata (from collect_function_metadata)
+        pointer_modifications: Dict mapping func_name -> set of modified param indices
+
     Returns:
-        Dict mapping function_name -> list of (param_idx, modification_node, statement_id)
+        Tuple of:
+        - modification_sites_by_name: Dict mapping function_name -> list of (param_idx, modification_node, statement_id)
+        - modification_sites_by_id: Dict mapping func_def_id -> list of (param_idx, modification_node, statement_id)
     """
-    modification_sites = {}
+    modification_sites_by_name = {}
+    modification_sites_by_id = {}
     index = parser.index
 
-    for func_name, meta in function_metadata.items():
+    for func_def_id, meta in function_metadata_by_id.items():
         modifications = []
         func_node = meta["node"]
+        func_name = meta.get("func_name", "")
         modified_params = pointer_modifications.get(func_name, set())
 
         param_name_to_idx = {}
@@ -2364,7 +2397,9 @@ def find_modification_sites(parser, function_metadata, pointer_modifications):
                 param_name_to_idx[param_name] = param_idx
 
         if not param_name_to_idx:
-            modification_sites[func_name] = modifications
+            if func_name:
+                modification_sites_by_name[func_name] = modifications
+            modification_sites_by_id[func_def_id] = modifications
             continue
 
         for node in traverse_tree(func_node):
@@ -2433,27 +2468,65 @@ def find_modification_sites(parser, function_metadata, pointer_modifications):
                     if statement_id is not None:
                         modifications.append((modification_param_idx, mod_node, statement_id))
 
-        modification_sites[func_name] = modifications
+        if func_name:
+            modification_sites_by_name[func_name] = modifications
+        modification_sites_by_id[func_def_id] = modifications
 
-    return modification_sites
+    return modification_sites_by_name, modification_sites_by_id
 
 
-def add_interprocedural_edges(final_graph, parser, call_sites, modification_sites,
+def get_cfg_call_targets(cfg_graph, call_site_id):
+    """
+    Get the function definition IDs that are called from a given call site,
+    based on CFG edges (method_call, virtual_call, function_call).
+
+    This uses the CFG's resolution of virtual dispatch, which correctly handles
+    pointer_targets to determine the actual concrete type being called.
+
+    Args:
+        cfg_graph: The CFG graph
+        call_site_id: The call site node ID
+
+    Returns:
+        Set of function definition IDs that are actually called from this call site
+    """
+    target_func_ids = set()
+
+    for edge in cfg_graph.out_edges(call_site_id):
+        edge_data = cfg_graph.get_edge_data(*edge)
+        if edge_data and len(edge_data) > 0:
+            edge_data = edge_data[0]
+            label = edge_data.get("label", "")
+
+            # Check for method_call, virtual_call, or function_call edges
+            # Labels may be "method_call", "method_call|123", "virtual_call|456", etc.
+            if (label.startswith("method_call") or
+                label.startswith("virtual_call") or
+                label.startswith("function_call")):
+                target_func_ids.add(edge[1])
+
+    return target_func_ids
+
+
+def add_interprocedural_edges(final_graph, parser, call_sites, modification_sites_by_id,
                                function_metadata, cfg_graph, rda_table):
     """
     Add interprocedural DFG edges for pass-by-reference.
 
     For each call site where &var or reference is passed to a pointer/reference parameter:
-    1. Add edge from call site to function definition (argument-parameter binding)
-    2. Add edges from modification sites inside function to uses after the call
+    1. Use CFG edges to determine which function(s) are actually called (handles virtual dispatch)
+    2. Add edges from modification sites inside the ACTUALLY CALLED function to uses after the call
+
+    This function uses CFG edge information to correctly resolve virtual dispatch,
+    ensuring that only modifications from the concrete type's implementation are connected.
 
     Args:
         final_graph: The DFG graph to add edges to
         parser: C++ parser
         call_sites: List of call site information from collect_call_site_information()
-        modification_sites: Dict from find_modification_sites()
+        modification_sites_by_id: Dict mapping func_def_id -> list of modifications
         function_metadata: Dict from collect_function_metadata()
-        cfg_graph: Control flow graph
+        cfg_graph: Control flow graph (contains virtual dispatch resolution)
         rda_table: RDA table with def/use information
     """
     index = parser.index
@@ -2463,29 +2536,37 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
         function_name = call_site_info["function_name"]
         pass_by_ref_args = call_site_info["pass_by_ref_args"]
 
-        if function_name not in function_metadata or function_name not in modification_sites:
-            continue
+        # Get the actual target function(s) from CFG edges
+        # This uses the CFG's resolution of virtual dispatch (pointer_targets)
+        target_func_ids = get_cfg_call_targets(cfg_graph, call_site_id)
 
-        func_meta = function_metadata[function_name]
-        func_node = func_meta["node"]
-        func_def_id = get_index(func_node, index)
-
-        if func_def_id is None:
+        if not target_func_ids:
+            # Fallback: if no CFG edges found, skip this call site
+            # (This shouldn't normally happen for valid method calls)
             continue
 
         for arg_idx, var_name, var_node in pass_by_ref_args:
-            mods = modification_sites.get(function_name, [])
-            param_mods = [(mod_param_idx, mod_node, mod_statement_id)
-                          for mod_param_idx, mod_node, mod_statement_id in mods
-                          if mod_param_idx == arg_idx]
+            # Collect modifications from ALL target functions
+            # (In case of true polymorphism with unknown concrete type, there could be multiple)
+            all_param_mods = []
 
-            if not param_mods:
+            for func_def_id in target_func_ids:
+                mods = modification_sites_by_id.get(func_def_id, [])
+                for mod_param_idx, mod_node, mod_statement_id in mods:
+                    if mod_param_idx == arg_idx:
+                        all_param_mods.append((mod_param_idx, mod_node, mod_statement_id, func_def_id))
+
+            if not all_param_mods:
                 continue
 
             reaching_mods = []
 
-            for mod_param_idx, mod_node, mod_statement_id in param_mods:
+            for mod_param_idx, mod_node, mod_statement_id, func_def_id in all_param_mods:
                 is_killed = False
+
+                # Get all mods for this specific function to check for kills
+                func_mods = [(m_idx, m_node, m_id) for m_idx, m_node, m_id, f_id in all_param_mods
+                             if f_id == func_def_id and m_idx == mod_param_idx]
 
                 visited_in_func = set()
                 queue_in_func = [mod_statement_id]
@@ -2502,7 +2583,7 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
                         if successor in visited_in_func:
                             continue
 
-                        for other_mod_idx, other_mod_node, other_mod_id in param_mods:
+                        for other_mod_idx, other_mod_node, other_mod_id in func_mods:
                             if other_mod_id == successor and other_mod_id != mod_statement_id:
                                 is_killed = True
                                 break
@@ -2925,11 +3006,11 @@ def dfg_cpp(properties, CFG_results):
     lambda_map = discover_lambdas(parser, CFG_results)
     end_lambda_time = time.time()
 
-    function_metadata = collect_function_metadata(parser)
-    pointer_modifications = analyze_pointer_modifications(parser, function_metadata)
+    function_metadata_by_name, function_metadata_by_id = collect_function_metadata(parser)
+    pointer_modifications = analyze_pointer_modifications(parser, function_metadata_by_name)
 
     start_rda_init_time = time.time()
-    rda_table = build_rda_table(parser, CFG_results, lambda_map, function_metadata, pointer_modifications)
+    rda_table = build_rda_table(parser, CFG_results, lambda_map, function_metadata_by_name, pointer_modifications)
     end_rda_init_time = time.time()
 
     start_rda_time = time.time()
@@ -2941,10 +3022,10 @@ def dfg_cpp(properties, CFG_results):
         cfg_graph.nodes, processed_edges, properties, lambda_map, node_list, parser
     )
 
-    call_sites = collect_call_site_information(parser, function_metadata, cfg_graph)
-    modification_sites = find_modification_sites(parser, function_metadata, pointer_modifications)
-    add_interprocedural_edges(final_graph, parser, call_sites, modification_sites,
-                               function_metadata, cfg_graph, rda_table)
+    call_sites = collect_call_site_information(parser, function_metadata_by_name, cfg_graph)
+    modification_sites_by_name, modification_sites_by_id = find_modification_sites(parser, function_metadata_by_id, pointer_modifications)
+    add_interprocedural_edges(final_graph, parser, call_sites, modification_sites_by_id,
+                               function_metadata_by_name, cfg_graph, rda_table)
 
     add_argument_parameter_edges(final_graph, parser, cfg_graph, rda_table)
 
