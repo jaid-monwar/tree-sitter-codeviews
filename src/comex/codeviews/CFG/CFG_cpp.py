@@ -479,6 +479,121 @@ class CFGGraph_cpp(CFGGraph):
 
         return base_classes
 
+    def get_all_derived_classes(self, base_class_name):
+        """
+        Find all classes that derive (directly or indirectly) from the given base class.
+        Uses the inheritance information stored in self.records["extends"].
+
+        Args:
+            base_class_name: The name of the base class to find derived classes for
+
+        Returns:
+            A set of class names that derive from base_class_name
+        """
+        derived_classes = set()
+
+        # Build reverse inheritance map: base_class -> [derived_classes]
+        # self.records["extends"] maps derived_class -> [base_classes]
+        reverse_inheritance = {}
+        for derived, bases in self.records.get("extends", {}).items():
+            if not isinstance(bases, list):
+                bases = [bases]
+            for base in bases:
+                if base not in reverse_inheritance:
+                    reverse_inheritance[base] = []
+                reverse_inheritance[base].append(derived)
+
+        # BFS to find all direct and indirect derived classes
+        to_process = [base_class_name]
+        while to_process:
+            current_base = to_process.pop(0)
+            for derived in reverse_inheritance.get(current_base, []):
+                if derived not in derived_classes:
+                    derived_classes.add(derived)
+                    to_process.append(derived)  # Also find classes derived from this derived class
+
+        return derived_classes
+
+    def get_class_namespaces(self, class_name):
+        """
+        Find all namespaces that contain a class with the given name.
+        This is needed because function_list uses (namespace, fn_name) as keys
+        for namespaced classes, not (class_name, fn_name).
+
+        Args:
+            class_name: The class name to find namespaces for
+
+        Returns:
+            A set of namespace names (or None for non-namespaced classes)
+        """
+        namespaces = set()
+
+        # Look for constructors in function_list - they have fn_name == class_name
+        for ((ns_or_class, fn_name), _), _ in self.records.get("function_list", {}).items():
+            if fn_name == class_name:
+                # This is a constructor for this class
+                # ns_or_class is either the namespace (for namespaced classes)
+                # or the class name itself (for non-namespaced classes)
+                if ns_or_class == class_name:
+                    # Non-namespaced class: (class_name, class_name) pattern
+                    namespaces.add(None)
+                else:
+                    # Namespaced class: (namespace, class_name) pattern
+                    namespaces.add(ns_or_class)
+
+        return namespaces
+
+    def get_explicit_base_constructors_in_initializer_list(self, constructor_node, base_class_names):
+        """
+        Check which base class constructors are explicitly called in the constructor's
+        field_initializer_list.
+
+        Args:
+            constructor_node: The constructor function_definition node
+            base_class_names: Set of base class names for this class
+
+        Returns:
+            Set of base class names that have explicit constructor calls in the initializer list
+        """
+        explicit_base_calls = set()
+
+        if constructor_node is None:
+            return explicit_base_calls
+
+        # Find field_initializer_list in the constructor
+        field_init_list = None
+        for child in constructor_node.children:
+            if child.type == "field_initializer_list":
+                field_init_list = child
+                break
+
+        if not field_init_list:
+            return explicit_base_calls
+
+        # Check each field_initializer for base class constructor calls
+        for child in field_init_list.children:
+            if child.type == "field_initializer":
+                # Extract field name
+                for subchild in child.children:
+                    if subchild.type == "field_identifier":
+                        field_name = subchild.text.decode('utf-8')
+                        if field_name in base_class_names:
+                            explicit_base_calls.add(field_name)
+                        break
+                    elif subchild.type == "qualified_identifier":
+                        # Handle qualified base class names like NS::BaseClass
+                        field_name = subchild.text.decode('utf-8')
+                        # Check both full qualified name and simple name
+                        if field_name in base_class_names:
+                            explicit_base_calls.add(field_name)
+                        # Also check if the last part matches
+                        simple_name = field_name.split("::")[-1]
+                        if simple_name in base_class_names:
+                            explicit_base_calls.add(simple_name)
+                        break
+
+        return explicit_base_calls
+
     def is_jump_statement(self, node):
         """
         Check if a node is a jump statement that transfers control elsewhere.
@@ -1613,14 +1728,32 @@ class CFGGraph_cpp(CFGGraph):
             class_name = None
             template_args = None
 
+            # Also track namespace prefix for disambiguating classes with same name in different namespaces
+            namespace_prefix = None
+
             if type_node and type_node.type == "type_identifier":
                 class_name = type_node.text.decode('utf-8')
+            elif type_node and type_node.type == "qualified_identifier":
+                # Handle qualified type names like NS1::DerivedClass
+                # Extract both the namespace prefix and the actual class name
+                full_name = type_node.text.decode('utf-8')
+                parts = full_name.split("::")
+                class_name = parts[-1]  # Get last part (e.g., "DerivedClass" from "NS1::DerivedClass")
+                if len(parts) > 1:
+                    namespace_prefix = "::".join(parts[:-1])  # Get namespace part (e.g., "NS1" from "NS1::DerivedClass")
             elif type_node and type_node.type == "template_type":
                 # Extract base class name and template arguments
                 # Structure: template_type -> name (type_identifier) + arguments (template_argument_list)
                 for child in type_node.named_children:
                     if child.type == "type_identifier":
                         class_name = child.text.decode('utf-8')
+                    elif child.type == "qualified_identifier":
+                        # Handle qualified template types like NS::Container<T>
+                        full_name = child.text.decode('utf-8')
+                        parts = full_name.split("::")
+                        class_name = parts[-1]
+                        if len(parts) > 1:
+                            namespace_prefix = "::".join(parts[:-1])
                     elif child.type == "template_argument_list":
                         # Extract template arguments as a tuple of strings
                         template_args = []
@@ -1749,22 +1882,24 @@ class CFGGraph_cpp(CFGGraph):
                                     signature = (f"const {class_name}&",)  # Const lvalue reference
                                     break
 
+                            # Use composite key: ((namespace_prefix, class_name), signature)
+                            # This allows disambiguation between NS1::DerivedClass and NS2::DerivedClass
                             if args_node:
                                 # Parameterized constructor with explicit arguments
                                 signature = self.get_call_signature(args_node)
-                                key = (class_name, signature)
+                                key = ((namespace_prefix, class_name), signature)
                                 if key not in self.records["constructor_calls"]:
                                     self.records["constructor_calls"][key] = []
                                 self.records["constructor_calls"][key].append((call_index, parent_index))
                             elif is_move:
                                 # Move constructor
-                                key = (class_name, signature)
+                                key = ((namespace_prefix, class_name), signature)
                                 if key not in self.records["constructor_calls"]:
                                     self.records["constructor_calls"][key] = []
                                 self.records["constructor_calls"][key].append((call_index, parent_index))
                             elif is_copy:
                                 # Copy constructor
-                                key = (class_name, signature)
+                                key = ((namespace_prefix, class_name), signature)
                                 if key not in self.records["constructor_calls"]:
                                     self.records["constructor_calls"][key] = []
                                 self.records["constructor_calls"][key].append((call_index, parent_index))
@@ -1796,7 +1931,7 @@ class CFGGraph_cpp(CFGGraph):
                             else:
                                 # Default constructor: ResourceHolder obj1;
                                 signature = tuple()  # Empty signature for default constructor
-                                key = (class_name, signature)
+                                key = ((namespace_prefix, class_name), signature)
                                 if key not in self.records["constructor_calls"]:
                                     self.records["constructor_calls"][key] = []
                                 self.records["constructor_calls"][key].append((call_index, parent_index))
@@ -1821,7 +1956,7 @@ class CFGGraph_cpp(CFGGraph):
                                     break
 
                             signature = tuple()  # Empty signature for default constructor
-                            key = (class_name, signature)
+                            key = ((namespace_prefix, class_name), signature)
                             if key not in self.records["constructor_calls"]:
                                 self.records["constructor_calls"][key] = []
                             self.records["constructor_calls"][key].append((call_index, parent_index))
@@ -2935,20 +3070,55 @@ class CFGGraph_cpp(CFGGraph):
 
                 # Find matching function(s) with signature matching for overload resolution
                 matching_functions = []
-                for ((class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+
+                # Get all derived classes for polymorphic dispatch detection
+                # If the object's declared class has derived classes, method calls through it
+                # could be virtual/polymorphic
+                derived_classes = set()
+                derived_class_namespaces = set()  # Namespaces containing derived classes
+                if object_class:
+                    derived_classes = self.get_all_derived_classes(object_class)
+                    # For each derived class, find its namespace(s)
+                    for derived_class in derived_classes:
+                        namespaces = self.get_class_namespaces(derived_class)
+                        derived_class_namespaces.update(namespaces)
+
+                # First pass: check if any derived class has an implementation of this method
+                # If so, this is potentially a polymorphic call through a base class pointer/reference
+                # Note: function_list key is ((namespace_or_class, fn_name), sig) where:
+                #   - For namespaced classes: namespace_or_class is the namespace
+                #   - For non-namespaced classes: namespace_or_class is the class name
+                has_derived_implementation = False
+                if derived_classes or derived_class_namespaces:
+                    for ((ns_or_class, fn_name), fn_sig), fn_id in self.records["function_list"].items():
+                        name_matches = (fn_name == method_name or fn_name.endswith("::" + method_name))
+                        # Check if this is from a derived class (either by class name or namespace)
+                        if name_matches and (ns_or_class in derived_classes or ns_or_class in derived_class_namespaces):
+                            has_derived_implementation = True
+                            break
+
+                # Determine allowed class/namespace identifiers for method matching
+                # Include base class and all derived classes/namespaces if this could be a polymorphic call
+                allowed_identifiers = {object_class} if object_class else set()
+                if has_derived_implementation and object_class:
+                    # This is a polymorphic call - include implementations from derived classes
+                    allowed_identifiers.update(derived_classes)
+                    allowed_identifiers.update(derived_class_namespaces)
+                    # Remove None if present (represents non-namespaced)
+                    allowed_identifiers.discard(None)
+
+                for ((ns_or_class, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                     # Match method name - handle both exact matches and out-of-line definitions
                     # (e.g., "displayPrivateMember" should match "FriendClass::displayPrivateMember")
                     name_matches = (fn_name == method_name or fn_name.endswith("::" + method_name))
 
-                    # IMPORTANT FIX: If we know the object's class, only match methods from that class
-                    if object_class and class_name != object_class:
-                        # print(f"DEBUG: Skipping {class_name}::{fn_name} (looking for {object_class})")
+                    # If we know the object's class, only match methods from that class
+                    # OR from derived classes/namespaces if this is a polymorphic call through base pointer
+                    if object_class and ns_or_class not in allowed_identifiers:
                         continue
-                    # elif object_class:
-                    #     print(f"DEBUG: Matching {class_name}::{fn_name} for object of type {object_class}")
 
                     if name_matches and self.signatures_match(signature, fn_sig):
-                        matching_functions.append((fn_id, class_name))
+                        matching_functions.append((fn_id, ns_or_class))
 
                 # Determine target function(s) and whether it's a virtual call
                 target_functions = []  # List of (fn_id, is_virtual) tuples
@@ -3329,13 +3499,25 @@ class CFGGraph_cpp(CFGGraph):
                                             self.add_edge(return_id, return_target, "operator_return")
 
         # Process constructor calls
-        for (class_name, signature), call_list in self.records["constructor_calls"].items():
+        # Key format: ((namespace_prefix, class_name), signature)
+        for ((namespace_prefix, class_name), signature), call_list in self.records["constructor_calls"].items():
             # Find matching constructor in function_list
             # Constructors are stored with the class name as the function name
+            # For namespaced classes, fn_class_name is the namespace (e.g., "NS1") and fn_name is the class (e.g., "DerivedClass")
+            # For non-namespaced classes, fn_class_name == fn_name (e.g., ("BaseClass", "BaseClass"))
             found_constructor = False
             for ((fn_class_name, fn_name), fn_sig), fn_id in self.records["function_list"].items():
                 # Match by class name and function name
-                if fn_class_name == class_name and fn_name == class_name:
+                # Case 1: Non-namespaced constructor (fn_class_name == class_name == fn_name, namespace_prefix is None)
+                # Case 2: Namespaced constructor (fn_class_name == namespace_prefix and fn_name == class_name)
+                is_constructor_match = False
+                if namespace_prefix is None:
+                    # Non-namespaced declaration: look for (class_name, class_name) constructor
+                    is_constructor_match = (fn_class_name == class_name and fn_name == class_name)
+                else:
+                    # Namespaced declaration: look for (namespace_prefix, class_name) constructor
+                    is_constructor_match = (fn_class_name == namespace_prefix and fn_name == class_name)
+                if is_constructor_match:
                     # Check signature match with flexibility for special constructors
                     sig_match = False
 
@@ -3389,18 +3571,99 @@ class CFGGraph_cpp(CFGGraph):
                     if sig_match:
                         # Found matching constructor with correct signature
                         found_constructor = True
+
+                        # Get the constructor function node
+                        fn_key = index_to_key.get(fn_id)
+                        fn_node = self.node_list.get(fn_key) if fn_key else None
+
+                        # Check if this class has base classes that need implicit constructor calls
+                        # In C++, base class constructors are called BEFORE derived class constructor
+                        base_classes = []
+                        if class_name in self.records.get("extends", {}):
+                            base_classes = self.records["extends"][class_name]
+                            if not isinstance(base_classes, list):
+                                base_classes = [base_classes]
+
+                        # If no inheritance info in records, try to extract from AST
+                        if not base_classes and fn_node:
+                            containing_class = self.get_containing_class(fn_node)
+                            if containing_class:
+                                base_classes = list(self.get_base_classes(containing_class))
+
+                        # Determine which base class constructors are explicitly called in initializer list
+                        explicit_base_calls = set()
+                        if fn_node and base_classes:
+                            explicit_base_calls = self.get_explicit_base_constructors_in_initializer_list(
+                                fn_node, set(base_classes)
+                            )
+
+                        # Find base classes that need implicit default constructor calls
+                        implicit_base_constructors = []  # [(base_class_name, base_constructor_id)]
+                        for base_class in base_classes:
+                            if base_class not in explicit_base_calls:
+                                # This base class needs an implicit default constructor call
+                                # Find the base class constructor (default constructor with no args)
+                                base_constructor_id = None
+                                base_constructor_key = ((base_class, base_class), ())
+                                if base_constructor_key in self.records["function_list"]:
+                                    base_constructor_id = self.records["function_list"][base_constructor_key]
+                                else:
+                                    # Try to find any constructor for the base class
+                                    for ((bc_class, bc_name), bc_sig), bc_id in self.records["function_list"].items():
+                                        if bc_class == base_class and bc_name == base_class:
+                                            # Found a constructor - prefer default (empty signature)
+                                            if bc_sig == ():
+                                                base_constructor_id = bc_id
+                                                break
+                                            elif base_constructor_id is None:
+                                                base_constructor_id = bc_id
+
+                                if base_constructor_id:
+                                    implicit_base_constructors.append((base_class, base_constructor_id))
+
                         for call_id, parent_id in call_list:
-                            # Add call edge: declaration -> constructor
-                            self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
+                            if implicit_base_constructors:
+                                # Chain: declaration -> base_constructor(s) -> derived_constructor
+                                # For multiple inheritance, base constructors are called in declaration order
+                                prev_target = parent_id
+
+                                for base_class, base_constructor_id in implicit_base_constructors:
+                                    # Add edge from previous point to base constructor
+                                    if prev_target == parent_id:
+                                        # First in chain: declaration -> base constructor
+                                        self.add_edge(parent_id, base_constructor_id, f"implicit_base_constructor_call|{call_id}")
+                                    else:
+                                        # Subsequent: previous base constructor -> this base constructor
+                                        self.add_edge(prev_target, base_constructor_id, "implicit_base_constructor_call")
+
+                                    # Get last statement in base constructor to chain from
+                                    base_fn_key = index_to_key.get(base_constructor_id)
+                                    base_fn_node = self.node_list.get(base_fn_key) if base_fn_key else None
+                                    if base_fn_node:
+                                        base_last_stmt = self.get_last_statement_in_function_body(base_fn_node, self.node_list)
+                                        if base_last_stmt:
+                                            prev_target = base_last_stmt[0]  # last_stmt_id
+                                        else:
+                                            # Empty base constructor body - use base constructor entry
+                                            prev_target = base_constructor_id
+                                    else:
+                                        prev_target = base_constructor_id
+
+                                # Now connect to derived constructor
+                                # prev_target is now the last statement of the last base constructor
+                                if prev_target != parent_id:
+                                    self.add_edge(prev_target, fn_id, "base_constructor_return_to_derived")
+                                else:
+                                    # Fallback: direct edge if something went wrong
+                                    self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
+                            else:
+                                # No base classes - direct edge: declaration -> constructor
+                                self.add_edge(parent_id, fn_id, f"constructor_call|{call_id}")
 
                         # Add return edges: constructor return points -> next statement after declaration
                         # For constructors: always create return edges from last statement (no implicit return node)
                         # Constructors don't have explicit return statements, so we create edges directly
                         # from the last statement in the constructor body back to the call site
-
-                        # Get the constructor function node
-                        fn_key = index_to_key.get(fn_id)
-                        fn_node = self.node_list.get(fn_key) if fn_key else None
 
                         if fn_node:
                             # Iterate through each call site to create return edges
