@@ -69,6 +69,11 @@ class CFGGraph_cpp(CFGGraph):
         self.object_scope_map = {}  # var_name → scope_key
         self.scope_nodes = {}  # scope_key → actual_scope_node
 
+        # Track pointer-to-object mappings for precise virtual call resolution
+        # Maps pointer_var_name → (concrete_class_name, namespace_prefix)
+        # Used when a pointer is assigned from address of a concrete object: Base* p = &derived_obj;
+        self.pointer_targets = {}
+
         # Access parser data (created by parser_driver)
         self.symbol_table = self.parser.symbol_table
         self.declaration = self.parser.declaration
@@ -1851,6 +1856,41 @@ class CFGGraph_cpp(CFGGraph):
                                     is_pointer_declarator = True
                                     # DO NOT set var_name for pointer declarations - they don't need RAII tracking
                                     # Pointers don't have automatic destructor calls at scope exit
+                                    #
+                                    # BUT: Track pointer-to-object mappings for virtual call resolution
+                                    # Example: BaseClass* baseptr = &obj_1;
+                                    # If obj_1 has a known concrete type, we should track that baseptr points to it
+                                    ptr_var_name = None
+                                    # Extract the pointer variable name from the pointer_declarator
+                                    for ptr_child in declarator.children:
+                                        if ptr_child.type == "identifier":
+                                            ptr_var_name = ptr_child.text.decode('utf-8')
+                                            break
+
+                                    if ptr_var_name:
+                                        # Check if there's an initializer that's an address-of expression
+                                        value_node = child.child_by_field_name("value")
+                                        if value_node and value_node.type == "pointer_expression":
+                                            # Check if it's address-of (&) not dereference (*)
+                                            is_address_of = False
+                                            target_var = None
+                                            for pe_child in value_node.children:
+                                                if pe_child.type == "&":
+                                                    is_address_of = True
+                                                elif pe_child.type == "identifier" and is_address_of:
+                                                    target_var = pe_child.text.decode('utf-8')
+                                                    break
+
+                                            if is_address_of and target_var:
+                                                # Find the concrete type of target_var from scope_objects
+                                                for scope_key, obj_list in self.scope_objects.items():
+                                                    for obj_info in obj_list:
+                                                        # obj_info is (var_name, class_name, namespace_prefix, decl_id, order)
+                                                        if len(obj_info) >= 3 and obj_info[0] == target_var:
+                                                            concrete_class = obj_info[1]
+                                                            concrete_namespace = obj_info[2]
+                                                            self.pointer_targets[ptr_var_name] = (concrete_class, concrete_namespace)
+                                                            break
                                 # Handle other declarator types if needed
 
                             # Skip constructor call tracking for pointer declarations
@@ -3088,6 +3128,18 @@ class CFGGraph_cpp(CFGGraph):
                                 object_class = object_class.replace("*", "").replace("&", "").replace("class ", "").replace("struct ", "").strip()
                                 break
 
+                # Check if we have a known concrete type for this pointer from pointer_targets
+                # This is set when a pointer is assigned from address-of a concrete object
+                # Example: BaseClass* baseptr = &obj_1; where obj_1 is NS1::DerivedClass
+                known_concrete_type = None
+                known_concrete_namespace = None
+                if object_name and object_name in self.pointer_targets:
+                    known_concrete_type, known_concrete_namespace = self.pointer_targets[object_name]
+
+                # Also check runtime_types (for heap-allocated objects via new)
+                if object_name and not known_concrete_type and object_name in self.runtime_types:
+                    known_concrete_type = self.runtime_types[object_name]
+
                 # Find matching function(s) with signature matching for overload resolution
                 matching_functions = []
 
@@ -3121,9 +3173,19 @@ class CFGGraph_cpp(CFGGraph):
                 # Include base class and all derived classes/namespaces if this could be a polymorphic call
                 allowed_identifiers = {object_class} if object_class else set()
                 if has_derived_implementation and object_class:
-                    # This is a polymorphic call - include implementations from derived classes
-                    allowed_identifiers.update(derived_classes)
-                    allowed_identifiers.update(derived_class_namespaces)
+                    # Check if we know the exact concrete type at this call site
+                    # If so, we can resolve the virtual call statically to just that type's implementation
+                    if known_concrete_type:
+                        # We know the exact runtime type - only allow that specific class/namespace
+                        allowed_identifiers = set()
+                        allowed_identifiers.add(known_concrete_type)
+                        if known_concrete_namespace:
+                            allowed_identifiers.add(known_concrete_namespace)
+                    else:
+                        # Unknown concrete type - this is a true polymorphic call
+                        # Include implementations from all derived classes
+                        allowed_identifiers.update(derived_classes)
+                        allowed_identifiers.update(derived_class_namespaces)
                     # Remove None if present (represents non-namespaced)
                     allowed_identifiers.discard(None)
 
