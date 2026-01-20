@@ -52,7 +52,10 @@ digraph  {
 183 -> 12  [color=red, controlflow_type="implicit_base_constructor_call|183", edge_type=CFG_edge, key=0, label="implicit_base_constructor_call|183"];
 188 -> 195  [color=red, controlflow_type=next_line, edge_type=CFG_edge, key=0, label=next_line];
 195 -> 200  [color=red, controlflow_type=next_line, edge_type=CFG_edge, key=0, label=next_line];
+200 -> 79  [color=red, controlflow_type=scope_exit_destructor, edge_type=CFG_edge, key=0, label=scope_exit_destructor];
 200 -> 93  [color=red, controlflow_type="virtual_call|202", edge_type=CFG_edge, key=0, label=virtual_call];
 200 -> 157  [color=red, controlflow_type="virtual_call|202", edge_type=CFG_edge, key=0, label=virtual_call];
 1 -> 177  [color=red, controlflow_type=next, edge_type=CFG_edge, key=0, label=next];
+209 -> 25  [color=red, controlflow_type=base_destructor_call, edge_type=CFG_edge, key=0, label=base_destructor_call];
+210 -> 25  [color=red, controlflow_type=base_destructor_call, edge_type=CFG_edge, key=0, label=base_destructor_call];
 }

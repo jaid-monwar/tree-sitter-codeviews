@@ -1218,7 +1218,8 @@ class CFGGraph_cpp(CFGGraph):
                 continue
 
             # Sort objects by construction order
-            objects_sorted = sorted(objects, key=lambda x: x[3])  # Sort by order field
+            # Tuple format: (var_name, class_name, namespace_prefix, decl_id, order)
+            objects_sorted = sorted(objects, key=lambda x: x[4])  # Sort by order field (index 4)
 
             # Get the scope node from our stored mapping
             scope_start, scope_end, scope_type = scope_key
@@ -1271,6 +1272,11 @@ class CFGGraph_cpp(CFGGraph):
                                 # After destructors complete, the function exits (no further edges needed)
                                 # Set next_after_scope_id to None to indicate no return edge from last destructor
                                 next_after_scope_id = None
+                            else:
+                                # No implicit return node and no return statement at scope exit
+                                # This happens for functions like main() that implicitly return at end
+                                # Still create destructor edges, but no final return edge needed
+                                next_after_scope_id = None
                         break
                     parent = parent.parent
 
@@ -1284,15 +1290,27 @@ class CFGGraph_cpp(CFGGraph):
             if next_after_scope_id != 2:
                 # Create destructor call list for each object
                 destructor_ids = []
-                for var_name, class_name, decl_id, order in objects_reversed:
+                for var_name, class_name, namespace_prefix, decl_id, order in objects_reversed:
                     # Find the destructor for this class
+                    # In function_list, destructors are stored as:
+                    #   - Non-namespaced: ((class_name, "~class_name"), sig) -> id
+                    #   - Namespaced: ((namespace, "~class_name"), sig) -> id
                     destructor_name = f"~{class_name}"
                     destructor_id = None
 
                     for ((fn_class_name, fn_name), fn_sig), fn_id in self.records.get("function_list", {}).items():
-                        if fn_name == destructor_name and fn_class_name == class_name:
-                            destructor_id = fn_id
-                            break
+                        if fn_name == destructor_name:
+                            # Match based on namespace/class:
+                            # - If namespace_prefix is set, fn_class_name should be the namespace
+                            # - If namespace_prefix is None, fn_class_name should be the class name itself
+                            if namespace_prefix:
+                                if fn_class_name == namespace_prefix:
+                                    destructor_id = fn_id
+                                    break
+                            else:
+                                if fn_class_name == class_name:
+                                    destructor_id = fn_id
+                                    break
 
                     if destructor_id:
                         destructor_ids.append((var_name, class_name, destructor_id))
@@ -1423,11 +1441,15 @@ class CFGGraph_cpp(CFGGraph):
             if not fn_name.startswith("~"):
                 continue
 
+            # Extract the actual class name from the destructor name (e.g., "~DerivedClass" -> "DerivedClass")
+            # fn_class_name may be a namespace (e.g., "NS1") for namespaced classes
+            actual_class_name = fn_name[1:]  # Remove the ~ prefix
+
             # Check if this class has base classes
-            if fn_class_name not in inheritance_map:
+            if actual_class_name not in inheritance_map:
                 continue
 
-            base_classes = inheritance_map[fn_class_name]
+            base_classes = inheritance_map[actual_class_name]
             if not base_classes:
                 continue
 
@@ -1827,11 +1849,8 @@ class CFGGraph_cpp(CFGGraph):
                                     var_name = declarator.text.decode('utf-8')
                                 elif declarator.type == "pointer_declarator":
                                     is_pointer_declarator = True
-                                    # Extract variable name from pointer declarator if needed for other purposes
-                                    for subchild in declarator.children:
-                                        if subchild.type == "identifier":
-                                            var_name = subchild.text.decode('utf-8')
-                                            break
+                                    # DO NOT set var_name for pointer declarations - they don't need RAII tracking
+                                    # Pointers don't have automatic destructor calls at scope exit
                                 # Handle other declarator types if needed
 
                             # Skip constructor call tracking for pointer declarations
@@ -1964,9 +1983,10 @@ class CFGGraph_cpp(CFGGraph):
                     # Add object to scope tracking for RAII
                     if var_name and scope_node:
                         scope_key = (scope_node.start_point, scope_node.end_point, scope_node.type)
-                        # Track: (var_name, class_name, decl_node_id, order)
+                        # Track: (var_name, class_name, namespace_prefix, decl_node_id, order)
+                        # namespace_prefix is needed for proper destructor lookup in function_list
                         order = len(self.scope_objects.get(scope_key, []))
-                        self.scope_objects[scope_key].append((var_name, class_name, parent_index, order))
+                        self.scope_objects[scope_key].append((var_name, class_name, namespace_prefix, parent_index, order))
                         self.object_scope_map[var_name] = scope_key
 
                     # Store template instantiation information if this is a template type
