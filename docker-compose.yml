@@ -1,0 +1,14 @@
+services:
+  atlas:
+    build: .
+    volumes:
+      # Mount input files directory
+      - ./input:/input:ro
+      # Mount output directory
+      - ./output:/output
+      # Persist tree-sitter grammars between runs
+      - atlas-grammars:/tmp/atlas
+    working_dir: /output
+
+volumes:
+  atlas-grammars:
