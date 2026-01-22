@@ -7,7 +7,7 @@ from tree_sitter import Language
 
 
 def get_language_map():
-    clone_directory = os.path.join(tempfile.gettempdir(), "comex")
+    clone_directory = os.path.join(tempfile.gettempdir(), "atlas")
     shared_languages = os.path.join(clone_directory, "languages.so")
 
     grammar_repos = [
@@ -28,7 +28,7 @@ def get_language_map():
             pass
         else:
             continue
-        print(f"Intial Setup: First time running COMEX on {grammar}")
+        print(f"Intial Setup: First time running ATLAS on {grammar}")
         os.makedirs(vendor_language, exist_ok=True)
         subprocess.check_call(["git", "init"], cwd=vendor_language, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         subprocess.check_call(["git", "remote", "add", "origin", url], cwd=vendor_language, stdout=subprocess.DEVNULL,

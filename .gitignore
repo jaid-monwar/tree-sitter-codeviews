@@ -3,7 +3,7 @@ __pycache__/
 build/
 .DS_Store
 /data
-src/comex.egg-info/
+src/atlas.egg-info/
 dist/
 /tests/data/RANDOM/dfg_rosetta
 tests/**/*.dot

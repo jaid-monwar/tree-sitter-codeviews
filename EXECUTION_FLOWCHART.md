@@ -1,4 +1,4 @@
-# Complete Execution Flow: `comex --lang "java" --code-file sample/test_java.java --graphs "ast"`
+# Complete Execution Flow: `atlas --lang "java" --code-file sample/test_java.java --graphs "ast"`
 
 This document provides a detailed trace of every file that gets called when running the above command.
 
@@ -10,12 +10,12 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 1: CLI Entry Point                                             │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Command: comex --lang "java" --code-file sample/test_java.java ... │
+│ Command: atlas --lang "java" --code-file sample/test_java.java ... │
 │                                                                      │
 │ ┌──> setup.cfg (entry_points)                                      │
-│ │    Defines: comex=comex.cli:app                                  │
+│ │    Defines: atlas=atlas.cli:app                                  │
 │ │                                                                   │
-│ └──> src/comex/__main__.py                                         │
+│ └──> src/atlas/__main__.py                                         │
 │      - Imports: from .cli import app                               │
 │      - Calls: app()                                                │
 └─────────────────────────────────────────────────────────────────────┘
@@ -23,12 +23,12 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 2: CLI Initialization                                          │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/cli.py                                              │
+│ File: src/atlas/cli.py                                              │
 │                                                                      │
 │ Line 14: get_language_map()  ← Called IMMEDIATELY on import        │
-│          └──> src/comex/__init__.py                                │
+│          └──> src/atlas/__init__.py                                │
 │               - Clones tree-sitter grammars (if first run)          │
-│               - Builds shared library: /tmp/comex/languages.so      │
+│               - Builds shared library: /tmp/atlas/languages.so      │
 │               - Returns: {'java': JAVA_LANGUAGE, 'cs': ..., ...}   │
 │                                                                      │
 │ Line 15: app = typer.Typer()  ← Creates Typer CLI application      │
@@ -37,7 +37,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 3: Command Parsing                                             │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/cli.py                                              │
+│ File: src/atlas/cli.py                                              │
 │ Function: main() (Line 19-120)                                      │
 │                                                                      │
 │ Line 20: lang = "java"                                              │
@@ -61,7 +61,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 4: File Reading                                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/cli.py                                              │
+│ File: src/atlas/cli.py                                              │
 │                                                                      │
 │ Lines 101-104: Read source file                                     │
 │   file_handle = open("sample/test_java.java", "r")                 │
@@ -72,7 +72,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 5: CombinedDriver Initialization                               │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/cli.py (Line 105-106)                              │
+│ File: src/atlas/cli.py (Line 105-106)                              │
 │                                                                      │
 │ CombinedDriver(                                                     │
 │   src_language="java",                                              │
@@ -83,13 +83,13 @@ This document provides a detailed trace of every file that gets called when runn
 │ )                                                                   │
 │                                                                      │
 │ ↓ Calls →                                                           │
-│ src/comex/codeviews/combined_graph/combined_driver.py               │
+│ src/atlas/codeviews/combined_graph/combined_driver.py               │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 6: CombinedDriver.__init__()                                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/combined_graph/combined_driver.py        │
+│ File: src/atlas/codeviews/combined_graph/combined_driver.py        │
 │                                                                      │
 │ Line 23: self.graph = nx.MultiDiGraph()  ← Create empty graph      │
 │                                                                      │
@@ -106,21 +106,21 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 7: ASTDriver Initialization                                    │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/AST/AST_driver.py                        │
+│ File: src/atlas/codeviews/AST/AST_driver.py                        │
 │                                                                      │
 │ Line 17: self.parser = ParserDriver(src_language, src_code).parser │
 │          ↓                                                          │
-│          Calls → src/comex/tree_parser/parser_driver.py            │
+│          Calls → src/atlas/tree_parser/parser_driver.py            │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 8: ParserDriver Initialization                                 │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/tree_parser/parser_driver.py                       │
+│ File: src/atlas/tree_parser/parser_driver.py                       │
 │                                                                      │
 │ Line 11: self.src_code = self.pre_process_src_code(lang, code)    │
 │          ↓                                                          │
-│          Calls → src/comex/utils/preprocessor.py                   │
+│          Calls → src/atlas/utils/preprocessor.py                   │
 │          - remove_empty_lines()                                     │
 │          - remove_comments()                                        │
 │                                                                      │
@@ -131,23 +131,23 @@ This document provides a detailed trace of every file that gets called when runn
 │   }                                                                 │
 │   self.parser = JavaParser("java", preprocessed_code)              │
 │                ↓                                                    │
-│                Calls → src/comex/tree_parser/java_parser.py        │
+│                Calls → src/atlas/tree_parser/java_parser.py        │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 9: JavaParser Initialization                                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/tree_parser/java_parser.py                         │
+│ File: src/atlas/tree_parser/java_parser.py                         │
 │                                                                      │
 │ Line 6: super().__init__(src_language, src_code)                   │
 │         ↓                                                           │
-│         Calls → src/comex/tree_parser/custom_parser.py             │
+│         Calls → src/atlas/tree_parser/custom_parser.py             │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 10: CustomParser Initialization                                │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/tree_parser/custom_parser.py                       │
+│ File: src/atlas/tree_parser/custom_parser.py                       │
 │                                                                      │
 │ - Gets language from language_map (from __init__.py)                │
 │ - Creates tree-sitter Parser                                        │
@@ -164,7 +164,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 11: Parse Source Code                                          │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/tree_parser/parser_driver.py                       │
+│ File: src/atlas/tree_parser/parser_driver.py                       │
 │                                                                      │
 │ Line 20: self.root_node, self.tree = self.parser.parse()           │
 │          ↓                                                          │
@@ -180,7 +180,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 12: Token Extraction                                           │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/tree_parser/parser_driver.py                       │
+│ File: src/atlas/tree_parser/parser_driver.py                       │
 │                                                                      │
 │ Lines 21-30: Extract all tokens from parse tree                     │
 │   (all_tokens, label, method_map, method_calls,                    │
@@ -188,7 +188,7 @@ This document provides a detailed trace of every file that gets called when runn
 │    symbol_table) = self.create_all_tokens()                        │
 │                                                                      │
 │   ↓ Calls → java_parser.create_all_tokens()                        │
-│              Uses: src/comex/utils/java_nodes.py                   │
+│              Uses: src/atlas/utils/java_nodes.py                   │
 │              - Traverses entire parse tree                          │
 │              - Identifies variables, methods, declarations          │
 │              - Builds symbol table with scopes                      │
@@ -198,7 +198,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 13: AST Graph Generation                                       │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/AST/AST_driver.py                        │
+│ File: src/atlas/codeviews/AST/AST_driver.py                        │
 │                                                                      │
 │ Lines 19-25: Create AST graph                                       │
 │   self.AST = ASTGraph(                                              │
@@ -209,13 +209,13 @@ This document provides a detailed trace of every file that gets called when runn
 │     parser=<parser with tokens>                                     │
 │   )                                                                 │
 │   ↓                                                                 │
-│   Calls → src/comex/codeviews/AST/AST.py                           │
+│   Calls → src/atlas/codeviews/AST/AST.py                           │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 14: ASTGraph.__init__()                                        │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/AST/AST.py                               │
+│ File: src/atlas/codeviews/AST/AST.py                               │
 │                                                                      │
 │ Line 17: self.graph = self.to_networkx()                           │
 │          ↓                                                          │
@@ -233,7 +233,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 15: Return to CombinedDriver                                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/combined_graph/combined_driver.py        │
+│ File: src/atlas/codeviews/combined_graph/combined_driver.py        │
 │                                                                      │
 │ Line 36: self.AST = self.results["AST"].graph                      │
 │          ← AST graph stored in CombinedDriver                       │
@@ -246,7 +246,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 16: Combine Graphs                                             │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/combined_graph/combined_driver.py        │
+│ File: src/atlas/codeviews/combined_graph/combined_driver.py        │
 │ Method: combine() (Line 161-216)                                    │
 │                                                                      │
 │ Since only AST exists (not DFG or CFG):                             │
@@ -261,7 +261,7 @@ This document provides a detailed trace of every file that gets called when runn
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 17: Write Output Files                                         │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/codeviews/combined_graph/combined_driver.py        │
+│ File: src/atlas/codeviews/combined_graph/combined_driver.py        │
 │                                                                      │
 │ Lines 45-53: Since output_file is provided:                         │
 │   if graph_format == "dot":  ← In our case                         │
@@ -271,13 +271,13 @@ This document provides a detailed trace of every file that gets called when runn
 │       output_png=True                                               │
 │     )                                                               │
 │     ↓                                                               │
-│     Calls → src/comex/utils/postprocessor.py                       │
+│     Calls → src/atlas/utils/postprocessor.py                       │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 18: Postprocessor - DOT Generation                             │
 ├─────────────────────────────────────────────────────────────────────┤
-│ File: src/comex/utils/postprocessor.py                             │
+│ File: src/atlas/utils/postprocessor.py                             │
 │ Function: write_to_dot() (Line 30-41)                              │
 │                                                                      │
 │ Line 32-36: Write DOT file                                          │
@@ -313,28 +313,28 @@ This document provides a detailed trace of every file that gets called when runn
 
 ### 1. **Entry Points**
 1. `setup.cfg` - Entry point configuration
-2. `src/comex/__main__.py` - Module execution
-3. `src/comex/cli.py` - CLI interface
+2. `src/atlas/__main__.py` - Module execution
+3. `src/atlas/cli.py` - CLI interface
 
 ### 2. **Initialization Phase**
-4. `src/comex/__init__.py` - Language map initialization
+4. `src/atlas/__init__.py` - Language map initialization
    - Clones tree-sitter grammars
    - Builds shared library
 
 ### 3. **Parsing Phase**
-5. `src/comex/codeviews/combined_graph/combined_driver.py` - Orchestrates everything
-6. `src/comex/codeviews/AST/AST_driver.py` - AST driver
-7. `src/comex/tree_parser/parser_driver.py` - Parser orchestration
-8. `src/comex/utils/preprocessor.py` - Code preprocessing
-9. `src/comex/tree_parser/java_parser.py` - Java-specific parsing
-10. `src/comex/tree_parser/custom_parser.py` - Base parser functionality
-11. `src/comex/utils/java_nodes.py` - Java node type definitions
+5. `src/atlas/codeviews/combined_graph/combined_driver.py` - Orchestrates everything
+6. `src/atlas/codeviews/AST/AST_driver.py` - AST driver
+7. `src/atlas/tree_parser/parser_driver.py` - Parser orchestration
+8. `src/atlas/utils/preprocessor.py` - Code preprocessing
+9. `src/atlas/tree_parser/java_parser.py` - Java-specific parsing
+10. `src/atlas/tree_parser/custom_parser.py` - Base parser functionality
+11. `src/atlas/utils/java_nodes.py` - Java node type definitions
 
 ### 4. **Graph Generation Phase**
-12. `src/comex/codeviews/AST/AST.py` - AST graph construction
+12. `src/atlas/codeviews/AST/AST.py` - AST graph construction
 
 ### 5. **Output Phase**
-13. `src/comex/utils/postprocessor.py` - Output file generation
+13. `src/atlas/utils/postprocessor.py` - Output file generation
 14. External: GraphViz `dot` command - PNG rendering
 
 ---
@@ -387,7 +387,7 @@ Edges: [(parent_id, child_id), ...]
 ## Important Notes
 
 1. **Language Map Initialization**: Called ONCE on CLI import, not per command
-2. **Tree-sitter Grammars**: Cloned to `/tmp/comex/` on first run only
+2. **Tree-sitter Grammars**: Cloned to `/tmp/atlas/` on first run only
 3. **Parser Selection**: Based on `src_language` parameter, routed to JavaParser
 4. **AST Only**: Since only "ast" was requested, DFG and CFG drivers are NOT called
 5. **Output Format**: "dot" generates both `.dot` and `.png` files

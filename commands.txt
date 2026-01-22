@@ -1,8 +1,8 @@
 # Generate AST
-comex --lang "c" --code-file sample/test_c.c --graphs "ast"
+atlas --lang "c" --code-file sample/test_c.c --graphs "ast"
 
-comex --lang "cpp" --code-file hello.cpp --graphs "ast" --output "json"
+atlas --lang "cpp" --code-file hello.cpp --graphs "ast" --output "json"
 
 
-comex --lang "cpp" --code-file c_cpp_test/error_6_namespace.cpp --graphs "cfg"
+atlas --lang "cpp" --code-file c_cpp_test/error_6_namespace.cpp --graphs "cfg"
 

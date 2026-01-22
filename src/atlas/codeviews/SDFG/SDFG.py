@@ -4,10 +4,10 @@ import time
 import networkx as nx
 from loguru import logger
 
-from comex.codeviews.CFG.CFG_driver import CFGDriver
-from comex.codeviews.SDFG.SDFG_c import dfg_c
-from comex.codeviews.SDFG.SDFG_cpp import dfg_cpp
-from comex.utils import postprocessor, DFG_utils
+from atlas.codeviews.CFG.CFG_driver import CFGDriver
+from atlas.codeviews.SDFG.SDFG_c import dfg_c
+from atlas.codeviews.SDFG.SDFG_cpp import dfg_cpp
+from atlas.utils import postprocessor, DFG_utils
 
 debug = False
 

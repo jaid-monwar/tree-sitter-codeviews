@@ -39,7 +39,7 @@ def main(
         debug: bool = typer.Option(False, help="Enables debug logs"),
 ):
     """
-    Comex
+    Atlas
 
     Generates, customizes and combines multiple source code representations (AST, CFG, DFG)
 
