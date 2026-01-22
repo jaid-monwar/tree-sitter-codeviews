@@ -1,6 +1,3 @@
-# from codeviews.CFG.CFG_python import CFGGraph_python
-from .CFG_csharp import CFGGraph_csharp
-from .CFG_java import CFGGraph_java
 from .CFG_c import CFGGraph_c
 from .CFG_cpp import CFGGraph_cpp
 from ...tree_parser.parser_driver import ParserDriver
@@ -10,7 +7,7 @@ from ...utils import postprocessor
 class CFGDriver:
     def __init__(
         self,
-        src_language="java",
+        src_language="c",
         src_code="",
         output_file="CFG_output.json",
         properties={},
@@ -23,11 +20,8 @@ class CFGDriver:
         self.properties = properties
 
         self.CFG_map = {
-            "java": CFGGraph_java,
-            "cs": CFGGraph_csharp,
             "c": CFGGraph_c,
             "cpp": CFGGraph_cpp,
-            # "python": CFGGraph_python
         }
 
         self.CFG = self.CFG_map[self.src_language](

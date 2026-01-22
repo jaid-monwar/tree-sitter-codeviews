@@ -1,2 +1,0 @@
-1.  Can't handle functions with array input, creates disconnected CFG and DFG in both C an C++
-    Sending an array to a function is the same as sending a pointer

@@ -64,7 +64,7 @@ class CSTGraph:
 
 
 class CSTDriver:
-    def __init__(self, src_language="java", src_code=""):
+    def __init__(self, src_language="c", src_code=""):
         self.src_language = src_language
         self.src_code = src_code
         self.parser = ParserDriver(src_language, src_code).parser

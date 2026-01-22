@@ -21,7 +21,7 @@ class CustomParser:
 
     def __init__(self, src_language, src_code):
         """Initialize the parser with the language.
-        Language options are: python, java, c_sharp, ruby, go, php, javascript"""
+        Language options are: c, cpp"""
 
         self.src_language = src_language
         self.src_code = src_code

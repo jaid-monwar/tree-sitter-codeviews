@@ -17,18 +17,17 @@ app = typer.Typer()
 
 @app.callback(invoke_without_command=True)
 def main(
-        lang: str = typer.Option(..., help="java, cs, c, cpp"),
+        lang: str = typer.Option(..., help="c, cpp"),
         code: Optional[str] = typer.Option(None, help="""
-    public class Max2 {
-        public static void main(String[] args) {
-            int x= 3;
-            x = x + 3;
-            int y = 4;
-            y += 1;
-        }
+    int main() {
+        int x = 3;
+        x = x + 3;
+        int y = 4;
+        y += 1;
+        return 0;
     }
     """),
-        code_file: Optional[Path] = typer.Option(None, help="./test_file,java"),
+        code_file: Optional[Path] = typer.Option(None, help="./test_file.c"),
         graphs: str = typer.Option("ast,dfg", help="ast, cfg, dfg"),
         output: str = typer.Option("dot", help="all/json/dot (dot generates png as well)"),
         blacklisted: str = typer.Option("", help="Nodes to be removed from the AST"),

@@ -11,7 +11,7 @@ from ...utils import postprocessor
 class CombinedDriver:
     def __init__(
         self,
-        src_language="java",
+        src_language="c",
         src_code="",
         output_file=None,
         graph_format="dot",

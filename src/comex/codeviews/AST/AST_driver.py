@@ -6,7 +6,7 @@ from ...utils import postprocessor
 class ASTDriver:
     def __init__(
         self,
-        src_language="java",
+        src_language="c",
         src_code="",
         output_file="AST_output.json",
         properties={},

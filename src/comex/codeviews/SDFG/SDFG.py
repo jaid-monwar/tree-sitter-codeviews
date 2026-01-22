@@ -5,8 +5,6 @@ import networkx as nx
 from loguru import logger
 
 from comex.codeviews.CFG.CFG_driver import CFGDriver
-from comex.codeviews.SDFG.SDFG_csharp import dfg_csharp
-from comex.codeviews.SDFG.SDFG_java import dfg_java
 from comex.codeviews.SDFG.SDFG_c import dfg_c
 from comex.codeviews.SDFG.SDFG_cpp import dfg_cpp
 from comex.utils import postprocessor, DFG_utils
@@ -23,7 +21,7 @@ debug = False
 class DfgRda:
     def __init__(
             self,
-            src_language="java",
+            src_language="c",
             src_code="",
             output_file=None,
             graph_format="dot",
@@ -95,8 +93,6 @@ class DfgRda:
 
     def rda(self, properties):
         lang_map = {
-            "java": dfg_java,
-            "cs": dfg_csharp,
             "c": dfg_c,
             "cpp": dfg_cpp,
         }
@@ -105,15 +101,7 @@ class DfgRda:
 
 
 if __name__ == '__main__':
-    # file = "tests/data/RANDOM/translation.cs"
-    # # sample_id = random.randint(0, 11800 - 1)
-    # sample_id = 11132
-    # with open(file, "r") as f:
-    #     lines = f.read().splitlines()
-    # sample_file = lines[sample_id]
-
-    # "cs",
-    for extension in ("java", "cs"):
+    for extension in ("c", "cpp"):
         file = f"data/test_manual.{extension}"
         if not os.path.isfile(file):
             continue
@@ -121,10 +109,7 @@ if __name__ == '__main__':
             sample_file = f.read()
 
         output_file = f"data/{extension}_test.json"
-        # src_code = src_parser.pre_process_src(extension, sample_file, wrap_class=False)
         src_code = sample_file
-        # with open("data/test." + extension, "w") as f:
-        #     f.write(src_code)
         result = DfgRda(
             src_language=extension,
             src_code=src_code,

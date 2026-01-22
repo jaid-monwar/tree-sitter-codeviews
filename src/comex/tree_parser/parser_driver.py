@@ -1,5 +1,3 @@
-from ..tree_parser.java_parser import JavaParser
-from ..tree_parser.cs_parser import CSParser
 from ..tree_parser.c_parser import CParser
 from ..tree_parser.cpp_parser import CppParser
 from ..utils import preprocessor
@@ -13,12 +11,8 @@ class ParserDriver:
         self.src_code = self.pre_process_src_code(src_language, src_code)
 
         self.parser_map = {
-            "java": JavaParser,
-            "cs": CSParser,
             "c": CParser,
             "cpp": CppParser,
-            # 'python': PythonParser
-            # Add more languages here
         }
         self.parser = self.parser_map[self.src_language](self.src_language, self.src_code)
         self.root_node, self.tree = self.parser.parse()

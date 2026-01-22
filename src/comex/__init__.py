@@ -11,8 +11,6 @@ def get_language_map():
     shared_languages = os.path.join(clone_directory, "languages.so")
 
     grammar_repos = [
-        ("https://github.com/tree-sitter/tree-sitter-java", "09d650def6cdf7f479f4b78f595e9ef5b58ce31e"),
-        ("https://github.com/tree-sitter/tree-sitter-c-sharp", "3ef3f7f99e16e528e6689eae44dff35150993307"),
         ("https://github.com/tree-sitter/tree-sitter-c", "34f4c7e751f4d661be3e23682fe2631d6615141d"),
         ("https://github.com/tree-sitter/tree-sitter-cpp", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02")  # Latest stable with pure virtual destructor support
     ]
@@ -79,27 +77,10 @@ def get_language_map():
         shared_languages,
         vendor_languages,
     )
-    # PYTHON_LANGUAGE = Language("build/my-languages.so", "python")
-    JAVA_LANGUAGE = Language(shared_languages, "java")
-    C_SHARP_LANGUAGE = Language(shared_languages, "c_sharp")
     C_LANGUAGE = Language(shared_languages, "c")
     CPP_LANGUAGE = Language(shared_languages, "cpp")
-    # RUBY_LANGUAGE = Language("build/my-languages.so", "ruby")
-    # GO_LANGUAGE = Language("build/my-languages.so", "go")
-    # PHP_LANGUAGE = Language("build/my-languages.so", "php")
-    # JAVASCRIPT_LANGUAGE = Language("build/my-languages.so", "javascript")
-
-    # with open(build_id_file, "w") as f:
-    #     f.write(build_id)
 
     return {
-        # "python": PYTHON_LANGUAGE,
-        "java": JAVA_LANGUAGE,
-        "cs": C_SHARP_LANGUAGE,
         "c": C_LANGUAGE,
         "cpp": CPP_LANGUAGE,
-        # "ruby": RUBY_LANGUAGE,
-        # "go": GO_LANGUAGE,
-        # "php": PHP_LANGUAGE,
-        # "javascript": JAVASCRIPT_LANGUAGE,
     }

@@ -12,7 +12,7 @@ tests/**/*.png
 CLAUDE.md
 .coverage
 *.png
-# *.dot
+*.dot
 *.json
 .vscode/
 .venv

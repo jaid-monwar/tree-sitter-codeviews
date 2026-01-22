@@ -1,0 +1,11 @@
+Construct	C	C++
+Function definitions	✓	✓
+Struct/Enum/Union	✓	✓
+Function pointers	✓	✓
+Goto/Label statements	✓	✓
+Classes	✗	✓
+Namespaces	✗	✓
+Templates	✗	✓
+Virtual methods	✗	✓
+Exception handling	✗	✓
+Operator overloading	✗	✓

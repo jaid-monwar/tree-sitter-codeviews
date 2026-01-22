@@ -52,7 +52,7 @@ def write_to_dot(og_graph, filename, output_png=False, src_language=None):
                     label = label.replace('\r', ' ')
                     # For C++, keep :: but ensure label is quoted (quotes added below)
                 else:
-                    # Original behavior for Java, C#, and other languages
+                    # Original behavior for other languages
                     label = re.escape(label)
 
                 # Always quote labels for C/C++ (to handle :: and other special chars)

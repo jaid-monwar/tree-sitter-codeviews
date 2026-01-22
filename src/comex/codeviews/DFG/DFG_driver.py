@@ -7,7 +7,7 @@ from ..SDFG.SDFG import DfgRda
 class DFGDriver:
     def __init__(
         self,
-        src_language="java",
+        src_language="c",
         src_code="",
         output_file="DFG_output.json",
         properties={},
