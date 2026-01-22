@@ -19,7 +19,6 @@ class DFGDriver:
         self.src_code = self.parser.src_code
         self.properties = properties.get("DFG", {})
 
-        # Initialize graph to empty graph by default
         self.graph = nx.MultiDiGraph()
         self.rda_table = None
         self.rda_result = None
@@ -37,7 +36,6 @@ class DFGDriver:
             self.json = postprocessor.write_networkx_to_json(self.graph, output_file)
             postprocessor.write_to_dot(
                 self.graph,
-                # os.path.join(grandparent_folder,"output_graphs/AST_output.dot"),
                 output_file.split(".")[0] + ".dot",
                 output_png=True,
                 src_language=self.src_language,

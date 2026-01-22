@@ -27,36 +27,27 @@ class CppParser(CustomParser):
             and current_node.type in current_types
         ):
             if current_node.parent.type == "init_declarator":
-                # Check if this is the identifier being declared
                 declarator = current_node.parent.children[0] if current_node.parent.children else None
                 if declarator:
-                    # Handle direct identifier
                     if declarator == current_node:
                         return True
-                    # Handle pointer/reference declarations
                     if declarator.type in ["pointer_declarator", "reference_declarator", "array_declarator"]:
                         if self.find_identifier_in_declarator(declarator) == current_node:
                             return True
             elif current_node.parent.type in ["pointer_declarator", "reference_declarator"]:
-                # The identifier in a pointer or reference declarator is a declaration
                 if current_node.type == "identifier":
-                    # Make sure it's the actual variable name, not a type
                     return True
             elif current_node.parent.type == "array_declarator":
-                # For array declarations like int arr[10]
                 if current_node.parent.children and current_node.parent.children[0] == current_node:
                     return True
             elif current_node.parent.type in ["parameter_declaration", "optional_parameter_declaration"]:
-                # Function parameters are declarations
                 return True
 
-        # Handle uninitialized declarations: int x; (identifier is part of declarator)
         if (
             current_node.parent is not None
             and current_node.parent.type == "declaration"
             and current_node.type == "identifier"
         ):
-            # Check if this identifier comes after a type specifier
             for i, child in enumerate(current_node.parent.children):
                 if child == current_node and i > 0:
                     prev_sibling = current_node.parent.children[i-1]
@@ -67,21 +58,16 @@ class CppParser(CustomParser):
                         return True
             return False
 
-        # Handle declarators in declarations
         if current_node.parent is not None and current_node.parent.type == "declarator":
             if current_node.parent.parent is not None and current_node.parent.parent.type in ["declaration", "parameter_declaration"]:
                 return True
 
-        # Handle function definitions - the function name itself is a declaration
         if current_node.parent is not None and current_node.parent.type == "function_declarator":
-            # The function name
             declarator = current_node.parent.child_by_field_name("declarator")
             if declarator == current_node:
                 return True
 
-        # Handle field declarations in classes/structs
         if current_node.parent is not None and current_node.parent.type == "field_declaration":
-            # Check if it's an identifier after a type
             for i, child in enumerate(current_node.parent.children):
                 if child == current_node and i > 0:
                     prev_sibling = current_node.parent.children[i-1]
@@ -113,23 +99,17 @@ class CppParser(CustomParser):
                      'struct_specifier', 'class_specifier', 'union_specifier', 'enum_specifier',
                      'template_type', 'qualified_identifier', 'auto', 'decltype']
 
-        # Start from the current node and walk up the tree
         current = node
 
         while current is not None:
-            # Check if we've reached a declaration or parameter_declaration node
             if current.type in ["declaration", "parameter_declaration", "optional_parameter_declaration", "field_declaration"]:
-                # Found the declaration context, now search for type specifier
                 for child in current.children:
                     if child.type in datatypes:
                         return child.text.decode('utf-8')
-                # If no type found at this level, return None
                 return None
 
-            # Move up to parent
             current = current.parent
 
-        # If we've reached the root without finding a declaration, return None
         return None
 
     def scope_check(self, parent_scope, child_scope):
@@ -164,10 +144,8 @@ class CppParser(CustomParser):
         Create tokens for C++ language.
         Handles C++-specific constructs like classes, namespaces, templates, references, etc.
         """
-        # Nodes to exclude from method_map (similar to remove_list in Java)
         remove_list = ["function_definition", "call_expression", "class_specifier", "struct_specifier"]
 
-        # Block types that create new scopes in C++
         block_types = [
             "compound_statement",
             "if_statement",
@@ -186,51 +164,38 @@ class CppParser(CustomParser):
             "lambda_expression",
         ]
 
-        # Scope Management
         if root_node.is_named and root_node.type in block_types:
-            """On entering a new block, increment the scope id and push it to the scope_stack"""
             symbol_table["scope_id"] = symbol_table["scope_id"] + 1
             symbol_table["scope_stack"].append(symbol_table["scope_id"])
 
-        # Leaf Node Processing (Tokens)
         if (
             root_node.is_named
             and (len(root_node.children) == 0 or root_node.type in ["string_literal", "raw_string_literal"])
             and root_node.type != "comment"
         ):
-            # Get unique ID for this token
             index = self.index[(root_node.start_point, root_node.end_point, root_node.type)]
 
-            # Extract label (actual code in the source)
             label[index] = root_node.text.decode("UTF-8")
 
-            # start line number
             start_line[index] = root_node.start_point[0]
 
-            # add to token list
             all_tokens.append(index)
 
-            # Store a copy of the current scope stack in the scope map for each token
             symbol_table["scope_map"][index] = symbol_table["scope_stack"].copy()
 
             current_node = root_node
 
-            # Function/Method Identification
             if current_node.parent is not None and current_node.parent.type in remove_list:
                 method_map.append(index)
-                # Check if it's a function call (has argument_list sibling)
                 if current_node.next_named_sibling is not None and current_node.next_named_sibling.type == "argument_list":
                     method_calls.append(index)
 
-            # Handle function calls: call_expression
             if current_node.parent is not None and current_node.parent.type == "call_expression":
-                # The function being called
                 function_node = current_node.parent.child_by_field_name("function")
                 if function_node == current_node or (function_node and self.find_identifier_in_declarator(function_node) == current_node):
                     method_map.append(index)
                     method_calls.append(index)
 
-            # Handle field access (member access): field_expression
             if current_node.parent is not None and current_node.parent.type == "field_expression":
                 field_node = current_node.parent.child_by_field_name("field")
                 if field_node is not None:
@@ -239,7 +204,6 @@ class CppParser(CustomParser):
                     if field_index == current_index:
                         method_map.append(current_index)
 
-                # Handle method calls on field expressions (like obj.method())
                 while current_node.parent is not None and current_node.parent.type == "field_expression":
                     current_node = current_node.parent
 
@@ -248,19 +212,15 @@ class CppParser(CustomParser):
                     method_calls.append(index)
                 label[index] = current_node.text.decode("UTF-8")
 
-            # Handle qualified identifiers (namespace::identifier)
             if current_node.parent is not None and current_node.parent.type == "qualified_identifier":
-                # The rightmost identifier in a qualified name
                 if current_node.parent.children and current_node.parent.children[-1] == current_node:
                     label[index] = current_node.parent.text.decode("UTF-8")
 
-            # Handle template instantiations
             if current_node.parent is not None and current_node.parent.type == "template_function":
                 method_map.append(index)
                 if current_node.next_named_sibling is not None and current_node.next_named_sibling.type == "template_argument_list":
                     method_calls.append(index)
 
-            # Variable Declaration
             if self.check_declaration(current_node):
                 variable_name = label[index]
                 declaration[index] = variable_name
@@ -269,10 +229,8 @@ class CppParser(CustomParser):
                 if variable_type is not None:
                     symbol_table["data_type"][index] = variable_type
             else:
-                # Variable Usage
                 current_scope = symbol_table['scope_map'][index]
 
-                # Handle field expressions (obj.field or obj->field)
                 if current_node.parent is not None and current_node.parent.type == "field_expression":
                     field_variable = current_node.parent.children[-1]
                     field_variable_name = field_variable.text.decode('utf-8')
@@ -283,9 +241,7 @@ class CppParser(CustomParser):
                             if self.scope_check(parent_scope, current_scope):
                                 declaration_map[index] = ind
                                 break
-                # Handle qualified identifiers in usage
                 elif current_node.parent is not None and current_node.parent.type == "qualified_identifier":
-                    # Use the full qualified name for matching
                     qualified_name = current_node.parent.text.decode('utf-8')
                     name_matches = []
                     for (ind, var) in declaration.items():
@@ -298,7 +254,6 @@ class CppParser(CustomParser):
                         closest_index = self.longest_scope_match(name_matches, symbol_table)
                         declaration_map[index] = closest_index
                 else:
-                    # Regular variable usage - find matching declaration
                     name_matches = []
                     for (ind, var) in declaration.items():
                         if var == label[index]:
@@ -310,7 +265,6 @@ class CppParser(CustomParser):
                         closest_index = self.longest_scope_match(name_matches, symbol_table)
                         declaration_map[index] = closest_index
 
-        # Recursion and Scope Exit
         else:
             for child in root_node.children:
                 self.create_all_tokens(
@@ -326,9 +280,7 @@ class CppParser(CustomParser):
                     symbol_table,
                 )
 
-        # Scope exit
         if root_node.is_named and root_node.type in block_types:
-            """On exiting a block, pop the scope id from the scope_stack"""
             symbol_table["scope_stack"].pop(-1)
 
         return (

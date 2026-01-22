@@ -1,5 +1,3 @@
-# This code is from https://github.com/microsoft/CodeBERT/blob/master/GraphCodeBERT/clonedetection/parser/utils.py
-
 def tree_to_token_index(root_node):
     """Returns all tokens in the tree rooted at the given root node using index values"""
     if (

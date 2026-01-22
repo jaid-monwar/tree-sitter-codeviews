@@ -1,5 +1,3 @@
-# This code is from https://github.com/microsoft/CodeBERT/blob/master/GraphCodeBERT/clonedetection/parser/utils.py
-
 import re
 import tokenize
 from io import StringIO
@@ -8,7 +6,6 @@ from io import StringIO
 def remove_empty_lines(source):
     temp = []
     for x in source.split("\n"):
-        # if x.strip() != "":
         temp.append(x)
     return "\n".join(temp)
 
@@ -33,13 +30,10 @@ def remove_comments(lang, source):
                 last_col = 0
             if start_col > last_col:
                 out += " " * (start_col - last_col)
-            # Remove comments:
             if token_type == tokenize.COMMENT:
                 pass
-            # This series of conditionals removes docstrings:
             elif token_type == tokenize.STRING:
                 if prev_toktype != tokenize.INDENT:
-                    # This is likely a docstring; double-check we're not inside an operator:
                     if prev_toktype != tokenize.NEWLINE:
                         if start_col > 0:
                             out += token_string
@@ -60,7 +54,7 @@ def remove_comments(lang, source):
         def replacer(match):
             s = match.group(0)
             if s.startswith("/"):
-                return " "  # note: a space and not an empty string
+                return " "
             else:
                 return s
 
@@ -70,7 +64,5 @@ def remove_comments(lang, source):
         )
         temp = []
         for x in re.sub(pattern, replacer, source).split("\n"):
-            # if x.strip() != "":
             temp.append(x)
-            # else:
         return "\n".join(temp)

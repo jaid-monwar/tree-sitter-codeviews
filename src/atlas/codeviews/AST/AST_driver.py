@@ -32,6 +32,4 @@ class ASTDriver:
                     output_png=True, src_language=self.src_language
                 )
             except Exception:
-                # DOT/PNG generation may fail for some code with special characters
-                # But JSON output (primary format) is still generated successfully
                 pass

@@ -34,7 +34,6 @@ class ParserDriver:
         src_code = preprocessor.remove_comments(src_language, src_code)
         return src_code
 
-    # Needs to be modified for every language
     def create_all_tokens(self):
         """Return the variable list"""
         return self.parser.create_all_tokens(

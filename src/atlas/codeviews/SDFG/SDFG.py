@@ -11,12 +11,6 @@ from atlas.utils import postprocessor, DFG_utils
 
 debug = False
 
-# if any(
-#         # GITHUB_ACTIONS
-#         x in os.environ for x in ("PYCHARM_HOSTED",)
-# ):
-#     debug = True
-
 
 class DfgRda:
     def __init__(
@@ -40,7 +34,6 @@ class DfgRda:
         self.src_code = src_code
         self.properties = properties
         self.graph = nx.MultiDiGraph()
-        # time to create the CFG
         start = time.time()
         self.CFG_Results = CFGDriver(
             self.src_language, self.src_code, "", self.properties["CFG"]
@@ -49,7 +42,6 @@ class DfgRda:
         self.CFG = self.CFG_Results.graph
         self.rda_table = None
         self.rda_result = None
-        # time to create the DFG
         start_dfg = time.time()
         self.graph, self.debug_graph, self.rda_table, self.rda_result = self.rda(
             self.properties["DFG"]
@@ -78,7 +70,6 @@ class DfgRda:
     def index_to_code(self):
         tokens_index = DFG_utils.tree_to_token_index(self.CFG_Results.root_node)
         code = self.src_code.split("\n")
-        # code_tokens is a list of all tokens in code - all leaves of the CST
         code_tokens = [DFG_utils.index_to_code_token(x, code) for x in tokens_index]
         index_to_code = {}
 

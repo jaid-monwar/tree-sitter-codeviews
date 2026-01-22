@@ -313,9 +313,6 @@ class Identifier:
         self.declaration = declaration
         self.has_initializer = has_initializer
         self.method_call = method_call
-        # Flag to indicate this definition represents a pointer modification at a call site.
-        # Such definitions are used for RDA kill semantics but should not create intraprocedural edges
-        # because interprocedural modification_to_use edges will be created instead.
         self.is_pointer_modification_at_call_site = is_pointer_modification_at_call_site
         if method_call and node.type == "qualified_identifier":
             self.satisfied = False
@@ -1010,9 +1007,7 @@ def collect_function_metadata(parser):
                     "node": node,
                     "func_name": func_name
                 }
-                # Store by name for backward compatibility (may overwrite)
                 metadata_by_name[func_name] = meta
-                # Store by ID for precise lookup (unique)
                 if func_def_id is not None:
                     metadata_by_id[func_def_id] = meta
 
@@ -1345,8 +1340,6 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
 
             function_node = root_node.child_by_field_name("function")
             function_name = None
-            # For method calls via field expressions (e.g., obj->method() or obj.method()),
-            # we need to extract just the method name for metadata lookup
             method_name_for_lookup = None
 
             if function_node:
@@ -1356,7 +1349,6 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
                     argument = function_node.child_by_field_name("argument")
                     if argument:
                         add_entry(parser, rda_table, parent_id, used=argument)
-                    # Extract the method name for pointer_modifications lookup
                     field = function_node.child_by_field_name("field")
                     if field:
                         method_name_for_lookup = st(field)
@@ -1422,8 +1414,6 @@ def build_rda_table(parser, CFG_results, lambda_map=None, function_metadata=None
 
                     if not is_input_function and not is_variadic_macro:
                         modifies_params = set()
-                        # Use method_name_for_lookup for field expressions (e.g., obj->method()),
-                        # otherwise fall back to function_name
                         lookup_name = method_name_for_lookup if method_name_for_lookup else function_name
                         if lookup_name and function_metadata and lookup_name in function_metadata:
                             if pointer_modifications and lookup_name in pointer_modifications:
@@ -1956,8 +1946,6 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                                 'used_def': used.name})
 
                     for available_def in matching_defs:
-                        # Skip definitions that are pointer modification placeholders at call sites.
-                        # These exist only for RDA kill semantics; interprocedural edges will be added separately.
                         if getattr(available_def, 'is_pointer_modification_at_call_site', False):
                             continue
                         if available_def.line != node:
@@ -1969,8 +1957,6 @@ def get_required_edges_from_def_to_use(index, cfg, rda_solution, rda_table,
                     used.satisfied = True
             elif matching_defs:
                 for available_def in matching_defs:
-                    # Skip definitions that are pointer modification placeholders at call sites.
-                    # These exist only for RDA kill semantics; interprocedural edges will be added separately.
                     if getattr(available_def, 'is_pointer_modification_at_call_site', False):
                         continue
                     if available_def.line != node:
@@ -2528,8 +2514,6 @@ def get_cfg_call_targets(cfg_graph, call_site_id):
             edge_data = edge_data[0]
             label = edge_data.get("label", "")
 
-            # Check for method_call, virtual_call, or function_call edges
-            # Labels may be "method_call", "method_call|123", "virtual_call|456", etc.
             if (label.startswith("method_call") or
                 label.startswith("virtual_call") or
                 label.startswith("function_call")):
@@ -2566,18 +2550,12 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
         function_name = call_site_info["function_name"]
         pass_by_ref_args = call_site_info["pass_by_ref_args"]
 
-        # Get the actual target function(s) from CFG edges
-        # This uses the CFG's resolution of virtual dispatch (pointer_targets)
         target_func_ids = get_cfg_call_targets(cfg_graph, call_site_id)
 
         if not target_func_ids:
-            # Fallback: if no CFG edges found, skip this call site
-            # (This shouldn't normally happen for valid method calls)
             continue
 
         for arg_idx, var_name, var_node in pass_by_ref_args:
-            # Collect modifications from ALL target functions
-            # (In case of true polymorphism with unknown concrete type, there could be multiple)
             all_param_mods = []
 
             for func_def_id in target_func_ids:
@@ -2594,7 +2572,6 @@ def add_interprocedural_edges(final_graph, parser, call_sites, modification_site
             for mod_param_idx, mod_node, mod_statement_id, func_def_id in all_param_mods:
                 is_killed = False
 
-                # Get all mods for this specific function to check for kills
                 func_mods = [(m_idx, m_node, m_id) for m_idx, m_node, m_id, f_id in all_param_mods
                              if f_id == func_def_id and m_idx == mod_param_idx]
 
@@ -2985,16 +2962,13 @@ def dfg_cpp(properties, CFG_results):
     cfg_graph = copy.deepcopy(CFG_results.graph)
     node_list = CFG_results.node_list
 
-    # Get CFG records for implicit_return_map lookup
     cfg_records = CFG_results.CFG.records if hasattr(CFG_results, 'CFG') and hasattr(CFG_results.CFG, 'records') else {}
     implicit_return_map = cfg_records.get('implicit_return_map', {})
 
-    # Build reverse map: implicit_return_id -> destructor_function_id
     implicit_return_to_destructor = {ir_id: fn_id for fn_id, ir_id in implicit_return_map.items()}
 
     processed_edges = []
 
-    # First pass: collect all called destructors (targets of scope_exit_destructor edges)
     called_destructors = set()
     destructor_chain_edges = []  # Collect destructor_chain edges for later processing
     base_destructor_edges = []   # Collect base_destructor_call edges for filtering
@@ -3006,29 +2980,24 @@ def dfg_cpp(properties, CFG_results):
             label = edge_data.get("label", "")
 
             if label == "scope_exit_destructor":
-                # edge[1] is the destructor function being called
                 called_destructors.add(edge[1])
             elif label.startswith("destructor_chain|"):
                 destructor_chain_edges.append(edge)
             elif label == "base_destructor_call":
                 base_destructor_edges.append(edge)
 
-    # Expand called_destructors to include destructors reachable via destructor_chain
-    # destructor_chain edges connect implicit_return of one destructor to another destructor
     changed = True
     while changed:
         changed = False
         for edge in destructor_chain_edges:
-            source_ir = edge[0]  # implicit_return of some destructor
-            target_destructor = edge[1]  # next destructor in chain
-            # Check if source implicit_return belongs to a called destructor
+            source_ir = edge[0]
+            target_destructor = edge[1]
             source_destructor = implicit_return_to_destructor.get(source_ir)
             if source_destructor and source_destructor in called_destructors:
                 if target_destructor not in called_destructors:
                     called_destructors.add(target_destructor)
                     changed = True
 
-    # Build set of valid implicit_return nodes (those belonging to called destructors)
     valid_implicit_returns = set()
     for destructor_id in called_destructors:
         ir_id = implicit_return_map.get(destructor_id)
@@ -3072,8 +3041,6 @@ def dfg_cpp(properties, CFG_results):
                 processed_edges.append(edge)
 
             elif label == "base_destructor_call":
-                # Only include base_destructor_call edges whose source implicit_return
-                # belongs to a destructor that is actually called
                 source_ir = edge[0]
                 if source_ir in valid_implicit_returns:
                     processed_edges.append(edge)

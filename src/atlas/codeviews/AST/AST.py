@@ -19,9 +19,6 @@ class ASTGraph:
     def get_AST_nodes(self, root_node, AST, AST_index):
 
         if root_node.is_named:
-            # Skip string_content and escape_sequence nodes for C and C++ to match Java/C# behavior
-            # In tree-sitter, C/C++ string_literal has string_content and escape_sequence children,
-            # but Java/C# string_literal nodes include the escape sequences directly in the text
             if root_node.type in ["string_content", "escape_sequence"]:
                 return None
 

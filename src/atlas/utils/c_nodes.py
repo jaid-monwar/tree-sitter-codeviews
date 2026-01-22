@@ -90,32 +90,23 @@ def extract_parameter_type(param_node):
     base_type = None
     pointer_count = 0
 
-    # Traverse children to find base type and count pointers
     for child in param_node.children:
-        # Skip type qualifiers (const, volatile, restrict)
         if child.type == "type_qualifier":
             continue
 
-        # Get base type
         if child.type in ['primitive_type', 'type_identifier', 'sized_type_specifier',
                          'struct_specifier', 'union_specifier', 'enum_specifier']:
             base_type = child.text.decode('utf-8')
 
-        # Count pointer levels
         elif child.type == "pointer_declarator":
-            # Count '*' symbols in the pointer_declarator
             pointer_text = child.text.decode('utf-8')
             pointer_count = pointer_text.count('*')
 
-        # Handle array declarators (int arr[] is equivalent to int *arr in parameters)
         elif child.type == "array_declarator":
-            # Array parameters decay to pointers
-            # Count each [] as one pointer level
             def count_array_dimensions(node):
                 count = 0
                 if node.type == "array_declarator":
                     count = 1
-                    # Check for nested array declarators (multi-dimensional arrays)
                     for subchild in node.children:
                         if subchild.type == "array_declarator":
                             count += count_array_dimensions(subchild)
@@ -123,7 +114,6 @@ def extract_parameter_type(param_node):
 
             pointer_count = count_array_dimensions(child)
 
-    # Construct the type string
     if base_type:
         return base_type + ('*' * pointer_count)
 
@@ -137,7 +127,6 @@ def get_child_of_type(node, type_list):
         return None
 
 def return_switch_child(node):
-    # Make it breadthfirst search, and return if you hit a node_list_type
     bfs_queue = []
     for child in node.children:
         bfs_queue.append(child)
@@ -164,18 +153,15 @@ def get_function_signature(node):
     Returns: tuple of parameter types, e.g., ('int', 'char*') or ('int', '...')
     """
     signature = []
-    # Find parameter_list in function_declarator
     for child in node.children:
         if child.type == "function_declarator":
             param_list = child.child_by_field_name('parameters')
             if param_list:
                 for param in param_list.children:
                     if param.type == "parameter_declaration":
-                        # Extract the full parameter type including pointers
                         param_type = extract_parameter_type(param)
                         signature.append(param_type)
                     elif param.type == "variadic_parameter":
-                        # Variadic function - add '...' marker
                         signature.append('...')
     return tuple(signature)
 
@@ -183,12 +169,10 @@ def get_function_name(node):
     """Extract function name from function_definition"""
     for child in node.children:
         if child.type == "function_declarator":
-            # Find identifier in function_declarator
             for dchild in child.children:
                 if dchild.type == "identifier":
                     return dchild.text.decode('utf-8')
                 elif dchild.type == "pointer_declarator":
-                    # Handle pointer return types like int *func()
                     for pchild in dchild.children:
                         if pchild.type == "identifier":
                             return pchild.text.decode('utf-8')
@@ -206,7 +190,6 @@ def is_function_declaration(node):
     if node.type != "declaration":
         return False
 
-    # Check if it contains a function_declarator
     for child in node.children:
         if child.type == "function_declarator":
             return True
@@ -219,7 +202,6 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
     Extracts nodes that will become CFG nodes and populates records dictionary.
     """
 
-    # Special handling for do-while condition
     if (
         root_node.type == "parenthesized_expression"
         and root_node.parent is not None
@@ -230,27 +212,22 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
         node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
         graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
 
-    # Handle statement-level nodes
     elif root_node.type in statement_types["node_list_type"]:
-        # Skip for loop init/update statements if they're not in the body
         if (
             root_node.type in statement_types["inner_node_type"]
             and root_node.parent is not None
             and root_node.parent.type in statement_types["outer_node_type"]
         ):
-            # Check if this is init or update part of for loop (not the body)
             if root_node.parent.type == "for_statement":
                 body = root_node.parent.child_by_field_name("body")
                 if body != root_node:
-                    pass  # Skip this node
+                    pass
                 else:
-                    # This is the body, process it normally
                     node_list[(root_node.start_point, root_node.end_point, root_node.type)] = root_node
                     label = root_node.text.decode("UTF-8")
                     type_label = root_node.type
                     graph_node_list.append((index[(root_node.start_point, root_node.end_point, root_node.type)], root_node.start_point[0], label, type_label))
 
-        # Check for switch expression in subtree
         elif (
             root_node.type in statement_types["inner_node_type"]
             and return_switch_child(root_node) is not None
@@ -265,9 +242,7 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
             label = root_node.text.decode("UTF-8")
             type_label = root_node.type
 
-            # Customize labels based on node type
             if root_node.type == "function_definition":
-                # Extract function signature
                 label = ""
                 for child in root_node.children:
                     if child.type != "compound_statement":
@@ -281,11 +256,9 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     signature = get_function_signature(root_node)
                     records["function_list"][(func_name, signature)] = func_index
 
-                    # Check if this is main function
                     if func_name == "main":
                         records["main_function"] = func_index
 
-                    # Get return type
                     return_type = None
                     for child in root_node.children:
                         if child.type in function_return_types:
@@ -337,12 +310,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 type_label = "switch"
 
             elif root_node.type == "case_statement":
-                # Extract case value
                 value_node = root_node.child_by_field_name("value")
                 if value_node:
                     label = "case " + value_node.text.decode("UTF-8") + ":"
                 else:
-                    # This might be default case
                     if root_node.children and root_node.children[0].type == "default":
                         label = "default:"
                     else:
@@ -350,12 +321,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 type_label = "case"
 
             elif root_node.type == "labeled_statement":
-                # Extract label name
                 label_node = root_node.child_by_field_name("label")
                 if label_node:
                     label_name = label_node.text.decode("UTF-8")
                     label = label_name + ":"
-                    # Store in label map for goto statements
                     current_index = index[(root_node.start_point, root_node.end_point, root_node.type)]
                     records["label_statement_map"][label_name] = (root_node.start_point, root_node.end_point, root_node.type)
                 type_label = "label"
@@ -373,7 +342,6 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                 type_label = "continue"
 
             elif root_node.type == "goto_statement":
-                # Extract target label
                 label_node = root_node.child_by_field_name("label")
                 if label_node:
                     label = "goto " + label_node.text.decode("UTF-8") + ";"
@@ -381,12 +349,10 @@ def get_nodes(root_node=None, node_list={}, graph_node_list=[], index={}, record
                     label = "goto;"
                 type_label = "goto"
 
-            # Add to graph node list if not already added above
             if root_node.type not in ["function_definition"]:
                 node_index = index[(root_node.start_point, root_node.end_point, root_node.type)]
                 graph_node_list.append((node_index, root_node.start_point[0], label, type_label))
 
-    # Recursively process children
     for child in root_node.children:
         get_nodes(child, node_list, graph_node_list, index, records)
 

@@ -28,19 +28,19 @@ class CustomParser:
         self.index = {}
         self.language_map = get_language_map()
         self.root_node, self.tree = self.parse()
-        self.all_tokens = []  # list of all tokens in the source code
-        self.label = {}  # label for each node in the AST
-        self.method_map = []  # list of all methods in the source code
-        self.method_calls = []  # list of all method calls in the source code
-        self.start_line = {}  # start line number for each toekn (leaf-node) in the AST
-        self.declaration = {}  # maps the declaration identifier token's index to the name of the variable/identifier
+        self.all_tokens = []
+        self.label = {}
+        self.method_map = []
+        self.method_calls = []
+        self.start_line = {}
+        self.declaration = {}
         self.declaration_map = {}
         self.symbol_table = {
             "scope_stack": [0],
             "scope_map": {},
             "scope_id": 0,
             "data_type": {},
-        }  # Stack style symbol table which maps
+        }
 
     def create_AST_id(self, root_node, AST_index, AST_id):
         """Create an id for each node in the AST. This AST id is maintained and used across all code views so that
@@ -57,10 +57,9 @@ class CustomParser:
             return
 
     def parse(self):
-        parser = Parser()  # tree-sitter parser
+        parser = Parser()
         parser.set_language(self.language_map[self.src_language])
         tree = parser.parse(bytes(self.src_code, "utf8"))
         self.root_node = tree.root_node
-        # First few id values are reserved for special nodes such as start and end node
         self.create_AST_id(self.root_node, self.index, [5])
         return self.root_node, tree

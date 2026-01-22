@@ -15,13 +15,11 @@ class CSTGraph:
         grandparent_folder = os.path.abspath(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         )
-        # postprocessor.write_to_dot(self.graph, os.path.join(grandparent_folder,"output_graphs/CST_output.dot"))
 
     def postorder_traversal(self, node):
         if node.children:
             for child in node.children:
                 self.postorder_traversal(child)
-        # print(node.type)
 
     def create_CST_id(self, root_node, CST_index, CST_id):
         current_node_id = CST_id[0]
